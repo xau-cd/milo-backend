@@ -11,15 +11,8 @@ if (!admin.apps.length) {
     databaseURL: "https://milo-ead21-default-rtdb.europe-west1.firebasedatabase.app"
   });
 }
-
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://milo-ead21-default-rtdb.europe-west1.firebasedatabase.app"
-  });
-}
-
 const db = admin.database();
+const auth = admin.auth();
 
 // ==================== CONFIGURATION EXPRESS ====================
 const app = express();
@@ -75,6 +68,10 @@ function getResendClient() {
     return null;
   }
 }
+
+// ==================== IDENTITÉ OFFICIELLE DE MILO ====================
+const MILO_IDENTITY = "Je suis MILO, une intelligence artificielle créée par HIKLON Technologie.";
+const MILO_SYSTEM_PROMPT = `${MILO_IDENTITY} Je suis un assistant personnel intelligent, serviable et professionnel. Je peux aider avec des recherches, des informations, et je peux envoyer des messages WhatsApp si l'utilisateur m'y autorise.`;
 
 // ==================== FONCTIONS UTILITAIRES ====================
 
@@ -208,7 +205,7 @@ async function searchWeb(query) {
 /**
  * Appelle l'API OpenRouter avec le modèle DeepSeek.
  */
-async function callOpenRouter(userMessage, systemPrompt = "Tu es MILO, un assistant IA serviable et intelligent.") {
+async function callOpenRouter(userMessage, systemPrompt = MILO_SYSTEM_PROMPT) {
   try {
     const response = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
@@ -262,14 +259,311 @@ async function saveLog(path, data) {
   }
 }
 
+/**
+ * Récupère ou crée un profil utilisateur dans Firebase.
+ */
+async function getOrCreateUserProfile(uid, data = {}) {
+  try {
+    const userRef = db.ref(`users/${uid}`);
+    const snapshot = await userRef.once("value");
+    
+    if (snapshot.exists()) {
+      return snapshot.val();
+    }
+    
+    const profile = {
+      uid: uid,
+      email: data.email || null,
+      displayName: data.displayName || "Utilisateur MILO",
+      whatsappNumber: data.whatsappNumber || null,
+      whatsappAuthorized: false,
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+      lastLogin: admin.database.ServerValue.TIMESTAMP
+    };
+    
+    await userRef.set(profile);
+    return profile;
+  } catch (error) {
+    console.error("❌ Erreur getOrCreateUserProfile :", error.message);
+    return null;
+  }
+}
+
+/**
+ * Met à jour le profil utilisateur.
+ */
+async function updateUserProfile(uid, updates) {
+  try {
+    const userRef = db.ref(`users/${uid}`);
+    await userRef.update(updates);
+    return true;
+  } catch (error) {
+    console.error("❌ Erreur updateUserProfile :", error.message);
+    return false;
+  }
+}
+
+/**
+ * Vérifie le token Firebase et retourne l'utilisateur.
+ */
+async function verifyFirebaseToken(idToken) {
+  try {
+    const decodedToken = await auth.verifyIdToken(idToken);
+    return decodedToken;
+  } catch (error) {
+    console.error("❌ Erreur verifyFirebaseToken :", error.message);
+    return null;
+  }
+}
+
+/**
+ * Envoie un message WhatsApp via Twilio.
+ */
+async function sendWhatsAppMessage(to, message) {
+  try {
+    const twilioData = getTwilioClient();
+    
+    if (!twilioData) {
+      throw new Error("Client Twilio non configuré");
+    }
+    
+    const result = await twilioData.client.messages.create({
+      from: `whatsapp:${twilioData.fromNumber}`,
+      to: `whatsapp:${to}`,
+      body: message
+    });
+    
+    return result;
+  } catch (error) {
+    console.error("❌ Erreur sendWhatsAppMessage :", error.message);
+    throw error;
+  }
+}
+
 // ==================== ROUTES ====================
 
 /**
  * Route racine pour vérifier que le serveur est actif.
  */
 app.get("/", (req, res) => {
-  res.status(200).send("✅ Cerveau MILO actif et opérationnel !");
+  res.status(200).json({
+    success: true,
+    message: "✅ Cerveau MILO actif et opérationnel !",
+    identity: MILO_IDENTITY
+  });
 });
+
+// ==================== ROUTES D'AUTHENTIFICATION ====================
+
+/**
+ * Route d'inscription utilisateur.
+ */
+app.post("/auth/register", async (req, res) => {
+  try {
+    const { email, password, displayName, whatsappNumber } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email et mot de passe requis." });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères." });
+    }
+
+    // Création de l'utilisateur dans Firebase Auth
+    const userRecord = await auth.createUser({
+      email: email,
+      password: password,
+      displayName: displayName || email.split("@")[0]
+    });
+
+    // Création du profil utilisateur dans la base de données
+    await getOrCreateUserProfile(userRecord.uid, {
+      email: email,
+      displayName: displayName || email.split("@")[0],
+      whatsappNumber: whatsappNumber || null,
+      whatsappAuthorized: false
+    });
+
+    // Génération d'un token personnalisé
+    const customToken = await auth.createCustomToken(userRecord.uid);
+
+    await saveLog("logs_systeme/inscriptions", {
+      uid: userRecord.uid,
+      email: email,
+      displayName: displayName || email.split("@")[0]
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Utilisateur créé avec succès.",
+      uid: userRecord.uid,
+      customToken: customToken
+    });
+  } catch (error) {
+    console.error("❌ Erreur inscription :", error.message);
+    
+    let errorMessage = "Erreur lors de l'inscription.";
+    if (error.code === "auth/email-already-exists") {
+      errorMessage = "Cet email est déjà utilisé.";
+    } else if (error.code === "auth/invalid-email") {
+      errorMessage = "Adresse email invalide.";
+    } else if (error.code === "auth/weak-password") {
+      errorMessage = "Mot de passe trop faible.";
+    }
+    
+    return res.status(400).json({ error: errorMessage });
+  }
+});
+
+/**
+ * Route de connexion utilisateur.
+ */
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ error: "Token d'identification requis." });
+    }
+
+    // Vérification du token Firebase
+    const decodedToken = await verifyFirebaseToken(idToken);
+    
+    if (!decodedToken) {
+      return res.status(401).json({ error: "Token invalide ou expiré." });
+    }
+
+    // Récupération ou création du profil utilisateur
+    const profile = await getOrCreateUserProfile(decodedToken.uid, {
+      email: decodedToken.email || null,
+      displayName: decodedToken.name || "Utilisateur MILO"
+    });
+
+    // Mise à jour de la date de dernière connexion
+    await updateUserProfile(decodedToken.uid, {
+      lastLogin: admin.database.ServerValue.TIMESTAMP
+    });
+
+    await saveLog("logs_systeme/connexions", {
+      uid: decodedToken.uid,
+      email: decodedToken.email || null
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Connexion réussie.",
+      user: {
+        uid: decodedToken.uid,
+        email: decodedToken.email,
+        profile: profile
+      }
+    });
+  } catch (error) {
+    console.error("❌ Erreur connexion :", error.message);
+    return res.status(500).json({ error: "Erreur lors de la connexion." });
+  }
+});
+
+/**
+ * Route pour mettre à jour le profil utilisateur.
+ */
+app.post("/auth/update-profile", async (req, res) => {
+  try {
+    const { idToken, whatsappNumber, displayName } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ error: "Token d'identification requis." });
+    }
+
+    const decodedToken = await verifyFirebaseToken(idToken);
+    
+    if (!decodedToken) {
+      return res.status(401).json({ error: "Token invalide ou expiré." });
+    }
+
+    const updates = {};
+    if (whatsappNumber) {
+      // Validation simple du numéro WhatsApp
+      const cleanedNumber = whatsappNumber.replace(/[^\d+]/g, "");
+      if (cleanedNumber.length < 10) {
+        return res.status(400).json({ error: "Numéro WhatsApp invalide." });
+      }
+      updates.whatsappNumber = cleanedNumber;
+    }
+    if (displayName) {
+      updates.displayName = displayName;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: "Aucune donnée à mettre à jour." });
+    }
+
+    await updateUserProfile(decodedToken.uid, updates);
+
+    await saveLog("logs_systeme/profils_mis_a_jour", {
+      uid: decodedToken.uid,
+      updates: updates
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Profil mis à jour avec succès."
+    });
+  } catch (error) {
+    console.error("❌ Erreur mise à jour profil :", error.message);
+    return res.status(500).json({ error: "Erreur lors de la mise à jour du profil." });
+  }
+});
+
+/**
+ * Route pour autoriser l'envoi de messages WhatsApp.
+ */
+app.post("/auth/authorize-whatsapp", async (req, res) => {
+  try {
+    const { idToken, whatsappNumber, authorized } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ error: "Token d'identification requis." });
+    }
+
+    const decodedToken = await verifyFirebaseToken(idToken);
+    
+    if (!decodedToken) {
+      return res.status(401).json({ error: "Token invalide ou expiré." });
+    }
+
+    if (!whatsappNumber) {
+      return res.status(400).json({ error: "Numéro WhatsApp requis." });
+    }
+
+    const cleanedNumber = whatsappNumber.replace(/[^\d+]/g, "");
+    if (cleanedNumber.length < 10) {
+      return res.status(400).json({ error: "Numéro WhatsApp invalide." });
+    }
+
+    await updateUserProfile(decodedToken.uid, {
+      whatsappNumber: cleanedNumber,
+      whatsappAuthorized: authorized === true
+    });
+
+    await saveLog("logs_systeme/autorisations_whatsapp", {
+      uid: decodedToken.uid,
+      whatsappNumber: cleanedNumber,
+      authorized: authorized === true
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: authorized ? "Autorisation WhatsApp accordée." : "Autorisation WhatsApp révoquée."
+    });
+  } catch (error) {
+    console.error("❌ Erreur autorisation WhatsApp :", error.message);
+    return res.status(500).json({ error: "Erreur lors de l'autorisation WhatsApp." });
+  }
+});
+
+// ==================== ROUTES DE RECHERCHE ====================
 
 /**
  * Route de recherche Wikipédia enrichie.
@@ -301,162 +595,6 @@ app.get("/wiki/search", async (req, res) => {
 });
 
 /**
- * Route de chat frontend.
- */
-app.post("/chat", async (req, res) => {
-  try {
-    const { message, user_id } = req.body;
-
-    if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({ error: "Le champ 'message' est requis et doit être une chaîne non vide." });
-    }
-
-    // Recherche d'informations complémentaires
-    const wikiData = await fetchWikiMedia(message);
-    const commonsImages = await fetchWikimediaCommons(message, 3);
-    const webData = await searchWeb(message);
-
-    // Construction du contexte enrichi
-    let contextPrompt = `Question de l'utilisateur : ${message}\n\n`;
-    
-    if (wikiData.summary) {
-      contextPrompt += `Contexte Wikipédia (${wikiData.title}) :\n${wikiData.summary.substring(0, 1000)}\n\n`;
-    }
-    
-    if (wikiData.categories && wikiData.categories.length > 0) {
-      contextPrompt += `Catégories : ${wikiData.categories.join(", ")}\n\n`;
-    }
-    
-    if (webData.abstract) {
-      contextPrompt += `Contexte Web :\n${webData.abstract.substring(0, 1000)}\n\n`;
-    }
-    
-    if (webData.relatedResults && webData.relatedResults.length > 0) {
-      contextPrompt += "Sources supplémentaires :\n";
-      webData.relatedResults.forEach((result, index) => {
-        contextPrompt += `${index + 1}. ${result.description?.substring(0, 200)}\n`;
-      });
-    }
-
-    // Appel à OpenRouter
-    const aiResponse = await callOpenRouter(contextPrompt);
-
-    // Sauvegarde du log
-    await saveLog("logs_systeme/chat_frontend", {
-      user_id: user_id || "anonymous",
-      message: message,
-      response: aiResponse,
-      wiki_found: !!wikiData.summary,
-      web_found: !!webData.abstract,
-      commons_images_found: commonsImages.length
-    });
-
-    return res.status(200).json({
-      success: true,
-      response: aiResponse,
-      wiki: {
-        title: wikiData.title,
-        summary: wikiData.summary,
-        image: wikiData.image,
-        url: wikiData.url,
-        categories: wikiData.categories
-      },
-      commons: commonsImages,
-      web: webData
-    });
-  } catch (error) {
-    console.error("❌ Erreur route /chat :", error.message);
-    return res.status(500).json({
-      success: false,
-      error: "Une erreur est survenue lors du traitement de votre demande.",
-      details: error.message
-    });
-  }
-});
-
-/**
- * Route webhook WhatsApp pour Twilio.
- */
-app.post("/webhook/whatsapp", async (req, res) => {
-  try {
-    const incomingMessage = req.body.Body || req.body.body || "";
-    const from = req.body.From || req.body.from || "unknown";
-    const messageSid = req.body.MessageSid || req.body.messageSid || null;
-
-    if (!incomingMessage || incomingMessage.trim().length === 0) {
-      return res.status(400).json({ error: "Message vide non accepté." });
-    }
-
-    // Sauvegarde du message entrant
-    await saveLog("logs_systeme/whatsapp_entrants", {
-      from: from,
-      message: incomingMessage,
-      message_sid: messageSid,
-      direction: "incoming"
-    });
-
-    // Initialisation Twilio dynamique
-    const twilioData = getTwilioClient();
-
-    // Recherche d'informations complémentaires
-    const wikiData = await fetchWikiMedia(incomingMessage);
-    const webData = await searchWeb(incomingMessage);
-
-    // Construction du contexte enrichi
-    let contextPrompt = `Question de l'utilisateur WhatsApp : ${incomingMessage}\n\n`;
-    
-    if (wikiData.summary) {
-      contextPrompt += `Contexte Wikipédia :\n${wikiData.summary.substring(0, 800)}\n\n`;
-    }
-    
-    if (webData.abstract) {
-      contextPrompt += `Contexte Web :\n${webData.abstract.substring(0, 800)}\n\n`;
-    }
-
-    // Appel à OpenRouter
-    let aiResponse;
-    try {
-      aiResponse = await callOpenRouter(contextPrompt, "Tu es MILO, un assistant WhatsApp serviable et concis. Réponds de manière claire et directe.");
-    } catch (aiError) {
-      console.error("❌ Erreur OpenRouter dans webhook :", aiError.message);
-      aiResponse = "Désolé, je n'ai pas pu traiter votre demande pour le moment. Veuillez réessayer plus tard.";
-    }
-
-    // Sauvegarde du log de la réponse
-    await saveLog("logs_systeme/whatsapp_entrants", {
-      from: from,
-      message: aiResponse,
-      message_sid: messageSid,
-      direction: "outgoing"
-    });
-
-    // Réponse via Twilio si le client est valide
-    if (twilioData) {
-      try {
-        await twilioData.client.messages.create({
-          from: `whatsapp:${twilioData.fromNumber}`,
-          to: from,
-          body: aiResponse
-        });
-        console.log(`✅ Réponse WhatsApp envoyée à ${from}`);
-      } catch (twilioError) {
-        console.error("❌ Erreur envoi Twilio :", twilioError.message);
-      }
-    } else {
-      console.warn("⚠️ Réponse WhatsApp non envoyée : client Twilio indisponible.");
-    }
-
-    // Réponse au webhook Twilio
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${aiResponse.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</Message></Response>`;
-    res.set("Content-Type", "text/xml");
-    return res.status(200).send(twimlResponse);
-  } catch (error) {
-    console.error("❌ Erreur webhook WhatsApp :", error.message);
-    return res.status(500).json({ error: "Erreur lors du traitement du webhook." });
-  }
-});
-
-/**
  * Route de recherche d'images Wikimedia Commons.
  */
 app.get("/wiki/commons", async (req, res) => {
@@ -484,6 +622,295 @@ app.get("/wiki/commons", async (req, res) => {
     });
   }
 });
+
+// ==================== ROUTE DE CHAT ====================
+
+/**
+ * Route de chat frontend.
+ */
+app.post("/chat", async (req, res) => {
+  try {
+    const { message, user_id, idToken } = req.body;
+
+    if (!message || typeof message !== "string" || message.trim().length === 0) {
+      return res.status(400).json({ error: "Le champ 'message' est requis et doit être une chaîne non vide." });
+    }
+
+    // Vérification de l'utilisateur si un token est fourni
+    let userProfile = null;
+    if (idToken) {
+      const decodedToken = await verifyFirebaseToken(idToken);
+      if (decodedToken) {
+        userProfile = await getOrCreateUserProfile(decodedToken.uid, {
+          email: decodedToken.email || null,
+          displayName: decodedToken.name || "Utilisateur MILO"
+        });
+      }
+    }
+
+    // Recherche d'informations complémentaires
+    const wikiData = await fetchWikiMedia(message);
+    const commonsImages = await fetchWikimediaCommons(message, 3);
+    const webData = await searchWeb(message);
+
+    // Construction du contexte enrichi
+    let contextPrompt = `Question de l'utilisateur : ${message}\n\n`;
+    
+    if (userProfile) {
+      contextPrompt += `Utilisateur connecté : ${userProfile.displayName || "Anonyme"}\n`;
+      if (userProfile.whatsappNumber && userProfile.whatsappAuthorized) {
+        contextPrompt += `Numéro WhatsApp autorisé : ${userProfile.whatsappNumber}\n`;
+      }
+      contextPrompt += `\n`;
+    }
+    
+    if (wikiData.summary) {
+      contextPrompt += `Contexte Wikipédia (${wikiData.title}) :\n${wikiData.summary.substring(0, 1000)}\n\n`;
+    }
+    
+    if (wikiData.categories && wikiData.categories.length > 0) {
+      contextPrompt += `Catégories : ${wikiData.categories.join(", ")}\n\n`;
+    }
+    
+    if (webData.abstract) {
+      contextPrompt += `Contexte Web :\n${webData.abstract.substring(0, 1000)}\n\n`;
+    }
+    
+    if (webData.relatedResults && webData.relatedResults.length > 0) {
+      contextPrompt += "Sources supplémentaires :\n";
+      webData.relatedResults.forEach((result, index) => {
+        contextPrompt += `${index + 1}. ${result.description?.substring(0, 200)}\n`;
+      });
+    }
+
+    // Appel à OpenRouter avec l'identité MILO
+    const aiResponse = await callOpenRouter(contextPrompt, MILO_SYSTEM_PROMPT);
+
+    // Sauvegarde du log
+    const logData = {
+      user_id: user_id || (userProfile ? userProfile.uid : "anonymous"),
+      message: message,
+      response: aiResponse,
+      wiki_found: !!wikiData.summary,
+      web_found: !!webData.abstract,
+      commons_images_found: commonsImages.length
+    };
+
+    if (userProfile) {
+      logData.authenticated = true;
+      logData.whatsapp_authorized = userProfile.whatsappAuthorized || false;
+    }
+
+    await saveLog("logs_systeme/chat_frontend", logData);
+
+    return res.status(200).json({
+      success: true,
+      response: aiResponse,
+      identity: MILO_IDENTITY,
+      wiki: {
+        title: wikiData.title,
+        summary: wikiData.summary,
+        image: wikiData.image,
+        url: wikiData.url,
+        categories: wikiData.categories
+      },
+      commons: commonsImages,
+      web: webData,
+      user: userProfile ? {
+        uid: userProfile.uid,
+        displayName: userProfile.displayName,
+        whatsappAuthorized: userProfile.whatsappAuthorized || false
+      } : null
+    });
+  } catch (error) {
+    console.error("❌ Erreur route /chat :", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Une erreur est survenue lors du traitement de votre demande.",
+      details: error.message
+    });
+  }
+});
+
+/**
+ * Route pour que l'IA envoie un message WhatsApp à l'utilisateur.
+ */
+app.post("/chat/send-whatsapp", async (req, res) => {
+  try {
+    const { idToken, message } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ error: "Token d'identification requis." });
+    }
+
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ error: "Message requis." });
+    }
+
+    const decodedToken = await verifyFirebaseToken(idToken);
+    
+    if (!decodedToken) {
+      return res.status(401).json({ error: "Token invalide ou expiré." });
+    }
+
+    const userProfile = await getOrCreateUserProfile(decodedToken.uid);
+
+    if (!userProfile || !userProfile.whatsappNumber) {
+      return res.status(400).json({ 
+        error: "Numéro WhatsApp non configuré.",
+        requiresSetup: true
+      });
+    }
+
+    if (!userProfile.whatsappAuthorized) {
+      return res.status(403).json({ 
+        error: "Autorisation WhatsApp requise.",
+        requiresAuthorization: true
+      });
+    }
+
+    // Envoi du message WhatsApp
+    const result = await sendWhatsAppMessage(userProfile.whatsappNumber, message);
+
+    await saveLog("logs_systeme/whatsapp_envoyes", {
+      uid: decodedToken.uid,
+      to: userProfile.whatsappNumber,
+      message: message,
+      twilio_sid: result.sid
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Message WhatsApp envoyé avec succès.",
+      twilio_sid: result.sid
+    });
+  } catch (error) {
+    console.error("❌ Erreur envoi WhatsApp :", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur lors de l'envoi du message WhatsApp.",
+      details: error.message
+    });
+  }
+});
+
+// ==================== ROUTE WEBHOOK WHATSAPP ====================
+
+/**
+ * Route webhook WhatsApp pour Twilio.
+ */
+app.post("/webhook/whatsapp", async (req, res) => {
+  try {
+    const incomingMessage = req.body.Body || req.body.body || "";
+    const from = req.body.From || req.body.from || "unknown";
+    const messageSid = req.body.MessageSid || req.body.messageSid || null;
+
+    if (!incomingMessage || incomingMessage.trim().length === 0) {
+      return res.status(400).json({ error: "Message vide non accepté." });
+    }
+
+    // Nettoyage du numéro de téléphone
+    const cleanedFrom = from.replace("whatsapp:", "").replace("+", "");
+
+    // Sauvegarde du message entrant
+    await saveLog("logs_systeme/whatsapp_entrants", {
+      from: cleanedFrom,
+      message: incomingMessage,
+      message_sid: messageSid,
+      direction: "incoming"
+    });
+
+    // Recherche de l'utilisateur par numéro WhatsApp
+    let userProfile = null;
+    try {
+      const usersRef = db.ref("users");
+      const snapshot = await usersRef.once("value");
+      const users = snapshot.val();
+      
+      if (users) {
+        for (const uid in users) {
+          if (users[uid].whatsappNumber === cleanedFrom || users[uid].whatsappNumber === `+${cleanedFrom}`) {
+            userProfile = users[uid];
+            userProfile.uid = uid;
+            break;
+          }
+        }
+      }
+    } catch (userError) {
+      console.warn("⚠️ Impossible de trouver l'utilisateur :", userError.message);
+    }
+
+    // Initialisation Twilio dynamique
+    const twilioData = getTwilioClient();
+
+    // Recherche d'informations complémentaires
+    const wikiData = await fetchWikiMedia(incomingMessage);
+    const webData = await searchWeb(incomingMessage);
+
+    // Construction du contexte enrichi
+    let contextPrompt = `Question de l'utilisateur WhatsApp : ${incomingMessage}\n\n`;
+    
+    if (userProfile) {
+      contextPrompt += `Utilisateur identifié : ${userProfile.displayName || "Utilisateur"}\n`;
+      if (userProfile.whatsappAuthorized) {
+        contextPrompt += `Autorisation WhatsApp accordée.\n`;
+      }
+      contextPrompt += `\n`;
+    }
+    
+    if (wikiData.summary) {
+      contextPrompt += `Contexte Wikipédia :\n${wikiData.summary.substring(0, 800)}\n\n`;
+    }
+    
+    if (webData.abstract) {
+      contextPrompt += `Contexte Web :\n${webData.abstract.substring(0, 800)}\n\n`;
+    }
+
+    // Appel à OpenRouter avec l'identité MILO
+    let aiResponse;
+    try {
+      aiResponse = await callOpenRouter(contextPrompt, `${MILO_SYSTEM_PROMPT} Réponds de manière concise pour WhatsApp.`);
+    } catch (aiError) {
+      console.error("❌ Erreur OpenRouter dans webhook :", aiError.message);
+      aiResponse = "Désolé, je n'ai pas pu traiter votre demande pour le moment. Veuillez réessayer plus tard.";
+    }
+
+    // Sauvegarde du log de la réponse
+    await saveLog("logs_systeme/whatsapp_entrants", {
+      from: cleanedFrom,
+      message: aiResponse,
+      message_sid: messageSid,
+      direction: "outgoing",
+      user_identified: !!userProfile
+    });
+
+    // Réponse via Twilio si le client est valide
+    if (twilioData) {
+      try {
+        await twilioData.client.messages.create({
+          from: `whatsapp:${twilioData.fromNumber}`,
+          to: from,
+          body: aiResponse
+        });
+        console.log(`✅ Réponse WhatsApp envoyée à ${cleanedFrom}`);
+      } catch (twilioError) {
+        console.error("❌ Erreur envoi Twilio :", twilioError.message);
+      }
+    } else {
+      console.warn("⚠️ Réponse WhatsApp non envoyée : client Twilio indisponible.");
+    }
+
+    // Réponse au webhook Twilio
+    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${aiResponse.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</Message></Response>`;
+    res.set("Content-Type", "text/xml");
+    return res.status(200).send(twimlResponse);
+  } catch (error) {
+    console.error("❌ Erreur webhook WhatsApp :", error.message);
+    return res.status(500).json({ error: "Erreur lors du traitement du webhook." });
+  }
+});
+
+// ==================== ROUTE D'ENVOI D'E-MAILS ====================
 
 /**
  * Route d'envoi d'e-mails via Resend.
@@ -579,4 +1006,5 @@ process.on("unhandledRejection", (reason, promise) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`Cerveau MILO actif sur le port ${PORT}`);
+    console.log(MILO_IDENTITY);
 });
