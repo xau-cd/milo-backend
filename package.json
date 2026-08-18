@@ -1,19 +1,18 @@
 {
-  "name": "milo-render",
+  "name": "milo-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "Cerveau MILO - Backend",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "axios": "^1.19.0",
-    "cors": "^2.8.6",
-    "express": "^5.2.1",
-    "firebase-admin": "^14.2.0"
+    "axios": "^1.6.8",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.0",
+    "firebase-functions": "^4.9.0",
+    "resend": "^3.2.0",
+    "twilio": "^5.0.4"
   }
 }
