@@ -168,4 +168,3 @@ app.post("/action/send-email", async (req, res) => {
 });
 
 // Exporter l'application express dans Firebase
-exports.miloBrain = functions.runWith({ timeoutSeconds: 60, memory: "1GB" }).https.onRequest(app);
