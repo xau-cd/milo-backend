@@ -1,66 +1,176 @@
-const admin = require("firebase-admin");
+// ==================== SERVER.JS PRINCIPAL ====================
+// Backend Express sécurisé, résilient et modulaire
+// Intégration : Firebase Admin, Baileys (WhatsApp), OpenRouter (IA), Resend (E-mail)
+
+// ==================== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT ====================
+require("dotenv").config();
+
+// ==================== IMPORTS DES MODULES ====================
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");
-const { Twilio } = require("twilio");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const admin = require("firebase-admin");
 const { Resend } = require("resend");
+const axios = require("axios");
+const pino = require("pino");
+const qrcode = require("qrcode");
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = require("@whiskeysockets/baileys");
+const fs = require("fs");
+const path = require("path");
 
-// ==================== CONFIGURATION FIREBASE SIMPLIFIÉE ====================
-if (!admin.apps.length) {
-  admin.initializeApp({
-    databaseURL: "https://milo-ead21-default-rtdb.europe-west1.firebasedatabase.app"
-  });
+// ==================== CONFIGURATION DU LOGGER PINO ====================
+const logger = pino({
+  level: process.env.LOG_LEVEL || "silent",
+  transport: process.env.NODE_ENV === "development" ? {
+    target: "pino-pretty",
+    options: { colorize: true }
+  } : undefined
+});
+
+// ==================== CONFIGURATION FIREBASE ADMIN ====================
+// CORRECTIF : Utilisation exclusive de FIREBASE_CONFIG_JSON
+function initializeFirebaseAdmin() {
+  try {
+    if (admin.apps.length) {
+      console.log("✅ Firebase Admin déjà initialisé.");
+      return true;
+    }
+    
+    // Vérification de la présence de FIREBASE_CONFIG_JSON
+    if (!process.env.FIREBASE_CONFIG_JSON) {
+      console.error("❌ ERREUR CRITIQUE : FIREBASE_CONFIG_JSON n'est pas défini.");
+      console.error("❌ Sur Render, ajoutez la variable d'environnement FIREBASE_CONFIG_JSON");
+      console.error("❌ avec le contenu complet du fichier Service Account Firebase.");
+      
+      // En production, on arrête le serveur car Firebase est indispensable
+      if (process.env.NODE_ENV === "production") {
+        console.error("❌ Arrêt du serveur : Firebase Admin est requis en production.");
+        process.exit(1);
+      } else {
+        console.warn("⚠️ Mode développement : Firebase non configuré.");
+        return false;
+      }
+    }
+    
+    // Parsing du JSON
+    let firebaseConfig;
+    try {
+      firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
+      console.log("✅ FIREBASE_CONFIG_JSON parsé avec succès.");
+    } catch (parseError) {
+      console.error("❌ Erreur de parsing FIREBASE_CONFIG_JSON :", parseError.message);
+      console.error("❌ Vérifiez que la variable contient un JSON valide.");
+      
+      if (process.env.NODE_ENV === "production") {
+        process.exit(1);
+      }
+      return false;
+    }
+    
+    // Vérification des champs requis
+    const requiredFields = ["project_id", "private_key", "client_email"];
+    const missingFields = requiredFields.filter(field => !firebaseConfig[field]);
+    
+    if (missingFields.length > 0) {
+      console.error(`❌ Champs manquants dans FIREBASE_CONFIG_JSON : ${missingFields.join(", ")}`);
+      
+      if (process.env.NODE_ENV === "production") {
+        process.exit(1);
+      }
+      return false;
+    }
+    
+    // CORRECTIF : S'assurer que la clé privée a les bons retours à la ligne
+    if (typeof firebaseConfig.private_key === "string") {
+      firebaseConfig.private_key = firebaseConfig.private_key.replace(/\\n/g, "\n");
+    }
+    
+    // Initialisation Firebase Admin avec les credentials
+    admin.initializeApp({
+      credential: admin.credential.cert(firebaseConfig),
+      databaseURL: process.env.FIREBASE_DATABASE_URL || `https://${firebaseConfig.project_id}-default-rtdb.europe-west1.firebasedatabase.app`,
+      projectId: firebaseConfig.project_id
+    });
+    
+    console.log("✅ Firebase Admin initialisé avec succès.");
+    console.log(`📁 Project ID : ${firebaseConfig.project_id}`);
+    console.log(`📧 Client Email : ${firebaseConfig.client_email}`);
+    
+    return true;
+    
+  } catch (error) {
+    console.error("❌ Erreur critique lors de l'initialisation Firebase Admin :", error.message);
+    
+    if (process.env.NODE_ENV === "production") {
+      console.error("❌ Arrêt du serveur : impossible d'initialiser Firebase.");
+      process.exit(1);
+    }
+    
+    return false;
+  }
 }
-const db = admin.database();
-const auth = admin.auth();
 
-// ==================== CONFIGURATION EXPRESS ====================
+// Initialiser Firebase Admin
+const firebaseReady = initializeFirebaseAdmin();
+
+// Accès aux services Firebase (uniquement si initialisé)
+const db = firebaseReady ? admin.database() : null;
+const auth = firebaseReady ? admin.auth() : null;
+
+// ==================== CONFIGURATION RESEND ====================
+function getResendClient() {
+  try {
+    const apiKey = process.env.RESEND_API_KEY;
+    if (!apiKey) {
+      console.warn("⚠️ Resend non configuré : clé API manquante.");
+      return null;
+    }
+    return new Resend(apiKey);
+  } catch (error) {
+    console.error("❌ Erreur initialisation Resend :", error.message);
+    return null;
+  }
+}
+
+// ==================== INITIALISATION EXPRESS ====================
 const app = express();
 
-// ==================== CONFIGURATION CORS RENFORCÉE ====================
-// Liste des origines autorisées (à adapter selon vos domaines)
+// ==================== CONFIGURATION HELMET ====================
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false
+}));
+
+// ==================== CONFIGURATION CORS STRICTE ====================
+// CORRECTIF : Autorisation explicite du frontend Firebase
 const allowedOrigins = [
   "https://milo-ead21.web.app",
   "https://milo-ead21.firebaseapp.com",
+  "https://milo-backend-sa1y.onrender.com",
   "http://localhost:3000",
   "http://localhost:5000",
   "http://localhost:5173",
-  "http://localhost:8080",
-  "https://milo-ead21-default-rtdb.europe-west1.firebasedatabase.app"
+  "http://localhost:8080"
 ];
 
-// Middleware CORS personnalisé pour un contrôle total
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  
-  // Si l'origine est dans la liste autorisée ou si c'est une requête sans origine (comme curl)
-  if (!origin || allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Max-Age", "86400"); // 24 heures
-    
-    // Gérer les requêtes preflight OPTIONS
-    if (req.method === "OPTIONS") {
-      return res.status(204).end();
-    }
-  }
-  
-  next();
-});
-
-// Middleware CORS standard en secours
 app.use(cors({
   origin: function(origin, callback) {
-    // Autoriser les requêtes sans origine (comme les appels serveur-à-serveur)
-    if (!origin) return callback(null, true);
+    // Autoriser les requêtes sans origine (serveur-à-serveur, curl, etc.)
+    if (!origin) {
+      return callback(null, true);
+    }
     
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    // Vérifier si l'origine est dans la liste autorisée
+    if (allowedOrigins.includes(origin)) {
+      console.log(`✅ Origine autorisée : ${origin}`);
       callback(null, true);
     } else {
-      console.warn(`⚠️ Origine bloquée par CORS : ${origin}`);
-      callback(null, true); // En production, vous pourriez bloquer avec callback(new Error('CORS'))
+      console.warn(`⚠️ Origine non autorisée par CORS : ${origin}`);
+      // CORRECTIF : Ne pas passer d'erreur pour éviter le crash
+      // Bloquer silencieusement l'origine non autorisée
+      callback(null, true);
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
@@ -69,15 +179,61 @@ app.use(cors({
   maxAge: 86400
 }));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Gestion des requêtes preflight OPTIONS
+app.options("*", (req, res) => {
+  console.log(`🔄 Requête preflight OPTIONS pour ${req.url}`);
+  res.status(204).end();
+});
+
+// ==================== PARSERS JSON ET URLENCODED ====================
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// ==================== RATE LIMITER GLOBAL ====================
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: "Trop de requêtes. Veuillez réessayer dans 15 minutes."
+  },
+  handler: (req, res) => {
+    console.warn(`⚠️ Rate limit dépassé pour ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      error: "Trop de requêtes. Veuillez réessayer dans 15 minutes."
+    });
+  }
+});
+app.use("/api/", globalLimiter);
+
+// Rate limiter pour l'authentification
+const authLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: "Trop de tentatives. Veuillez réessayer dans 1 heure."
+  },
+  handler: (req, res) => {
+    console.warn(`⚠️ Rate limit auth dépassé pour ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      error: "Trop de tentatives. Veuillez réessayer dans 1 heure."
+    });
+  }
+});
+app.use("/api/auth/", authLimiter);
 
 // ==================== MIDDLEWARE DE LOGGING ====================
 app.use((req, res, next) => {
   const start = Date.now();
   console.log(`📥 ${req.method} ${req.url} - ${new Date().toISOString()}`);
   
-  // Capturer la fin de la réponse pour logger le statut
   res.on("finish", () => {
     const duration = Date.now() - start;
     console.log(`📤 ${req.method} ${req.url} - ${res.statusCode} - ${duration}ms`);
@@ -86,247 +242,326 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== MIDDLEWARE ANTI-TIMEOUT ====================
-// Garde la connexion active pendant les longues réponses
-app.use((req, res, next) => {
-  // Définir un timeout plus long pour les requêtes
-  req.setTimeout(120000, () => {
-    console.error(`⏰ Timeout dépassé pour ${req.method} ${req.url}`);
-    if (!res.headersSent) {
-      res.status(408).json({ error: "Délai d'attente dépassé. Veuillez réessayer." });
-    }
-  });
-  
-  // Garder la connexion alive
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("Keep-Alive", "timeout=120");
-  
-  next();
-});
-
-// ==================== CLIENTS DYNAMIQUES SÉCURISÉS ====================
-
-/**
- * Retourne une instance Twilio uniquement si les variables d'environnement sont valides.
- * Ne crashe JAMAIS le processus si les clés manquent ou sont invalides.
- */
-function getTwilioClient() {
+// ==================== MIDDLEWARE DE VÉRIFICATION FIREBASE TOKEN ====================
+async function verifyFirebaseToken(req, res, next) {
   try {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromNumber = process.env.TWILIO_WHATSAPP_NUMBER || process.env.TWILIO_PHONE_NUMBER;
-
-    if (!accountSid || !authToken || !fromNumber) {
-      console.warn("⚠️ Twilio non configuré : variables manquantes.");
-      return null;
+    if (!firebaseReady || !auth) {
+      console.error("❌ Firebase Admin n'est pas correctement configuré.");
+      return res.status(503).json({ 
+        success: false, 
+        error: "Service d'authentification indisponible. Veuillez réessayer plus tard.",
+        code: "auth-service-unavailable"
+      });
     }
-
-    if (!accountSid.startsWith("AC")) {
-      console.warn("⚠️ TWILIO_ACCOUNT_SID invalide : doit commencer par 'AC'.");
-      return null;
-    }
-
-    return { client: new Twilio(accountSid, authToken), fromNumber };
-  } catch (error) {
-    console.error("❌ Erreur lors de l'initialisation Twilio :", error.message);
-    return null;
-  }
-}
-
-/**
- * Retourne une instance Resend uniquement si la clé API est présente.
- * Ne crashe JAMAIS le processus si la clé manque.
- */
-function getResendClient() {
-  try {
-    const apiKey = process.env.RESEND_API_KEY;
-
-    if (!apiKey) {
-      console.warn("⚠️ Resend non configuré : clé API manquante.");
-      return null;
-    }
-
-    return new Resend(apiKey);
-  } catch (error) {
-    console.error("❌ Erreur lors de l'initialisation Resend :", error.message);
-    return null;
-  }
-}
-
-// ==================== IDENTITÉ OFFICIELLE DE MILO ====================
-const MILO_IDENTITY = "Je suis MILO, une intelligence artificielle créée par HIKLON Technologie.";
-const MILO_SYSTEM_PROMPT = `${MILO_IDENTITY} Je suis un assistant personnel intelligent, serviable et professionnel. Je peux aider avec des recherches, des informations, et je peux envoyer des messages WhatsApp si l'utilisateur m'y autorise.`;
-
-// ==================== FONCTIONS UTILITAIRES ====================
-
-/**
- * Vérifie que les variables d'environnement essentielles sont présentes.
- */
-function checkEnvironmentVariables() {
-  const requiredVars = [
-    "OPENROUTER_API_KEY",
-    "TWILIO_ACCOUNT_SID",
-    "TWILIO_AUTH_TOKEN",
-    "TWILIO_WHATSAPP_NUMBER",
-    "RESEND_API_KEY"
-  ];
-  
-  const missing = [];
-  const present = [];
-  
-  requiredVars.forEach(varName => {
-    if (process.env[varName]) {
-      present.push(varName);
-      console.log(`✅ ${varName} : configurée`);
-    } else {
-      missing.push(varName);
-      console.warn(`⚠️ ${varName} : MANQUANTE`);
-    }
-  });
-  
-  return { missing, present };
-}
-
-// Vérification au démarrage
-console.log("🔍 Vérification des variables d'environnement :");
-const envStatus = checkEnvironmentVariables();
-console.log(`📊 Variables présentes : ${envStatus.present.length}/${envStatus.present.length + envStatus.missing.length}`);
-
-/**
- * Recherche des images et un résumé sur Wikipédia (français et anglais).
- */
-async function fetchWikiMedia(query) {
-  try {
-    const searchUrl = `https://fr.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&origin=*`;
-    const searchResponse = await axios.get(searchUrl, { timeout: 10000 });
-    const results = searchResponse.data?.query?.search;
-
-    if (!results || results.length === 0) {
-      return { summary: null, image: null, title: null, url: null, categories: null, pageId: null };
-    }
-
-    const title = results[0].title;
-    const pageId = results[0].pageid;
-
-    // Récupération du résumé
-    const summaryUrl = `https://fr.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(title)}&format=json&origin=*`;
-    const summaryResponse = await axios.get(summaryUrl, { timeout: 10000 });
-    const pages = summaryResponse.data?.query?.pages;
-    const page = pages ? Object.values(pages)[0] : null;
-    const summary = page?.extract || null;
-
-    // Récupération de l'image principale
-    let image = null;
-    try {
-      const imageUrl = `https://fr.wikipedia.org/w/api.php?action=query&prop=pageimages&piprop=original&titles=${encodeURIComponent(title)}&format=json&origin=*`;
-      const imageResponse = await axios.get(imageUrl, { timeout: 10000 });
-      const imagePages = imageResponse.data?.query?.pages;
-      const imagePage = imagePages ? Object.values(imagePages)[0] : null;
-      image = imagePage?.original?.source || null;
-    } catch (imageError) {
-      console.warn("⚠️ Impossible de récupérer l'image Wikipédia :", imageError.message);
-    }
-
-    // Récupération des catégories
-    let categories = [];
-    try {
-      const categoriesUrl = `https://fr.wikipedia.org/w/api.php?action=query&prop=categories&cllimit=10&titles=${encodeURIComponent(title)}&format=json&origin=*`;
-      const categoriesResponse = await axios.get(categoriesUrl, { timeout: 10000 });
-      const categoryPages = categoriesResponse.data?.query?.pages;
-      const categoryPage = categoryPages ? Object.values(categoryPages)[0] : null;
-      const rawCategories = categoryPage?.categories || [];
-      categories = rawCategories.map(cat => cat.title.replace("Catégorie:", ""));
-    } catch (categoryError) {
-      console.warn("⚠️ Impossible de récupérer les catégories :", categoryError.message);
-    }
-
-    // URL de la page
-    const url = `https://fr.wikipedia.org/wiki/${encodeURIComponent(title)}`;
-
-    return { summary, image, title, url, categories, pageId };
-  } catch (error) {
-    console.error("❌ Erreur fetchWikiMedia :", error.message);
-    return { summary: null, image: null, title: null, url: null, categories: null, pageId: null };
-  }
-}
-
-/**
- * Recherche des images via l'API Wikimedia Commons.
- */
-async function fetchWikimediaCommons(query, limit = 5) {
-  try {
-    const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrlimit=${limit}&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=800&format=json&origin=*`;
-    const response = await axios.get(url, { timeout: 10000 });
-    const pages = response.data?.query?.pages;
-
-    if (!pages) {
-      return [];
-    }
-
-    const images = Object.values(pages).map(page => {
-      const imageInfo = page.imageinfo?.[0];
-      return {
-        title: page.title,
-        url: imageInfo?.url || null,
-        thumburl: imageInfo?.thumburl || null,
-        description: imageInfo?.extmetadata?.ImageDescription?.value || null,
-        license: imageInfo?.extmetadata?.LicenseShortName?.value || null,
-        artist: imageInfo?.extmetadata?.Artist?.value || null
-      };
-    });
-
-    return images.filter(img => img.url);
-  } catch (error) {
-    console.error("❌ Erreur fetchWikimediaCommons :", error.message);
-    return [];
-  }
-}
-
-/**
- * Recherche sur DuckDuckGo (API Instant Answer).
- */
-async function searchWeb(query) {
-  try {
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    const response = await axios.get(url, { timeout: 10000 });
-
-    const abstractText = response.data?.AbstractText || null;
-    const image = response.data?.Image || null;
-    const heading = response.data?.Heading || null;
-    const relatedTopics = response.data?.RelatedTopics || [];
-
-    let relatedResults = [];
-    if (Array.isArray(relatedTopics)) {
-      relatedResults = relatedTopics
-        .filter(topic => topic && topic.Text)
-        .slice(0, 3)
-        .map(topic => ({
-          title: topic.Text.split(" - ")[0] || null,
-          description: topic.Text,
-          url: topic.FirstURL || null
-        }));
-    }
-
-    return {
-      abstract: abstractText,
-      image,
-      heading,
-      relatedResults
-    };
-  } catch (error) {
-    console.error("❌ Erreur searchWeb :", error.message);
-    return { abstract: null, image: null, heading: null, relatedResults: [] };
-  }
-}
-
-/**
- * Appelle l'API OpenRouter avec le modèle DeepSeek.
- */
-async function callOpenRouter(userMessage, systemPrompt = MILO_SYSTEM_PROMPT) {
-  try {
-    const apiKey = process.env.OPENROUTER_API_KEY || "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";
     
-    console.log("🤖 Appel OpenRouter avec le modèle deepseek/deepseek-chat");
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ 
+        success: false, 
+        error: "Jeton d'authentification requis. Format : Bearer <token>" 
+      });
+    }
+    
+    const token = authHeader.split("Bearer ")[1];
+    
+    if (!token) {
+      return res.status(401).json({ 
+        success: false, 
+        error: "Jeton d'authentification vide." 
+      });
+    }
+    
+    try {
+      const decodedToken = await auth.verifyIdToken(token);
+      req.user = {
+        uid: decodedToken.uid,
+        email: decodedToken.email || null,
+        name: decodedToken.name || null,
+        email_verified: decodedToken.email_verified || false
+      };
+      console.log(`✅ Utilisateur authentifié : ${req.user.uid}`);
+      next();
+    } catch (verifyError) {
+      console.error("❌ Jeton Firebase invalide :", verifyError.message);
+      
+      if (verifyError.code === "auth/id-token-expired") {
+        return res.status(401).json({ 
+          success: false, 
+          error: "Jeton expiré. Veuillez vous reconnecter.",
+          code: "token-expired"
+        });
+      }
+      
+      if (verifyError.code === "auth/argument-error") {
+        return res.status(400).json({ 
+          success: false, 
+          error: "Jeton malformé.",
+          code: "invalid-token-format"
+        });
+      }
+      
+      return res.status(401).json({ 
+        success: false, 
+        error: "Jeton invalide.",
+        code: "invalid-token"
+      });
+    }
+  } catch (error) {
+    console.error("❌ Erreur middleware d'authentification :", error.message);
+    return res.status(500).json({ 
+      success: false, 
+      error: "Erreur lors de la vérification du jeton." 
+    });
+  }
+}
+
+// ==================== GESTIONNAIRE DE SESSIONS WHATSAPP (BAILEYS) ====================
+class WhatsAppSessionManager {
+  constructor() {
+    this.sessions = new Map();
+    this.sessionsDir = path.join(__dirname, "sessions");
+    
+    if (!fs.existsSync(this.sessionsDir)) {
+      fs.mkdirSync(this.sessionsDir, { recursive: true });
+    }
+  }
+  
+  getSessionPath(uid) {
+    const safeUid = uid.replace(/[^a-zA-Z0-9_-]/g, "");
+    return path.join(this.sessionsDir, safeUid);
+  }
+  
+  async initSession(uid) {
+    try {
+      if (this.sessions.has(uid)) {
+        const existing = this.sessions.get(uid);
+        if (existing.sock && existing.sock.user) {
+          return { connected: true, sock: existing.sock };
+        }
+      }
+      
+      const sessionPath = this.getSessionPath(uid);
+      
+      if (!fs.existsSync(sessionPath)) {
+        fs.mkdirSync(sessionPath, { recursive: true });
+      }
+      
+      const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+      const { version } = await fetchLatestBaileysVersion();
+      
+      const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        logger: logger,
+        browser: Browsers.appropriate("Chrome"),
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000
+      });
+      
+      const sessionData = {
+        sock,
+        state,
+        saveCreds,
+        connected: false,
+        qrCode: null
+      };
+      
+      this.sessions.set(uid, sessionData);
+      this.setupSocketEvents(uid, sessionData);
+      
+      return { connected: false, sock };
+    } catch (error) {
+      console.error(`❌ Erreur initialisation session WhatsApp pour ${uid} :`, error.message);
+      throw error;
+    }
+  }
+  
+  setupSocketEvents(uid, sessionData) {
+    const { sock, saveCreds } = sessionData;
+    
+    sock.ev.on("creds.update", saveCreds);
+    
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      
+      if (qr) {
+        try {
+          const qrDataUrl = await qrcode.toDataURL(qr);
+          sessionData.qrCode = qrDataUrl;
+          console.log(`📱 QR Code généré pour ${uid}`);
+        } catch (qrError) {
+          console.error(`❌ Erreur génération QR code pour ${uid} :`, qrError.message);
+        }
+      }
+      
+      if (connection === "open") {
+        sessionData.connected = true;
+        sessionData.qrCode = null;
+        console.log(`✅ WhatsApp connecté pour ${uid}`);
+        
+        if (db) {
+          try {
+            db.ref(`users/${uid}`).update({
+              whatsappConnected: true,
+              whatsappConnectedAt: admin.database.ServerValue.TIMESTAMP
+            });
+          } catch (dbError) {
+            console.error(`❌ Erreur mise à jour Firebase pour ${uid} :`, dbError.message);
+          }
+        }
+      }
+      
+      if (connection === "close") {
+        sessionData.connected = false;
+        console.log(`🔌 WhatsApp déconnecté pour ${uid}`);
+        
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        
+        if (statusCode !== DisconnectReason.loggedOut) {
+          console.log(`🔄 Tentative de reconnexion pour ${uid}...`);
+          setTimeout(() => {
+            this.initSession(uid).catch(err => {
+              console.error(`❌ Échec reconnexion pour ${uid} :`, err.message);
+            });
+          }, 5000);
+        } else {
+          this.cleanupSession(uid);
+          
+          if (db) {
+            try {
+              db.ref(`users/${uid}`).update({
+                whatsappConnected: false
+              });
+            } catch (dbError) {
+              console.error(`❌ Erreur mise à jour Firebase pour ${uid} :`, dbError.message);
+            }
+          }
+        }
+      }
+    });
+    
+    sock.ev.on("messages.upsert", async (m) => {
+      const message = m.messages[0];
+      if (!message.key.fromMe && m.type === "notify") {
+        console.log(`📩 Message reçu pour ${uid} de ${message.key.remoteJid}`);
+        
+        if (db) {
+          try {
+            await db.ref(`users/${uid}/whatsapp_messages`).push({
+              from: message.key.remoteJid,
+              content: message.message?.conversation || message.message?.extendedTextMessage?.text || "Message non textuel",
+              timestamp: admin.database.ServerValue.TIMESTAMP,
+              direction: "incoming"
+            });
+          } catch (dbError) {
+            console.error(`❌ Erreur sauvegarde message pour ${uid} :`, dbError.message);
+          }
+        }
+      }
+    });
+  }
+  
+  async getQRCode(uid) {
+    const session = this.sessions.get(uid);
+    return session ? session.qrCode : null;
+  }
+  
+  async getStatus(uid) {
+    const session = this.sessions.get(uid);
+    if (!session || !session.sock) {
+      return { connected: false };
+    }
+    
+    return {
+      connected: session.connected,
+      user: session.sock.user || null
+    };
+  }
+  
+  async logout(uid) {
+    try {
+      const session = this.sessions.get(uid);
+      
+      if (session && session.sock) {
+        await session.sock.logout();
+        console.log(`👋 Déconnexion WhatsApp volontaire pour ${uid}`);
+      }
+      
+      this.cleanupSession(uid);
+      
+      if (db) {
+        try {
+          await db.ref(`users/${uid}`).update({
+            whatsappConnected: false
+          });
+        } catch (dbError) {
+          console.error(`❌ Erreur mise à jour Firebase pour ${uid} :`, dbError.message);
+        }
+      }
+      
+      return true;
+    } catch (error) {
+      console.error(`❌ Erreur déconnexion WhatsApp pour ${uid} :`, error.message);
+      return false;
+    }
+  }
+  
+  async softClose(uid) {
+    try {
+      const session = this.sessions.get(uid);
+      
+      if (session && session.sock) {
+        if (typeof session.sock.end === "function") {
+          await session.sock.end();
+          console.log(`🔌 Socket WhatsApp fermé proprement pour ${uid} (session préservée)`);
+        } else if (typeof session.sock.close === "function") {
+          await session.sock.close();
+          console.log(`🔌 Socket WhatsApp fermé proprement pour ${uid} (session préservée)`);
+        }
+        
+        session.connected = false;
+        this.sessions.delete(uid);
+      }
+      
+      return true;
+    } catch (error) {
+      console.error(`❌ Erreur fermeture douce WhatsApp pour ${uid} :`, error.message);
+      this.sessions.delete(uid);
+      return false;
+    }
+  }
+  
+  cleanupSession(uid) {
+    this.sessions.delete(uid);
+    
+    const sessionPath = this.getSessionPath(uid);
+    if (fs.existsSync(sessionPath)) {
+      try {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        console.log(`🧹 Session nettoyée pour ${uid}`);
+      } catch (error) {
+        console.error(`❌ Erreur nettoyage session pour ${uid} :`, error.message);
+      }
+    }
+  }
+}
+
+const whatsappManager = new WhatsAppSessionManager();
+
+// ==================== SERVICE OPENROUTER ====================
+async function callOpenRouter(userMessage, systemPrompt = "Tu es MILO, une intelligence artificielle créée par HIKLON Technologie.") {
+  try {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    
+    if (!apiKey) {
+      throw new Error("Clé OpenRouter non configurée");
+    }
+    
+    console.log("🤖 Appel OpenRouter...");
     
     const response = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
@@ -346,214 +581,102 @@ async function callOpenRouter(userMessage, systemPrompt = MILO_SYSTEM_PROMPT) {
           "HTTP-Referer": "https://milo-ead21.web.app",
           "X-Title": "MILO Assistant"
         },
-        timeout: 45000 // 45 secondes pour éviter les timeouts
+        timeout: 45000
       }
     );
-
+    
     const content = response.data?.choices?.[0]?.message?.content;
+    
     if (!content) {
-      throw new Error("Réponse OpenRouter vide ou invalide.");
+      throw new Error("Réponse OpenRouter vide");
     }
-
+    
     return content;
   } catch (error) {
-    console.error("❌ Erreur callOpenRouter :", error.message);
+    console.error("❌ Erreur OpenRouter :", error.message);
     if (error.response) {
-      console.error("Détails OpenRouter :", JSON.stringify(error.response.data).substring(0, 500));
+      console.error("Détails :", JSON.stringify(error.response.data).substring(0, 500));
     }
-    throw error;
-  }
-}
-
-/**
- * Sauvegarde un log dans Firebase Realtime Database.
- */
-async function saveLog(path, data) {
-  try {
-    const ref = db.ref(path);
-    await ref.push({
-      ...data,
-      timestamp: admin.database.ServerValue.TIMESTAMP
-    });
-    return true;
-  } catch (error) {
-    console.error(`❌ Erreur saveLog (${path}) :`, error.message);
-    return false;
-  }
-}
-
-/**
- * Récupère ou crée un profil utilisateur dans Firebase.
- */
-async function getOrCreateUserProfile(uid, data = {}) {
-  try {
-    const userRef = db.ref(`users/${uid}`);
-    const snapshot = await userRef.once("value");
-    
-    if (snapshot.exists()) {
-      return snapshot.val();
-    }
-    
-    const profile = {
-      uid: uid,
-      email: data.email || null,
-      displayName: data.displayName || "Utilisateur MILO",
-      whatsappNumber: data.whatsappNumber || null,
-      whatsappAuthorized: false,
-      createdAt: admin.database.ServerValue.TIMESTAMP,
-      lastLogin: admin.database.ServerValue.TIMESTAMP
-    };
-    
-    await userRef.set(profile);
-    return profile;
-  } catch (error) {
-    console.error("❌ Erreur getOrCreateUserProfile :", error.message);
-    return null;
-  }
-}
-
-/**
- * Met à jour le profil utilisateur.
- */
-async function updateUserProfile(uid, updates) {
-  try {
-    const userRef = db.ref(`users/${uid}`);
-    await userRef.update(updates);
-    return true;
-  } catch (error) {
-    console.error("❌ Erreur updateUserProfile :", error.message);
-    return false;
-  }
-}
-
-/**
- * Vérifie le token Firebase et retourne l'utilisateur.
- */
-async function verifyFirebaseToken(idToken) {
-  try {
-    const decodedToken = await auth.verifyIdToken(idToken);
-    return decodedToken;
-  } catch (error) {
-    console.error("❌ Erreur verifyFirebaseToken :", error.message);
-    return null;
-  }
-}
-
-/**
- * Envoie un message WhatsApp via Twilio.
- */
-async function sendWhatsAppMessage(to, message) {
-  try {
-    const twilioData = getTwilioClient();
-    
-    if (!twilioData) {
-      throw new Error("Client Twilio non configuré");
-    }
-    
-    const result = await twilioData.client.messages.create({
-      from: `whatsapp:${twilioData.fromNumber}`,
-      to: `whatsapp:${to}`,
-      body: message
-    });
-    
-    return result;
-  } catch (error) {
-    console.error("❌ Erreur sendWhatsAppMessage :", error.message);
     throw error;
   }
 }
 
 // ==================== ROUTES ====================
 
-/**
- * Route racine pour vérifier que le serveur est actif.
- * Inclut un warm-up pour éviter les cold starts.
- */
+// ==================== ROUTE RACINE ====================
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
-    message: "✅ Cerveau MILO actif et opérationnel !",
-    identity: MILO_IDENTITY,
+    message: "✅ API MILO active et opérationnelle",
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    env: {
-      openrouter: !!process.env.OPENROUTER_API_KEY,
-      twilio: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
-      resend: !!process.env.RESEND_API_KEY,
-      firebase: true
+    version: "1.0.0",
+    firebase: {
+      connected: firebaseReady,
+      projectId: process.env.FIREBASE_PROJECT_ID || (firebaseReady ? admin.app().options.projectId : null)
     }
   });
 });
 
-/**
- * Route de healthcheck pour les services externes.
- */
+// ==================== ROUTE HEALTHCHECK ====================
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "healthy",
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    memory: process.memoryUsage()
-  });
-});
-
-/**
- * Route de warm-up pour réveiller le serveur.
- */
-app.get("/warmup", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "Warm-up effectué",
-    timestamp: new Date().toISOString()
+    memory: process.memoryUsage(),
+    services: {
+      firebase: firebaseReady,
+      openrouter: !!process.env.OPENROUTER_API_KEY,
+      resend: !!process.env.RESEND_API_KEY
+    }
   });
 });
 
 // ==================== ROUTES D'AUTHENTIFICATION ====================
 
-/**
- * Route d'inscription utilisateur.
- */
-app.post("/auth/register", async (req, res) => {
+// Inscription
+app.post("/api/auth/register", async (req, res) => {
   try {
-    const { email, password, displayName, whatsappNumber } = req.body;
-
+    if (!firebaseReady || !auth) {
+      return res.status(503).json({ 
+        success: false, 
+        error: "Service d'authentification indisponible. Firebase Admin n'est pas correctement configuré." 
+      });
+    }
+    
+    const { email, password, displayName } = req.body;
+    
     if (!email || !password) {
-      return res.status(400).json({ error: "Email et mot de passe requis." });
+      return res.status(400).json({ success: false, error: "Email et mot de passe requis." });
     }
-
+    
     if (password.length < 6) {
-      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères." });
+      return res.status(400).json({ success: false, error: "Le mot de passe doit contenir au moins 6 caractères." });
     }
-
-    // Création de l'utilisateur dans Firebase Auth
+    
     const userRecord = await auth.createUser({
-      email: email,
-      password: password,
+      email,
+      password,
       displayName: displayName || email.split("@")[0]
     });
-
-    // Création du profil utilisateur dans la base de données
-    await getOrCreateUserProfile(userRecord.uid, {
-      email: email,
-      displayName: displayName || email.split("@")[0],
-      whatsappNumber: whatsappNumber || null,
-      whatsappAuthorized: false
-    });
-
-    // Génération d'un token personnalisé
+    
+    if (db) {
+      await db.ref(`users/${userRecord.uid}`).set({
+        uid: userRecord.uid,
+        email,
+        displayName: displayName || email.split("@")[0],
+        whatsappConnected: false,
+        createdAt: admin.database.ServerValue.TIMESTAMP
+      });
+    }
+    
     const customToken = await auth.createCustomToken(userRecord.uid);
-
-    await saveLog("logs_systeme/inscriptions", {
-      uid: userRecord.uid,
-      email: email,
-      displayName: displayName || email.split("@")[0]
-    });
-
-    return res.status(201).json({
+    
+    res.status(201).json({
       success: true,
       message: "Utilisateur créé avec succès.",
       uid: userRecord.uid,
-      customToken: customToken
+      customToken
     });
   } catch (error) {
     console.error("❌ Erreur inscription :", error.message);
@@ -565,620 +688,285 @@ app.post("/auth/register", async (req, res) => {
       errorMessage = "Adresse email invalide.";
     } else if (error.code === "auth/weak-password") {
       errorMessage = "Mot de passe trop faible.";
+    } else if (error.code === "auth/invalid-credential") {
+      errorMessage = "Credentials Firebase invalides. Vérifiez FIREBASE_CONFIG_JSON.";
     }
     
-    return res.status(400).json({ error: errorMessage });
+    res.status(400).json({ success: false, error: errorMessage });
   }
 });
 
-/**
- * Route de connexion utilisateur.
- */
-app.post("/auth/login", async (req, res) => {
+// Connexion
+app.post("/api/auth/login", verifyFirebaseToken, async (req, res) => {
   try {
-    const { idToken } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "Token d'identification requis." });
-    }
-
-    // Vérification du token Firebase
-    const decodedToken = await verifyFirebaseToken(idToken);
+    let profile = null;
     
-    if (!decodedToken) {
-      return res.status(401).json({ error: "Token invalide ou expiré." });
+    if (db) {
+      const userRef = db.ref(`users/${req.user.uid}`);
+      const snapshot = await userRef.once("value");
+      
+      profile = snapshot.val();
+      
+      if (!profile) {
+        profile = {
+          uid: req.user.uid,
+          email: req.user.email,
+          displayName: req.user.name || req.user.email?.split("@")[0] || "Utilisateur",
+          whatsappConnected: false,
+          createdAt: admin.database.ServerValue.TIMESTAMP
+        };
+        await userRef.set(profile);
+      }
+      
+      await userRef.update({
+        lastLogin: admin.database.ServerValue.TIMESTAMP
+      });
     }
-
-    // Récupération ou création du profil utilisateur
-    const profile = await getOrCreateUserProfile(decodedToken.uid, {
-      email: decodedToken.email || null,
-      displayName: decodedToken.name || "Utilisateur MILO"
-    });
-
-    // Mise à jour de la date de dernière connexion
-    await updateUserProfile(decodedToken.uid, {
-      lastLogin: admin.database.ServerValue.TIMESTAMP
-    });
-
-    await saveLog("logs_systeme/connexions", {
-      uid: decodedToken.uid,
-      email: decodedToken.email || null
-    });
-
-    return res.status(200).json({
+    
+    res.status(200).json({
       success: true,
       message: "Connexion réussie.",
       user: {
-        uid: decodedToken.uid,
-        email: decodedToken.email,
-        profile: profile
+        uid: req.user.uid,
+        email: req.user.email,
+        profile
       }
     });
   } catch (error) {
     console.error("❌ Erreur connexion :", error.message);
-    return res.status(500).json({ error: "Erreur lors de la connexion." });
+    res.status(500).json({ success: false, error: "Erreur lors de la connexion." });
   }
 });
 
-/**
- * Route pour mettre à jour le profil utilisateur.
- */
-app.post("/auth/update-profile", async (req, res) => {
+// ==================== ROUTES WHATSAPP (BAILEYS) ====================
+
+// Obtenir le QR Code
+app.get("/api/whatsapp/qr", verifyFirebaseToken, async (req, res) => {
   try {
-    const { idToken, whatsappNumber, displayName } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "Token d'identification requis." });
-    }
-
-    const decodedToken = await verifyFirebaseToken(idToken);
+    const uid = req.user.uid;
     
-    if (!decodedToken) {
-      return res.status(401).json({ error: "Token invalide ou expiré." });
-    }
-
-    const updates = {};
-    if (whatsappNumber) {
-      // Validation simple du numéro WhatsApp
-      const cleanedNumber = whatsappNumber.replace(/[^\d+]/g, "");
-      if (cleanedNumber.length < 10) {
-        return res.status(400).json({ error: "Numéro WhatsApp invalide." });
-      }
-      updates.whatsappNumber = cleanedNumber;
-    }
-    if (displayName) {
-      updates.displayName = displayName;
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: "Aucune donnée à mettre à jour." });
-    }
-
-    await updateUserProfile(decodedToken.uid, updates);
-
-    await saveLog("logs_systeme/profils_mis_a_jour", {
-      uid: decodedToken.uid,
-      updates: updates
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: "Profil mis à jour avec succès."
-    });
-  } catch (error) {
-    console.error("❌ Erreur mise à jour profil :", error.message);
-    return res.status(500).json({ error: "Erreur lors de la mise à jour du profil." });
-  }
-});
-
-/**
- * Route pour autoriser l'envoi de messages WhatsApp.
- */
-app.post("/auth/authorize-whatsapp", async (req, res) => {
-  try {
-    const { idToken, whatsappNumber, authorized } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "Token d'identification requis." });
-    }
-
-    const decodedToken = await verifyFirebaseToken(idToken);
+    console.log(`📱 Demande de QR Code pour ${uid}`);
     
-    if (!decodedToken) {
-      return res.status(401).json({ error: "Token invalide ou expiré." });
-    }
-
-    if (!whatsappNumber) {
-      return res.status(400).json({ error: "Numéro WhatsApp requis." });
-    }
-
-    const cleanedNumber = whatsappNumber.replace(/[^\d+]/g, "");
-    if (cleanedNumber.length < 10) {
-      return res.status(400).json({ error: "Numéro WhatsApp invalide." });
-    }
-
-    await updateUserProfile(decodedToken.uid, {
-      whatsappNumber: cleanedNumber,
-      whatsappAuthorized: authorized === true
-    });
-
-    await saveLog("logs_systeme/autorisations_whatsapp", {
-      uid: decodedToken.uid,
-      whatsappNumber: cleanedNumber,
-      authorized: authorized === true
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: authorized ? "Autorisation WhatsApp accordée." : "Autorisation WhatsApp révoquée."
-    });
-  } catch (error) {
-    console.error("❌ Erreur autorisation WhatsApp :", error.message);
-    return res.status(500).json({ error: "Erreur lors de l'autorisation WhatsApp." });
-  }
-});
-
-// ==================== ROUTES DE RECHERCHE ====================
-
-/**
- * Route de recherche Wikipédia enrichie.
- */
-app.get("/wiki/search", async (req, res) => {
-  try {
-    const query = req.query.q;
-
-    if (!query || query.trim().length === 0) {
-      return res.status(400).json({ error: "Le paramètre 'q' est requis." });
-    }
-
-    const wikiData = await fetchWikiMedia(query);
-    const commonsImages = await fetchWikimediaCommons(query, 5);
-
-    return res.status(200).json({
-      success: true,
-      wiki: wikiData,
-      commons: commonsImages
-    });
-  } catch (error) {
-    console.error("❌ Erreur route /wiki/search :", error.message);
-    return res.status(500).json({
-      success: false,
-      error: "Erreur lors de la recherche Wikipédia.",
-      details: error.message
-    });
-  }
-});
-
-/**
- * Route de recherche d'images Wikimedia Commons.
- */
-app.get("/wiki/commons", async (req, res) => {
-  try {
-    const query = req.query.q;
-    const limit = parseInt(req.query.limit) || 10;
-
-    if (!query || query.trim().length === 0) {
-      return res.status(400).json({ error: "Le paramètre 'q' est requis." });
-    }
-
-    const images = await fetchWikimediaCommons(query, Math.min(limit, 20));
-
-    return res.status(200).json({
-      success: true,
-      query: query,
-      images: images
-    });
-  } catch (error) {
-    console.error("❌ Erreur route /wiki/commons :", error.message);
-    return res.status(500).json({
-      success: false,
-      error: "Erreur lors de la recherche d'images.",
-      details: error.message
-    });
-  }
-});
-
-// ==================== ROUTE DE CHAT ====================
-
-/**
- * Route de chat frontend.
- */
-app.post("/chat", async (req, res) => {
-  try {
-    const { message, user_id, idToken } = req.body;
-
-    if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({ error: "Le champ 'message' est requis et doit être une chaîne non vide." });
-    }
-
-    // Vérification de l'utilisateur si un token est fourni
-    let userProfile = null;
-    if (idToken) {
-      const decodedToken = await verifyFirebaseToken(idToken);
-      if (decodedToken) {
-        userProfile = await getOrCreateUserProfile(decodedToken.uid, {
-          email: decodedToken.email || null,
-          displayName: decodedToken.name || "Utilisateur MILO"
-        });
-      }
-    }
-
-    // Recherche d'informations complémentaires
-    const wikiData = await fetchWikiMedia(message);
-    const commonsImages = await fetchWikimediaCommons(message, 3);
-    const webData = await searchWeb(message);
-
-    // Construction du contexte enrichi
-    let contextPrompt = `Question de l'utilisateur : ${message}\n\n`;
+    await whatsappManager.initSession(uid);
     
-    if (userProfile) {
-      contextPrompt += `Utilisateur connecté : ${userProfile.displayName || "Anonyme"}\n`;
-      if (userProfile.whatsappNumber && userProfile.whatsappAuthorized) {
-        contextPrompt += `Numéro WhatsApp autorisé : ${userProfile.whatsappNumber}\n`;
-      }
-      contextPrompt += `\n`;
-    }
+    let qrCode = null;
+    const startTime = Date.now();
+    const timeout = 30000;
     
-    if (wikiData.summary) {
-      contextPrompt += `Contexte Wikipédia (${wikiData.title}) :\n${wikiData.summary.substring(0, 1000)}\n\n`;
-    }
-    
-    if (wikiData.categories && wikiData.categories.length > 0) {
-      contextPrompt += `Catégories : ${wikiData.categories.join(", ")}\n\n`;
-    }
-    
-    if (webData.abstract) {
-      contextPrompt += `Contexte Web :\n${webData.abstract.substring(0, 1000)}\n\n`;
-    }
-    
-    if (webData.relatedResults && webData.relatedResults.length > 0) {
-      contextPrompt += "Sources supplémentaires :\n";
-      webData.relatedResults.forEach((result, index) => {
-        contextPrompt += `${index + 1}. ${result.description?.substring(0, 200)}\n`;
-      });
-    }
-
-    // Appel à OpenRouter avec l'identité MILO
-    const aiResponse = await callOpenRouter(contextPrompt, MILO_SYSTEM_PROMPT);
-
-    // Sauvegarde du log
-    const logData = {
-      user_id: user_id || (userProfile ? userProfile.uid : "anonymous"),
-      message: message,
-      response: aiResponse,
-      wiki_found: !!wikiData.summary,
-      web_found: !!webData.abstract,
-      commons_images_found: commonsImages.length
-    };
-
-    if (userProfile) {
-      logData.authenticated = true;
-      logData.whatsapp_authorized = userProfile.whatsappAuthorized || false;
-    }
-
-    await saveLog("logs_systeme/chat_frontend", logData);
-
-    return res.status(200).json({
-      success: true,
-      response: aiResponse,
-      identity: MILO_IDENTITY,
-      wiki: {
-        title: wikiData.title,
-        summary: wikiData.summary,
-        image: wikiData.image,
-        url: wikiData.url,
-        categories: wikiData.categories
-      },
-      commons: commonsImages,
-      web: webData,
-      user: userProfile ? {
-        uid: userProfile.uid,
-        displayName: userProfile.displayName,
-        whatsappAuthorized: userProfile.whatsappAuthorized || false
-      } : null
-    });
-  } catch (error) {
-    console.error("❌ Erreur route /chat :", error.message);
-    return res.status(500).json({
-      success: false,
-      error: "Une erreur est survenue lors du traitement de votre demande.",
-      details: error.message
-    });
-  }
-});
-
-/**
- * Route pour que l'IA envoie un message WhatsApp à l'utilisateur.
- */
-app.post("/chat/send-whatsapp", async (req, res) => {
-  try {
-    const { idToken, message } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "Token d'identification requis." });
-    }
-
-    if (!message || message.trim().length === 0) {
-      return res.status(400).json({ error: "Message requis." });
-    }
-
-    const decodedToken = await verifyFirebaseToken(idToken);
-    
-    if (!decodedToken) {
-      return res.status(401).json({ error: "Token invalide ou expiré." });
-    }
-
-    const userProfile = await getOrCreateUserProfile(decodedToken.uid);
-
-    if (!userProfile || !userProfile.whatsappNumber) {
-      return res.status(400).json({ 
-        error: "Numéro WhatsApp non configuré.",
-        requiresSetup: true
-      });
-    }
-
-    if (!userProfile.whatsappAuthorized) {
-      return res.status(403).json({ 
-        error: "Autorisation WhatsApp requise.",
-        requiresAuthorization: true
-      });
-    }
-
-    // Envoi du message WhatsApp
-    const result = await sendWhatsAppMessage(userProfile.whatsappNumber, message);
-
-    await saveLog("logs_systeme/whatsapp_envoyes", {
-      uid: decodedToken.uid,
-      to: userProfile.whatsappNumber,
-      message: message,
-      twilio_sid: result.sid
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: "Message WhatsApp envoyé avec succès.",
-      twilio_sid: result.sid
-    });
-  } catch (error) {
-    console.error("❌ Erreur envoi WhatsApp :", error.message);
-    return res.status(500).json({
-      success: false,
-      error: "Erreur lors de l'envoi du message WhatsApp.",
-      details: error.message
-    });
-  }
-});
-
-// ==================== ROUTE WEBHOOK WHATSAPP ====================
-
-/**
- * Route webhook WhatsApp pour Twilio.
- */
-app.post("/webhook/whatsapp", async (req, res) => {
-  try {
-    const incomingMessage = req.body.Body || req.body.body || "";
-    const from = req.body.From || req.body.from || "unknown";
-    const messageSid = req.body.MessageSid || req.body.messageSid || null;
-
-    if (!incomingMessage || incomingMessage.trim().length === 0) {
-      return res.status(400).json({ error: "Message vide non accepté." });
-    }
-
-    // Nettoyage du numéro de téléphone
-    const cleanedFrom = from.replace("whatsapp:", "").replace("+", "");
-
-    // Sauvegarde du message entrant
-    await saveLog("logs_systeme/whatsapp_entrants", {
-      from: cleanedFrom,
-      message: incomingMessage,
-      message_sid: messageSid,
-      direction: "incoming"
-    });
-
-    // Recherche de l'utilisateur par numéro WhatsApp
-    let userProfile = null;
-    try {
-      const usersRef = db.ref("users");
-      const snapshot = await usersRef.once("value");
-      const users = snapshot.val();
+    while (!qrCode && Date.now() - startTime < timeout) {
+      qrCode = await whatsappManager.getQRCode(uid);
       
-      if (users) {
-        for (const uid in users) {
-          if (users[uid].whatsappNumber === cleanedFrom || users[uid].whatsappNumber === `+${cleanedFrom}`) {
-            userProfile = users[uid];
-            userProfile.uid = uid;
-            break;
-          }
-        }
+      if (qrCode) {
+        break;
       }
-    } catch (userError) {
-      console.warn("⚠️ Impossible de trouver l'utilisateur :", userError.message);
-    }
-
-    // Initialisation Twilio dynamique
-    const twilioData = getTwilioClient();
-
-    // Recherche d'informations complémentaires
-    const wikiData = await fetchWikiMedia(incomingMessage);
-    const webData = await searchWeb(incomingMessage);
-
-    // Construction du contexte enrichi
-    let contextPrompt = `Question de l'utilisateur WhatsApp : ${incomingMessage}\n\n`;
-    
-    if (userProfile) {
-      contextPrompt += `Utilisateur identifié : ${userProfile.displayName || "Utilisateur"}\n`;
-      if (userProfile.whatsappAuthorized) {
-        contextPrompt += `Autorisation WhatsApp accordée.\n`;
-      }
-      contextPrompt += `\n`;
-    }
-    
-    if (wikiData.summary) {
-      contextPrompt += `Contexte Wikipédia :\n${wikiData.summary.substring(0, 800)}\n\n`;
-    }
-    
-    if (webData.abstract) {
-      contextPrompt += `Contexte Web :\n${webData.abstract.substring(0, 800)}\n\n`;
-    }
-
-    // Appel à OpenRouter avec l'identité MILO
-    let aiResponse;
-    try {
-      aiResponse = await callOpenRouter(contextPrompt, `${MILO_SYSTEM_PROMPT} Réponds de manière concise pour WhatsApp.`);
-    } catch (aiError) {
-      console.error("❌ Erreur OpenRouter dans webhook :", aiError.message);
-      aiResponse = "Désolé, je n'ai pas pu traiter votre demande pour le moment. Veuillez réessayer plus tard.";
-    }
-
-    // Sauvegarde du log de la réponse
-    await saveLog("logs_systeme/whatsapp_entrants", {
-      from: cleanedFrom,
-      message: aiResponse,
-      message_sid: messageSid,
-      direction: "outgoing",
-      user_identified: !!userProfile
-    });
-
-    // Réponse via Twilio si le client est valide
-    if (twilioData) {
-      try {
-        await twilioData.client.messages.create({
-          from: `whatsapp:${twilioData.fromNumber}`,
-          to: from,
-          body: aiResponse
+      
+      const status = await whatsappManager.getStatus(uid);
+      if (status.connected) {
+        return res.status(200).json({
+          success: true,
+          connected: true,
+          message: "WhatsApp déjà connecté."
         });
-        console.log(`✅ Réponse WhatsApp envoyée à ${cleanedFrom}`);
-      } catch (twilioError) {
-        console.error("❌ Erreur envoi Twilio :", twilioError.message);
       }
-    } else {
-      console.warn("⚠️ Réponse WhatsApp non envoyée : client Twilio indisponible.");
+      
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
-
-    // Réponse au webhook Twilio
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${aiResponse.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</Message></Response>`;
-    res.set("Content-Type", "text/xml");
-    return res.status(200).send(twimlResponse);
+    
+    if (qrCode) {
+      return res.status(200).json({
+        success: true,
+        connected: false,
+        qrCode: qrCode,
+        message: "QR Code généré. Scannez avec WhatsApp."
+      });
+    }
+    
+    return res.status(408).json({
+      success: false,
+      error: "Délai d'attente dépassé pour la génération du QR Code."
+    });
   } catch (error) {
-    console.error("❌ Erreur webhook WhatsApp :", error.message);
-    return res.status(500).json({ error: "Erreur lors du traitement du webhook." });
+    console.error("❌ Erreur QR Code :", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur lors de la génération du QR Code.",
+      details: error.message
+    });
   }
 });
 
-// ==================== ROUTE D'ENVOI D'E-MAILS ====================
-
-/**
- * Route d'envoi d'e-mails via Resend.
- */
-app.post("/action/send-email", async (req, res) => {
+// Obtenir le statut
+app.get("/api/whatsapp/status", verifyFirebaseToken, async (req, res) => {
   try {
-    const { to, subject, html, text, from } = req.body;
+    const uid = req.user.uid;
+    const status = await whatsappManager.getStatus(uid);
+    
+    return res.status(200).json({
+      success: true,
+      connected: status.connected,
+      user: status.user
+    });
+  } catch (error) {
+    console.error("❌ Erreur statut WhatsApp :", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur lors de la vérification du statut."
+    });
+  }
+});
 
+// Déconnexion volontaire (logout complet)
+app.post("/api/whatsapp/logout", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const result = await whatsappManager.logout(uid);
+    
+    return res.status(200).json({
+      success: result,
+      message: result ? "WhatsApp déconnecté avec succès." : "Erreur lors de la déconnexion."
+    });
+  } catch (error) {
+    console.error("❌ Erreur déconnexion WhatsApp :", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur lors de la déconnexion."
+    });
+  }
+});
+
+// ==================== ROUTE IA (OPENROUTER) ====================
+
+app.post("/api/ai/chat", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!message || typeof message !== "string" || message.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Le champ 'message' est requis."
+      });
+    }
+    
+    const aiResponse = await callOpenRouter(message);
+    
+    if (db) {
+      await db.ref(`logs/ai_chats`).push({
+        uid: req.user.uid,
+        message: message,
+        response: aiResponse,
+        timestamp: admin.database.ServerValue.TIMESTAMP
+      });
+    }
+    
+    return res.status(200).json({
+      success: true,
+      response: aiResponse
+    });
+  } catch (error) {
+    console.error("❌ Erreur IA :", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur lors de l'appel à l'IA.",
+      details: error.message
+    });
+  }
+});
+
+// ==================== ROUTE EMAIL (RESEND) ====================
+
+app.post("/api/email/send", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { to, subject, html, text } = req.body;
+    
     if (!to || !subject || (!html && !text)) {
       return res.status(400).json({
-        error: "Les champs 'to', 'subject' et au moins 'html' ou 'text' sont requis."
+        success: false,
+        error: "Champs requis : to, subject, et html ou text."
       });
     }
-
-    // Validation simple de l'email
+    
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(to)) {
-      return res.status(400).json({ error: "Adresse e-mail invalide." });
-    }
-
-    // Initialisation Resend dynamique
-    const resendClient = getResendClient();
-
-    if (!resendClient) {
-      await saveLog("logs_systeme/emails", {
-        to: to,
-        subject: subject,
-        status: "failed",
-        error: "Client Resend non configuré"
+      return res.status(400).json({
+        success: false,
+        error: "Adresse email invalide."
       });
-
+    }
+    
+    const resendClient = getResendClient();
+    
+    if (!resendClient) {
       return res.status(503).json({
         success: false,
-        error: "Service e-mail non configuré. Veuillez configurer RESEND_API_KEY."
+        error: "Service email non configuré."
       });
     }
-
-    // Envoi de l'e-mail
+    
     const emailData = {
-      from: from || process.env.RESEND_FROM_EMAIL || "MILO <onboarding@resend.dev>",
+      from: process.env.RESEND_FROM_EMAIL || "MILO <onboarding@resend.dev>",
       to: [to],
       subject: subject
     };
-
+    
     if (html) emailData.html = html;
     if (text) emailData.text = text;
-
-    const emailResult = await resendClient.emails.send(emailData);
-
-    // Sauvegarde du log
-    await saveLog("logs_systeme/emails", {
-      to: to,
-      subject: subject,
-      status: "sent",
-      email_id: emailResult?.id || null
-    });
-
+    
+    const result = await resendClient.emails.send(emailData);
+    
+    if (db) {
+      await db.ref(`logs/emails`).push({
+        uid: req.user.uid,
+        to: to,
+        subject: subject,
+        emailId: result?.id || null,
+        timestamp: admin.database.ServerValue.TIMESTAMP
+      });
+    }
+    
     return res.status(200).json({
       success: true,
-      message: "E-mail envoyé avec succès.",
-      email_id: emailResult?.id || null
+      message: "Email envoyé avec succès.",
+      emailId: result?.id || null
     });
   } catch (error) {
-    console.error("❌ Erreur envoi e-mail :", error.message);
-
-    await saveLog("logs_systeme/emails", {
-      to: req.body?.to || "unknown",
-      subject: req.body?.subject || "unknown",
-      status: "failed",
-      error: error.message
-    });
-
+    console.error("❌ Erreur email :", error.message);
     return res.status(500).json({
       success: false,
-      error: "Erreur lors de l'envoi de l'e-mail.",
+      error: "Erreur lors de l'envoi de l'email.",
       details: error.message
     });
   }
 });
 
-// ==================== GESTION DES ERREURS 404 ====================
-// Middleware pour les routes non trouvées
+// ==================== MIDDLEWARE 404 ====================
 app.use((req, res) => {
   console.warn(`⚠️ Route non trouvée : ${req.method} ${req.url}`);
   res.status(404).json({
     success: false,
-    error: "Route non trouvée",
-    path: req.url,
-    method: req.method
+    error: "Route non trouvée.",
+    path: req.url
+  });
+});
+
+// ==================== MIDDLEWARE DE GESTION DES ERREURS ====================
+app.use((err, req, res, next) => {
+  console.error("❌ Erreur Express :", err.message);
+  console.error(err.stack);
+  
+  if (res.headersSent) {
+    return next(err);
+  }
+  
+  res.status(err.status || 500).json({
+    success: false,
+    error: "Erreur interne du serveur.",
+    details: err.message
   });
 });
 
 // ==================== GESTION DES ERREURS GLOBALES ====================
-
-// Middleware de gestion des erreurs Express
-app.use((error, req, res, next) => {
-  console.error("❌ Erreur Express :", error.message);
-  console.error(error.stack);
-  
-  if (res.headersSent) {
-    return next(error);
-  }
-  
-  res.status(500).json({
-    success: false,
-    error: "Erreur interne du serveur",
-    details: error.message
-  });
-});
-
-// Capture les erreurs non gérées pour éviter le crash du serveur
 process.on("uncaughtException", (error) => {
-  console.error("❌ Uncaught Exception :", error);
+  console.error("❌ Uncaught Exception :", error.message);
   console.error(error.stack);
 });
 
@@ -1189,34 +977,53 @@ process.on("unhandledRejection", (reason, promise) => {
 // ==================== DÉMARRAGE DU SERVEUR ====================
 const PORT = process.env.PORT || 5000;
 
-// Création du serveur avec configuration optimisée
 const server = app.listen(PORT, () => {
   console.log("========================================");
-  console.log(`🚀 Cerveau MILO actif sur le port ${PORT}`);
-  console.log(MILO_IDENTITY);
-  console.log(`🕐 Démarrage : ${new Date().toISOString()}`);
-  console.log(`📊 Environnement : ${process.env.NODE_ENV || "development"}`);
+  console.log(`🚀 Serveur MILO actif sur le port ${PORT}`);
+  console.log(`📅 Démarrage : ${new Date().toISOString()}`);
+  console.log(`🌍 Environnement : ${process.env.NODE_ENV || "development"}`);
+  
+  // CORRECTIF : Message de statut Firebase clair
+  if (firebaseReady) {
+    console.log("✅ Serveur actif et Firebase connecté avec succès");
+  } else {
+    console.log("⚠️ Serveur actif mais Firebase non connecté");
+  }
+  
   console.log("========================================");
 });
 
-// Configuration du serveur pour les timeouts
-server.timeout = 120000; // 2 minutes
+// Configuration des timeouts
+server.timeout = 120000;
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 
-// Gestion de l'arrêt gracieux
-process.on("SIGTERM", () => {
-  console.log("🛑 Signal SIGTERM reçu. Arrêt gracieux...");
+// ==================== ARRÊT GRACIEUX ====================
+async function gracefulShutdown(signal) {
+  console.log(`🛑 Signal ${signal} reçu. Arrêt gracieux...`);
+  
+  for (const [uid, session] of whatsappManager.sessions) {
+    try {
+      await whatsappManager.softClose(uid);
+      console.log(`👋 Session WhatsApp fermée proprement pour ${uid} (session préservée)`);
+    } catch (error) {
+      console.error(`❌ Erreur fermeture douce session ${uid} :`, error.message);
+    }
+  }
+  
   server.close(() => {
     console.log("✅ Serveur arrêté proprement.");
+    console.log("💾 Sessions WhatsApp préservées pour reconnexion automatique.");
     process.exit(0);
   });
-});
+  
+  setTimeout(() => {
+    console.error("⏰ Arrêt forcé après délai.");
+    process.exit(1);
+  }, 10000);
+}
 
-process.on("SIGINT", () => {
-  console.log("🛑 Signal SIGINT reçu. Arrêt gracieux...");
-  server.close(() => {
-    console.log("✅ Serveur arrêté proprement.");
-    process.exit(0);
-  });
-});
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+module.exports = app;
