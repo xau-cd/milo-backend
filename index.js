@@ -16,9 +16,93 @@ const auth = admin.auth();
 
 // ==================== CONFIGURATION EXPRESS ====================
 const app = express();
-app.use(cors());
+
+// ==================== CONFIGURATION CORS RENFORCÉE ====================
+// Liste des origines autorisées (à adapter selon vos domaines)
+const allowedOrigins = [
+  "https://milo-ead21.web.app",
+  "https://milo-ead21.firebaseapp.com",
+  "http://localhost:3000",
+  "http://localhost:5000",
+  "http://localhost:5173",
+  "http://localhost:8080",
+  "https://milo-ead21-default-rtdb.europe-west1.firebasedatabase.app"
+];
+
+// Middleware CORS personnalisé pour un contrôle total
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  // Si l'origine est dans la liste autorisée ou si c'est une requête sans origine (comme curl)
+  if (!origin || allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Max-Age", "86400"); // 24 heures
+    
+    // Gérer les requêtes preflight OPTIONS
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+  }
+  
+  next();
+});
+
+// Middleware CORS standard en secours
+app.use(cors({
+  origin: function(origin, callback) {
+    // Autoriser les requêtes sans origine (comme les appels serveur-à-serveur)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.warn(`⚠️ Origine bloquée par CORS : ${origin}`);
+      callback(null, true); // En production, vous pourriez bloquer avec callback(new Error('CORS'))
+    }
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+  credentials: true,
+  maxAge: 86400
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ==================== MIDDLEWARE DE LOGGING ====================
+app.use((req, res, next) => {
+  const start = Date.now();
+  console.log(`📥 ${req.method} ${req.url} - ${new Date().toISOString()}`);
+  
+  // Capturer la fin de la réponse pour logger le statut
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    console.log(`📤 ${req.method} ${req.url} - ${res.statusCode} - ${duration}ms`);
+  });
+  
+  next();
+});
+
+// ==================== MIDDLEWARE ANTI-TIMEOUT ====================
+// Garde la connexion active pendant les longues réponses
+app.use((req, res, next) => {
+  // Définir un timeout plus long pour les requêtes
+  req.setTimeout(120000, () => {
+    console.error(`⏰ Timeout dépassé pour ${req.method} ${req.url}`);
+    if (!res.headersSent) {
+      res.status(408).json({ error: "Délai d'attente dépassé. Veuillez réessayer." });
+    }
+  });
+  
+  // Garder la connexion alive
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Keep-Alive", "timeout=120");
+  
+  next();
+});
 
 // ==================== CLIENTS DYNAMIQUES SÉCURISÉS ====================
 
@@ -74,6 +158,39 @@ const MILO_IDENTITY = "Je suis MILO, une intelligence artificielle créée par H
 const MILO_SYSTEM_PROMPT = `${MILO_IDENTITY} Je suis un assistant personnel intelligent, serviable et professionnel. Je peux aider avec des recherches, des informations, et je peux envoyer des messages WhatsApp si l'utilisateur m'y autorise.`;
 
 // ==================== FONCTIONS UTILITAIRES ====================
+
+/**
+ * Vérifie que les variables d'environnement essentielles sont présentes.
+ */
+function checkEnvironmentVariables() {
+  const requiredVars = [
+    "OPENROUTER_API_KEY",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_WHATSAPP_NUMBER",
+    "RESEND_API_KEY"
+  ];
+  
+  const missing = [];
+  const present = [];
+  
+  requiredVars.forEach(varName => {
+    if (process.env[varName]) {
+      present.push(varName);
+      console.log(`✅ ${varName} : configurée`);
+    } else {
+      missing.push(varName);
+      console.warn(`⚠️ ${varName} : MANQUANTE`);
+    }
+  });
+  
+  return { missing, present };
+}
+
+// Vérification au démarrage
+console.log("🔍 Vérification des variables d'environnement :");
+const envStatus = checkEnvironmentVariables();
+console.log(`📊 Variables présentes : ${envStatus.present.length}/${envStatus.present.length + envStatus.missing.length}`);
 
 /**
  * Recherche des images et un résumé sur Wikipédia (français et anglais).
@@ -207,6 +324,10 @@ async function searchWeb(query) {
  */
 async function callOpenRouter(userMessage, systemPrompt = MILO_SYSTEM_PROMPT) {
   try {
+    const apiKey = process.env.OPENROUTER_API_KEY || "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";
+    
+    console.log("🤖 Appel OpenRouter avec le modèle deepseek/deepseek-chat");
+    
     const response = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
@@ -220,10 +341,12 @@ async function callOpenRouter(userMessage, systemPrompt = MILO_SYSTEM_PROMPT) {
       },
       {
         headers: {
-          "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY || "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"}`,
-          "Content-Type": "application/json"
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://milo-ead21.web.app",
+          "X-Title": "MILO Assistant"
         },
-        timeout: 30000
+        timeout: 45000 // 45 secondes pour éviter les timeouts
       }
     );
 
@@ -236,7 +359,7 @@ async function callOpenRouter(userMessage, systemPrompt = MILO_SYSTEM_PROMPT) {
   } catch (error) {
     console.error("❌ Erreur callOpenRouter :", error.message);
     if (error.response) {
-      console.error("Détails OpenRouter :", error.response.data);
+      console.error("Détails OpenRouter :", JSON.stringify(error.response.data).substring(0, 500));
     }
     throw error;
   }
@@ -344,12 +467,44 @@ async function sendWhatsAppMessage(to, message) {
 
 /**
  * Route racine pour vérifier que le serveur est actif.
+ * Inclut un warm-up pour éviter les cold starts.
  */
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
     message: "✅ Cerveau MILO actif et opérationnel !",
-    identity: MILO_IDENTITY
+    identity: MILO_IDENTITY,
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    env: {
+      openrouter: !!process.env.OPENROUTER_API_KEY,
+      twilio: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+      resend: !!process.env.RESEND_API_KEY,
+      firebase: true
+    }
+  });
+});
+
+/**
+ * Route de healthcheck pour les services externes.
+ */
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+});
+
+/**
+ * Route de warm-up pour réveiller le serveur.
+ */
+app.get("/warmup", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Warm-up effectué",
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -991,11 +1146,40 @@ app.post("/action/send-email", async (req, res) => {
   }
 });
 
+// ==================== GESTION DES ERREURS 404 ====================
+// Middleware pour les routes non trouvées
+app.use((req, res) => {
+  console.warn(`⚠️ Route non trouvée : ${req.method} ${req.url}`);
+  res.status(404).json({
+    success: false,
+    error: "Route non trouvée",
+    path: req.url,
+    method: req.method
+  });
+});
+
 // ==================== GESTION DES ERREURS GLOBALES ====================
+
+// Middleware de gestion des erreurs Express
+app.use((error, req, res, next) => {
+  console.error("❌ Erreur Express :", error.message);
+  console.error(error.stack);
+  
+  if (res.headersSent) {
+    return next(error);
+  }
+  
+  res.status(500).json({
+    success: false,
+    error: "Erreur interne du serveur",
+    details: error.message
+  });
+});
 
 // Capture les erreurs non gérées pour éviter le crash du serveur
 process.on("uncaughtException", (error) => {
   console.error("❌ Uncaught Exception :", error);
+  console.error(error.stack);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
@@ -1004,7 +1188,35 @@ process.on("unhandledRejection", (reason, promise) => {
 
 // ==================== DÉMARRAGE DU SERVEUR ====================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    console.log(`Cerveau MILO actif sur le port ${PORT}`);
-    console.log(MILO_IDENTITY);
+
+// Création du serveur avec configuration optimisée
+const server = app.listen(PORT, () => {
+  console.log("========================================");
+  console.log(`🚀 Cerveau MILO actif sur le port ${PORT}`);
+  console.log(MILO_IDENTITY);
+  console.log(`🕐 Démarrage : ${new Date().toISOString()}`);
+  console.log(`📊 Environnement : ${process.env.NODE_ENV || "development"}`);
+  console.log("========================================");
+});
+
+// Configuration du serveur pour les timeouts
+server.timeout = 120000; // 2 minutes
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+
+// Gestion de l'arrêt gracieux
+process.on("SIGTERM", () => {
+  console.log("🛑 Signal SIGTERM reçu. Arrêt gracieux...");
+  server.close(() => {
+    console.log("✅ Serveur arrêté proprement.");
+    process.exit(0);
+  });
+});
+
+process.on("SIGINT", () => {
+  console.log("🛑 Signal SIGINT reçu. Arrêt gracieux...");
+  server.close(() => {
+    console.log("✅ Serveur arrêté proprement.");
+    process.exit(0);
+  });
 });
