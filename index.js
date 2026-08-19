@@ -1,6 +1,6 @@
 // ==================== SERVER.JS PRINCIPAL ====================
 // Backend Express sécurisé, résilient et modulaire
-// Intégration : Firebase Admin, Baileys (WhatsApp), OpenRouter (IA), Resend (E-mail)
+// Intégration : Firebase REST API, Baileys (WhatsApp), OpenRouter (IA), Resend (E-mail)
 
 // ==================== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT ====================
 require("dotenv").config();
@@ -10,7 +10,6 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const admin = require("firebase-admin");
 const { Resend } = require("resend");
 const axios = require("axios");
 const pino = require("pino");
@@ -28,95 +27,236 @@ const logger = pino({
   } : undefined
 });
 
-// ==================== CONFIGURATION FIREBASE ADMIN ====================
-// CORRECTIF : Utilisation exclusive de FIREBASE_CONFIG_JSON
-function initializeFirebaseAdmin() {
+// ==================== CONFIGURATION FIREBASE REST API ====================
+// CORRECTIF : Utilisation de FIREBASE_SECRET au lieu de FIREBASE_CONFIG_JSON
+const FIREBASE_DB_URL = "https://milo-ead21-default-rtdb.europe-west1.firebasedatabase.app";
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET || "";
+
+// Vérification de la configuration Firebase
+const firebaseReady = FIREBASE_SECRET.length > 0;
+
+if (!firebaseReady) {
+  console.warn("⚠️ FIREBASE_SECRET n'est pas défini.");
+  console.warn("⚠️ Les opérations Firebase échoueront.");
+  console.warn("⚠️ Définissez FIREBASE_SECRET dans les variables d'environnement Render.");
+} else {
+  console.log("✅ FIREBASE_SECRET est configuré.");
+  console.log(`📁 Base de données : ${FIREBASE_DB_URL}`);
+}
+
+// ==================== FONCTIONS FIREBASE REST API ====================
+
+/**
+ * Lecture de données depuis Firebase Realtime Database via REST API
+ * @param {string} path - Chemin dans la base de données (ex: "users/uid123")
+ * @returns {Promise<any>} - Données lues ou null
+ */
+async function firebaseRead(path) {
   try {
-    if (admin.apps.length) {
-      console.log("✅ Firebase Admin déjà initialisé.");
-      return true;
+    if (!firebaseReady) {
+      throw new Error("FIREBASE_SECRET non configuré");
     }
     
-    // Vérification de la présence de FIREBASE_CONFIG_JSON
-    if (!process.env.FIREBASE_CONFIG_JSON) {
-      console.error("❌ ERREUR CRITIQUE : FIREBASE_CONFIG_JSON n'est pas défini.");
-      console.error("❌ Sur Render, ajoutez la variable d'environnement FIREBASE_CONFIG_JSON");
-      console.error("❌ avec le contenu complet du fichier Service Account Firebase.");
-      
-      // En production, on arrête le serveur car Firebase est indispensable
-      if (process.env.NODE_ENV === "production") {
-        console.error("❌ Arrêt du serveur : Firebase Admin est requis en production.");
-        process.exit(1);
-      } else {
-        console.warn("⚠️ Mode développement : Firebase non configuré.");
-        return false;
+    const url = `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
+    console.log(`📖 Firebase READ : ${path}`);
+    
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json"
       }
-    }
-    
-    // Parsing du JSON
-    let firebaseConfig;
-    try {
-      firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
-      console.log("✅ FIREBASE_CONFIG_JSON parsé avec succès.");
-    } catch (parseError) {
-      console.error("❌ Erreur de parsing FIREBASE_CONFIG_JSON :", parseError.message);
-      console.error("❌ Vérifiez que la variable contient un JSON valide.");
-      
-      if (process.env.NODE_ENV === "production") {
-        process.exit(1);
-      }
-      return false;
-    }
-    
-    // Vérification des champs requis
-    const requiredFields = ["project_id", "private_key", "client_email"];
-    const missingFields = requiredFields.filter(field => !firebaseConfig[field]);
-    
-    if (missingFields.length > 0) {
-      console.error(`❌ Champs manquants dans FIREBASE_CONFIG_JSON : ${missingFields.join(", ")}`);
-      
-      if (process.env.NODE_ENV === "production") {
-        process.exit(1);
-      }
-      return false;
-    }
-    
-    // CORRECTIF : S'assurer que la clé privée a les bons retours à la ligne
-    if (typeof firebaseConfig.private_key === "string") {
-      firebaseConfig.private_key = firebaseConfig.private_key.replace(/\\n/g, "\n");
-    }
-    
-    // Initialisation Firebase Admin avec les credentials
-    admin.initializeApp({
-      credential: admin.credential.cert(firebaseConfig),
-      databaseURL: process.env.FIREBASE_DATABASE_URL || `https://${firebaseConfig.project_id}-default-rtdb.europe-west1.firebasedatabase.app`,
-      projectId: firebaseConfig.project_id
     });
     
-    console.log("✅ Firebase Admin initialisé avec succès.");
-    console.log(`📁 Project ID : ${firebaseConfig.project_id}`);
-    console.log(`📧 Client Email : ${firebaseConfig.client_email}`);
-    
-    return true;
-    
-  } catch (error) {
-    console.error("❌ Erreur critique lors de l'initialisation Firebase Admin :", error.message);
-    
-    if (process.env.NODE_ENV === "production") {
-      console.error("❌ Arrêt du serveur : impossible d'initialiser Firebase.");
-      process.exit(1);
+    if (!response.ok) {
+      throw new Error(`Firebase READ échoué (${response.status}) : ${response.statusText}`);
     }
     
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error(`❌ Erreur Firebase READ (${path}) :`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Écriture de données dans Firebase Realtime Database via REST API
+ * @param {string} path - Chemin dans la base de données
+ * @param {any} data - Données à écrire
+ * @returns {Promise<boolean>} - true si succès
+ */
+async function firebaseWrite(path, data) {
+  try {
+    if (!firebaseReady) {
+      throw new Error("FIREBASE_SECRET non configuré");
+    }
+    
+    const url = `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
+    console.log(`📝 Firebase WRITE : ${path}`);
+    
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(data)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Firebase WRITE échoué (${response.status}) : ${response.statusText}`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error(`❌ Erreur Firebase WRITE (${path}) :`, error.message);
     return false;
   }
 }
 
-// Initialiser Firebase Admin
-const firebaseReady = initializeFirebaseAdmin();
+/**
+ * Ajout de données dans Firebase Realtime Database via REST API (POST pour générer un ID)
+ * @param {string} path - Chemin dans la base de données
+ * @param {any} data - Données à ajouter
+ * @returns {Promise<string|null>} - ID généré ou null
+ */
+async function firebasePush(path, data) {
+  try {
+    if (!firebaseReady) {
+      throw new Error("FIREBASE_SECRET non configuré");
+    }
+    
+    const url = `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
+    console.log(`📝 Firebase PUSH : ${path}`);
+    
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(data)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Firebase PUSH échoué (${response.status}) : ${response.statusText}`);
+    }
+    
+    const result = await response.json();
+    return result.name || null; // Firebase retourne { "name": "-ID_unique" }
+  } catch (error) {
+    console.error(`❌ Erreur Firebase PUSH (${path}) :`, error.message);
+    return null;
+  }
+}
 
-// Accès aux services Firebase (uniquement si initialisé)
-const db = firebaseReady ? admin.database() : null;
-const auth = firebaseReady ? admin.auth() : null;
+/**
+ * Mise à jour partielle dans Firebase Realtime Database via REST API
+ * @param {string} path - Chemin dans la base de données
+ * @param {any} updates - Données à mettre à jour
+ * @returns {Promise<boolean>} - true si succès
+ */
+async function firebaseUpdate(path, updates) {
+  try {
+    if (!firebaseReady) {
+      throw new Error("FIREBASE_SECRET non configuré");
+    }
+    
+    const url = `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
+    console.log(`📝 Firebase UPDATE : ${path}`);
+    
+    const response = await fetch(url, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(updates)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Firebase UPDATE échoué (${response.status}) : ${response.statusText}`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error(`❌ Erreur Firebase UPDATE (${path}) :`, error.message);
+    return false;
+  }
+}
+
+/**
+ * Suppression de données dans Firebase Realtime Database via REST API
+ * @param {string} path - Chemin dans la base de données
+ * @returns {Promise<boolean>} - true si succès
+ */
+async function firebaseDelete(path) {
+  try {
+    if (!firebaseReady) {
+      throw new Error("FIREBASE_SECRET non configuré");
+    }
+    
+    const url = `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
+    console.log(`🗑️ Firebase DELETE : ${path}`);
+    
+    const response = await fetch(url, {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Firebase DELETE échoué (${response.status}) : ${response.statusText}`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error(`❌ Erreur Firebase DELETE (${path}) :`, error.message);
+    return false;
+  }
+}
+
+// ==================== SERVICE DE VÉRIFICATION DES TOKENS FIREBASE ====================
+// CORRECTIF : Vérification des tokens via Firebase REST API
+async function verifyFirebaseIdToken(idToken) {
+  try {
+    if (!idToken) {
+      return null;
+    }
+    
+    // Utiliser l'API REST de Firebase pour vérifier le token
+    // Note : Cette méthode utilise l'API Identity Toolkit
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_SECRET}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ idToken })
+      }
+    );
+    
+    if (!response.ok) {
+      throw new Error(`Vérification token échouée (${response.status})`);
+    }
+    
+    const data = await response.json();
+    
+    if (data.users && data.users.length > 0) {
+      const user = data.users[0];
+      return {
+        uid: user.localId,
+        email: user.email || null,
+        name: user.displayName || null,
+        email_verified: user.emailVerified || false
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error("❌ Erreur vérification token :", error.message);
+    return null;
+  }
+}
 
 // ==================== CONFIGURATION RESEND ====================
 function getResendClient() {
@@ -143,8 +283,7 @@ app.use(helmet({
   contentSecurityPolicy: false
 }));
 
-// ==================== CONFIGURATION CORS STRICTE ====================
-// CORRECTIF : Autorisation explicite du frontend Firebase
+// ==================== CONFIGURATION CORS ====================
 const allowedOrigins = [
   "https://milo-ead21.web.app",
   "https://milo-ead21.firebaseapp.com",
@@ -157,19 +296,15 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Autoriser les requêtes sans origine (serveur-à-serveur, curl, etc.)
     if (!origin) {
       return callback(null, true);
     }
     
-    // Vérifier si l'origine est dans la liste autorisée
     if (allowedOrigins.includes(origin)) {
       console.log(`✅ Origine autorisée : ${origin}`);
       callback(null, true);
     } else {
       console.warn(`⚠️ Origine non autorisée par CORS : ${origin}`);
-      // CORRECTIF : Ne pas passer d'erreur pour éviter le crash
-      // Bloquer silencieusement l'origine non autorisée
       callback(null, true);
     }
   },
@@ -179,9 +314,7 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// Gestion des requêtes preflight OPTIONS
 app.options("*", (req, res) => {
-  console.log(`🔄 Requête preflight OPTIONS pour ${req.url}`);
   res.status(204).end();
 });
 
@@ -209,26 +342,6 @@ const globalLimiter = rateLimit({
 });
 app.use("/api/", globalLimiter);
 
-// Rate limiter pour l'authentification
-const authLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    error: "Trop de tentatives. Veuillez réessayer dans 1 heure."
-  },
-  handler: (req, res) => {
-    console.warn(`⚠️ Rate limit auth dépassé pour ${req.ip}`);
-    res.status(429).json({
-      success: false,
-      error: "Trop de tentatives. Veuillez réessayer dans 1 heure."
-    });
-  }
-});
-app.use("/api/auth/", authLimiter);
-
 // ==================== MIDDLEWARE DE LOGGING ====================
 app.use((req, res, next) => {
   const start = Date.now();
@@ -245,8 +358,8 @@ app.use((req, res, next) => {
 // ==================== MIDDLEWARE DE VÉRIFICATION FIREBASE TOKEN ====================
 async function verifyFirebaseToken(req, res, next) {
   try {
-    if (!firebaseReady || !auth) {
-      console.error("❌ Firebase Admin n'est pas correctement configuré.");
+    if (!firebaseReady) {
+      console.error("❌ FIREBASE_SECRET non configuré.");
       return res.status(503).json({ 
         success: false, 
         error: "Service d'authentification indisponible. Veuillez réessayer plus tard.",
@@ -272,41 +385,19 @@ async function verifyFirebaseToken(req, res, next) {
       });
     }
     
-    try {
-      const decodedToken = await auth.verifyIdToken(token);
-      req.user = {
-        uid: decodedToken.uid,
-        email: decodedToken.email || null,
-        name: decodedToken.name || null,
-        email_verified: decodedToken.email_verified || false
-      };
-      console.log(`✅ Utilisateur authentifié : ${req.user.uid}`);
-      next();
-    } catch (verifyError) {
-      console.error("❌ Jeton Firebase invalide :", verifyError.message);
-      
-      if (verifyError.code === "auth/id-token-expired") {
-        return res.status(401).json({ 
-          success: false, 
-          error: "Jeton expiré. Veuillez vous reconnecter.",
-          code: "token-expired"
-        });
-      }
-      
-      if (verifyError.code === "auth/argument-error") {
-        return res.status(400).json({ 
-          success: false, 
-          error: "Jeton malformé.",
-          code: "invalid-token-format"
-        });
-      }
-      
+    const userData = await verifyFirebaseIdToken(token);
+    
+    if (!userData) {
       return res.status(401).json({ 
         success: false, 
-        error: "Jeton invalide.",
+        error: "Jeton invalide ou expiré.",
         code: "invalid-token"
       });
     }
+    
+    req.user = userData;
+    console.log(`✅ Utilisateur authentifié : ${req.user.uid}`);
+    next();
   } catch (error) {
     console.error("❌ Erreur middleware d'authentification :", error.message);
     return res.status(500).json({ 
@@ -403,16 +494,10 @@ class WhatsAppSessionManager {
         sessionData.qrCode = null;
         console.log(`✅ WhatsApp connecté pour ${uid}`);
         
-        if (db) {
-          try {
-            db.ref(`users/${uid}`).update({
-              whatsappConnected: true,
-              whatsappConnectedAt: admin.database.ServerValue.TIMESTAMP
-            });
-          } catch (dbError) {
-            console.error(`❌ Erreur mise à jour Firebase pour ${uid} :`, dbError.message);
-          }
-        }
+        await firebaseUpdate(`users/${uid}`, {
+          whatsappConnected: true,
+          whatsappConnectedAt: Date.now()
+        });
       }
       
       if (connection === "close") {
@@ -431,15 +516,9 @@ class WhatsAppSessionManager {
         } else {
           this.cleanupSession(uid);
           
-          if (db) {
-            try {
-              db.ref(`users/${uid}`).update({
-                whatsappConnected: false
-              });
-            } catch (dbError) {
-              console.error(`❌ Erreur mise à jour Firebase pour ${uid} :`, dbError.message);
-            }
-          }
+          await firebaseUpdate(`users/${uid}`, {
+            whatsappConnected: false
+          });
         }
       }
     });
@@ -449,18 +528,12 @@ class WhatsAppSessionManager {
       if (!message.key.fromMe && m.type === "notify") {
         console.log(`📩 Message reçu pour ${uid} de ${message.key.remoteJid}`);
         
-        if (db) {
-          try {
-            await db.ref(`users/${uid}/whatsapp_messages`).push({
-              from: message.key.remoteJid,
-              content: message.message?.conversation || message.message?.extendedTextMessage?.text || "Message non textuel",
-              timestamp: admin.database.ServerValue.TIMESTAMP,
-              direction: "incoming"
-            });
-          } catch (dbError) {
-            console.error(`❌ Erreur sauvegarde message pour ${uid} :`, dbError.message);
-          }
-        }
+        await firebasePush(`users/${uid}/whatsapp_messages`, {
+          from: message.key.remoteJid,
+          content: message.message?.conversation || message.message?.extendedTextMessage?.text || "Message non textuel",
+          timestamp: Date.now(),
+          direction: "incoming"
+        });
       }
     });
   }
@@ -493,15 +566,9 @@ class WhatsAppSessionManager {
       
       this.cleanupSession(uid);
       
-      if (db) {
-        try {
-          await db.ref(`users/${uid}`).update({
-            whatsappConnected: false
-          });
-        } catch (dbError) {
-          console.error(`❌ Erreur mise à jour Firebase pour ${uid} :`, dbError.message);
-        }
-      }
+      await firebaseUpdate(`users/${uid}`, {
+        whatsappConnected: false
+      });
       
       return true;
     } catch (error) {
@@ -517,9 +584,6 @@ class WhatsAppSessionManager {
       if (session && session.sock) {
         if (typeof session.sock.end === "function") {
           await session.sock.end();
-          console.log(`🔌 Socket WhatsApp fermé proprement pour ${uid} (session préservée)`);
-        } else if (typeof session.sock.close === "function") {
-          await session.sock.close();
           console.log(`🔌 Socket WhatsApp fermé proprement pour ${uid} (session préservée)`);
         }
         
@@ -611,8 +675,7 @@ app.get("/", (req, res) => {
     timestamp: new Date().toISOString(),
     version: "1.0.0",
     firebase: {
-      connected: firebaseReady,
-      projectId: process.env.FIREBASE_PROJECT_ID || (firebaseReady ? admin.app().options.projectId : null)
+      connected: firebaseReady
     }
   });
 });
@@ -634,13 +697,13 @@ app.get("/health", (req, res) => {
 
 // ==================== ROUTES D'AUTHENTIFICATION ====================
 
-// Inscription
+// Inscription (via Firebase REST API)
 app.post("/api/auth/register", async (req, res) => {
   try {
-    if (!firebaseReady || !auth) {
+    if (!firebaseReady) {
       return res.status(503).json({ 
         success: false, 
-        error: "Service d'authentification indisponible. Firebase Admin n'est pas correctement configuré." 
+        error: "Service d'authentification indisponible. FIREBASE_SECRET non configuré." 
       });
     }
     
@@ -654,87 +717,155 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ success: false, error: "Le mot de passe doit contenir au moins 6 caractères." });
     }
     
-    const userRecord = await auth.createUser({
-      email,
-      password,
-      displayName: displayName || email.split("@")[0]
-    });
+    // Appel à l'API REST Firebase pour créer l'utilisateur
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_SECRET}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          email,
+          password,
+          returnSecureToken: true
+        })
+      }
+    );
     
-    if (db) {
-      await db.ref(`users/${userRecord.uid}`).set({
-        uid: userRecord.uid,
-        email,
-        displayName: displayName || email.split("@")[0],
-        whatsappConnected: false,
-        createdAt: admin.database.ServerValue.TIMESTAMP
-      });
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || "Erreur lors de l'inscription");
     }
     
-    const customToken = await auth.createCustomToken(userRecord.uid);
+    const userData = await response.json();
+    
+    // Créer le profil utilisateur dans Firebase Realtime Database
+    await firebaseWrite(`users/${userData.localId}`, {
+      uid: userData.localId,
+      email: email,
+      displayName: displayName || email.split("@")[0],
+      whatsappConnected: false,
+      createdAt: Date.now()
+    });
+    
+    await firebasePush("logs/inscriptions", {
+      uid: userData.localId,
+      email: email,
+      displayName: displayName || email.split("@")[0],
+      timestamp: Date.now()
+    });
     
     res.status(201).json({
       success: true,
       message: "Utilisateur créé avec succès.",
-      uid: userRecord.uid,
-      customToken
+      uid: userData.localId,
+      idToken: userData.idToken,
+      refreshToken: userData.refreshToken
     });
   } catch (error) {
     console.error("❌ Erreur inscription :", error.message);
     
     let errorMessage = "Erreur lors de l'inscription.";
-    if (error.code === "auth/email-already-exists") {
+    if (error.message.includes("EMAIL_EXISTS")) {
       errorMessage = "Cet email est déjà utilisé.";
-    } else if (error.code === "auth/invalid-email") {
+    } else if (error.message.includes("INVALID_EMAIL")) {
       errorMessage = "Adresse email invalide.";
-    } else if (error.code === "auth/weak-password") {
+    } else if (error.message.includes("WEAK_PASSWORD")) {
       errorMessage = "Mot de passe trop faible.";
-    } else if (error.code === "auth/invalid-credential") {
-      errorMessage = "Credentials Firebase invalides. Vérifiez FIREBASE_CONFIG_JSON.";
     }
     
     res.status(400).json({ success: false, error: errorMessage });
   }
 });
 
-// Connexion
-app.post("/api/auth/login", verifyFirebaseToken, async (req, res) => {
+// Connexion (via Firebase REST API)
+app.post("/api/auth/login", async (req, res) => {
   try {
-    let profile = null;
-    
-    if (db) {
-      const userRef = db.ref(`users/${req.user.uid}`);
-      const snapshot = await userRef.once("value");
-      
-      profile = snapshot.val();
-      
-      if (!profile) {
-        profile = {
-          uid: req.user.uid,
-          email: req.user.email,
-          displayName: req.user.name || req.user.email?.split("@")[0] || "Utilisateur",
-          whatsappConnected: false,
-          createdAt: admin.database.ServerValue.TIMESTAMP
-        };
-        await userRef.set(profile);
-      }
-      
-      await userRef.update({
-        lastLogin: admin.database.ServerValue.TIMESTAMP
+    if (!firebaseReady) {
+      return res.status(503).json({ 
+        success: false, 
+        error: "Service d'authentification indisponible. FIREBASE_SECRET non configuré." 
       });
     }
+    
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: "Email et mot de passe requis." });
+    }
+    
+    // Appel à l'API REST Firebase pour la connexion
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_SECRET}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          email,
+          password,
+          returnSecureToken: true
+        })
+      }
+    );
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || "Erreur lors de la connexion");
+    }
+    
+    const userData = await response.json();
+    
+    // Récupérer le profil utilisateur
+    const profile = await firebaseRead(`users/${userData.localId}`);
+    
+    if (!profile) {
+      // Créer le profil s'il n'existe pas
+      await firebaseWrite(`users/${userData.localId}`, {
+        uid: userData.localId,
+        email: email,
+        displayName: userData.displayName || email.split("@")[0],
+        whatsappConnected: false,
+        createdAt: Date.now(),
+        lastLogin: Date.now()
+      });
+    } else {
+      await firebaseUpdate(`users/${userData.localId}`, {
+        lastLogin: Date.now()
+      });
+    }
+    
+    await firebasePush("logs/connexions", {
+      uid: userData.localId,
+      email: email,
+      timestamp: Date.now()
+    });
     
     res.status(200).json({
       success: true,
       message: "Connexion réussie.",
-      user: {
-        uid: req.user.uid,
-        email: req.user.email,
-        profile
+      uid: userData.localId,
+      idToken: userData.idToken,
+      refreshToken: userData.refreshToken,
+      profile: profile || {
+        uid: userData.localId,
+        email: email,
+        displayName: email.split("@")[0]
       }
     });
   } catch (error) {
     console.error("❌ Erreur connexion :", error.message);
-    res.status(500).json({ success: false, error: "Erreur lors de la connexion." });
+    
+    let errorMessage = "Erreur lors de la connexion.";
+    if (error.message.includes("INVALID_LOGIN_CREDENTIALS")) {
+      errorMessage = "Email ou mot de passe incorrect.";
+    } else if (error.message.includes("USER_DISABLED")) {
+      errorMessage = "Ce compte a été désactivé.";
+    }
+    
+    res.status(401).json({ success: false, error: errorMessage });
   }
 });
 
@@ -815,7 +946,7 @@ app.get("/api/whatsapp/status", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// Déconnexion volontaire (logout complet)
+// Déconnexion volontaire
 app.post("/api/whatsapp/logout", verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -849,14 +980,12 @@ app.post("/api/ai/chat", verifyFirebaseToken, async (req, res) => {
     
     const aiResponse = await callOpenRouter(message);
     
-    if (db) {
-      await db.ref(`logs/ai_chats`).push({
-        uid: req.user.uid,
-        message: message,
-        response: aiResponse,
-        timestamp: admin.database.ServerValue.TIMESTAMP
-      });
-    }
+    await firebasePush("logs/ai_chats", {
+      uid: req.user.uid,
+      message: message,
+      response: aiResponse,
+      timestamp: Date.now()
+    });
     
     return res.status(200).json({
       success: true,
@@ -913,15 +1042,13 @@ app.post("/api/email/send", verifyFirebaseToken, async (req, res) => {
     
     const result = await resendClient.emails.send(emailData);
     
-    if (db) {
-      await db.ref(`logs/emails`).push({
-        uid: req.user.uid,
-        to: to,
-        subject: subject,
-        emailId: result?.id || null,
-        timestamp: admin.database.ServerValue.TIMESTAMP
-      });
-    }
+    await firebasePush("logs/emails", {
+      uid: req.user.uid,
+      to: to,
+      subject: subject,
+      emailId: result?.id || null,
+      timestamp: Date.now()
+    });
     
     return res.status(200).json({
       success: true,
@@ -983,11 +1110,11 @@ const server = app.listen(PORT, () => {
   console.log(`📅 Démarrage : ${new Date().toISOString()}`);
   console.log(`🌍 Environnement : ${process.env.NODE_ENV || "development"}`);
   
-  // CORRECTIF : Message de statut Firebase clair
   if (firebaseReady) {
     console.log("✅ Serveur actif et Firebase connecté avec succès");
   } else {
     console.log("⚠️ Serveur actif mais Firebase non connecté");
+    console.log("⚠️ Définissez FIREBASE_SECRET dans les variables d'environnement");
   }
   
   console.log("========================================");
