@@ -1,6 +1,7 @@
 // ==================== INDEX.JS - CERVEAU ORCHESTRATEUR MILO ====================
 // Backend événementiel ultra-sécurisé pour l'agent MILO
-// Architecture : OpenRouter Function Calling + Firebase Admin + Sécurité Zero Trust
+// Architecture : API Key Auth + OpenRouter Function Calling + Sécurité Zero Trust
+// CORRIGÉ : Authentification par clé API statique (sans firebase-admin)
 
 // ==================== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT ====================
 require("dotenv").config();
@@ -10,67 +11,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const admin = require("firebase-admin");
 const axios = require("axios");
-
-// ==================== CONFIGURATION FIREBASE ADMIN ====================
-// Initialisation sécurisée avec FIREBASE_CONFIG_JSON
-function initializeFirebaseAdmin() {
-  try {
-    if (admin.apps.length) {
-      console.log("✅ Firebase Admin déjà initialisé.");
-      return true;
-    }
-    
-    if (!process.env.FIREBASE_CONFIG_JSON) {
-      console.error("❌ ERREUR CRITIQUE : FIREBASE_CONFIG_JSON non défini.");
-      console.error("❌ Ajoutez cette variable dans Render avec le contenu du Service Account.");
-      
-      if (process.env.NODE_ENV === "production") {
-        process.exit(1);
-      }
-      return false;
-    }
-    
-    let firebaseConfig;
-    try {
-      firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
-      console.log("✅ FIREBASE_CONFIG_JSON parsé avec succès.");
-    } catch (parseError) {
-      console.error("❌ Erreur de parsing FIREBASE_CONFIG_JSON :", parseError.message);
-      if (process.env.NODE_ENV === "production") {
-        process.exit(1);
-      }
-      return false;
-    }
-    
-    // Correction des retours à la ligne dans la clé privée
-    if (typeof firebaseConfig.private_key === "string") {
-      firebaseConfig.private_key = firebaseConfig.private_key.replace(/\\n/g, "\n");
-    }
-    
-    admin.initializeApp({
-      credential: admin.credential.cert(firebaseConfig),
-      databaseURL: process.env.FIREBASE_DATABASE_URL || `https://${firebaseConfig.project_id}-default-rtdb.europe-west1.firebasedatabase.app`,
-      projectId: firebaseConfig.project_id
-    });
-    
-    console.log("✅ Firebase Admin initialisé avec succès.");
-    console.log(`📁 Project ID : ${firebaseConfig.project_id}`);
-    
-    return true;
-  } catch (error) {
-    console.error("❌ Erreur initialisation Firebase :", error.message);
-    if (process.env.NODE_ENV === "production") {
-      process.exit(1);
-    }
-    return false;
-  }
-}
-
-const firebaseReady = initializeFirebaseAdmin();
-const db = firebaseReady ? admin.database() : null;
-const auth = firebaseReady ? admin.auth() : null;
 
 // ==================== INITIALISATION EXPRESS ====================
 const app = express();
@@ -113,12 +54,11 @@ app.use(cors({
       callback(null, true);
     } else {
       console.warn(`⛔ CORS rejeté : ${origin}`);
-      // Rejet silencieux sans crash
       callback(null, false);
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-  allowedHeaders: ["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin"],
+  allowedHeaders: ["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin", "x-api-key"],
   exposedHeaders: ["X-RateLimit-Remaining", "X-RateLimit-Limit", "X-Action-Trigger"],
   credentials: true,
   maxAge: 86400
@@ -126,7 +66,7 @@ app.use(cors({
 
 // Gestion des requêtes preflight OPTIONS
 app.options("*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key");
   res.setHeader("Access-Control-Expose-Headers", "X-RateLimit-Remaining, X-Action-Trigger");
   res.status(204).end();
 });
@@ -195,6 +135,103 @@ app.use((req, res, next) => {
   next();
 });
 
+// ==================== MIDDLEWARE DE SÉCURITÉ PAR CLÉ API ====================
+// CORRECTION : Nouveau middleware d'authentification par API Key
+// Remplacé : verifyFirebaseToken → verifyApiKey
+
+function verifyApiKey(req, res, next) {
+  try {
+    // Vérifier si API_KEY est configurée dans les variables d'environnement
+    if (!process.env.API_KEY) {
+      console.error("❌ ERREUR CRITIQUE : API_KEY non définie.");
+      console.error("❌ Ajoutez la variable API_KEY dans les variables d'environnement Render.");
+      console.error("❌ Le serveur ne peut pas sécuriser les routes sans cette clé.");
+      
+      return res.status(503).json({
+        status: "error",
+        message: "Service de sécurité indisponible. API_KEY non configurée.",
+        actionTrigger: "NONE",
+        actionData: null
+      });
+    }
+    
+    // Récupérer la clé depuis l'en-tête Authorization ou x-api-key
+    let providedKey = null;
+    
+    // Option 1 : Header Authorization: Bearer <CLÉ>
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      providedKey = authHeader.split("Bearer ")[1];
+      console.log("🔑 Clé API reçue via Authorization Bearer");
+    }
+    
+    // Option 2 : Header personnalisé x-api-key
+    if (!providedKey && req.headers["x-api-key"]) {
+      providedKey = req.headers["x-api-key"];
+      console.log("🔑 Clé API reçue via x-api-key");
+    }
+    
+    // Vérifier si la clé est présente
+    if (!providedKey || providedKey.trim().length === 0) {
+      console.warn("⛔ Tentative d'accès sans clé API.");
+      return res.status(401).json({
+        status: "error",
+        message: "Accès refusé. Clé API manquante.",
+        actionTrigger: "AUTH_EXPIRED",
+        actionData: { redirect: "/login" }
+      });
+    }
+    
+    // Comparaison sécurisée de la clé (temps constant pour éviter le timing attack)
+    const expectedKey = process.env.API_KEY;
+    const providedKeyBuffer = Buffer.from(providedKey);
+    const expectedKeyBuffer = Buffer.from(expectedKey);
+    
+    if (providedKeyBuffer.length !== expectedKeyBuffer.length) {
+      console.warn("⛔ Tentative d'accès avec clé API invalide (longueur différente).");
+      return res.status(401).json({
+        status: "error",
+        message: "Accès refusé. Clé API invalide.",
+        actionTrigger: "AUTH_EXPIRED",
+        actionData: { redirect: "/login" }
+      });
+    }
+    
+    // Comparaison en temps constant
+    let isValid = true;
+    for (let i = 0; i < providedKeyBuffer.length; i++) {
+      if (providedKeyBuffer[i] !== expectedKeyBuffer[i]) {
+        isValid = false;
+        break;
+      }
+    }
+    
+    if (!isValid) {
+      console.warn("⛔ Tentative d'accès avec clé API invalide.");
+      return res.status(401).json({
+        status: "error",
+        message: "Accès refusé. Clé API invalide.",
+        actionTrigger: "AUTH_EXPIRED",
+        actionData: { redirect: "/login" }
+      });
+    }
+    
+    // Clé valide
+    console.log("✅ Clé API valide. Accès autorisé.");
+    req.apiKeyAuthenticated = true;
+    next();
+    
+  } catch (error) {
+    console.error("❌ Erreur middleware de sécurité :", error.message);
+    return res.status(500).json({
+      status: "error",
+      message: "Erreur lors de la vérification de la clé API.",
+      actionTrigger: "NONE",
+      actionData: null
+    });
+  }
+}
+
 // ==================== FILTRE DE SÉCURITÉ - SANITIZATION ====================
 // Détection et masquage des données sensibles avant envoi à l'IA
 const SENSITIVE_PATTERNS = [
@@ -227,7 +264,6 @@ function sanitizeMessage(message) {
   };
 }
 
-// Middleware de sanitization
 function sanitizeMiddleware(req, res, next) {
   if (req.body && req.body.message) {
     const result = sanitizeMessage(req.body.message);
@@ -239,80 +275,6 @@ function sanitizeMiddleware(req, res, next) {
     }
   }
   next();
-}
-
-// ==================== MIDDLEWARE DE VÉRIFICATION FIREBASE TOKEN ====================
-async function verifyFirebaseToken(req, res, next) {
-  try {
-    if (!firebaseReady || !auth) {
-      return res.status(503).json({
-        status: "error",
-        message: "Service d'authentification indisponible.",
-        actionTrigger: "NONE",
-        actionData: null
-      });
-    }
-    
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({
-        status: "error",
-        message: "Authentification requise.",
-        actionTrigger: "AUTH_EXPIRED",
-        actionData: { redirect: "/login" }
-      });
-    }
-    
-    const token = authHeader.split("Bearer ")[1];
-    
-    if (!token) {
-      return res.status(401).json({
-        status: "error",
-        message: "Jeton d'authentification vide.",
-        actionTrigger: "AUTH_EXPIRED",
-        actionData: { redirect: "/login" }
-      });
-    }
-    
-    try {
-      const decodedToken = await auth.verifyIdToken(token);
-      req.user = {
-        uid: decodedToken.uid,
-        email: decodedToken.email || null,
-        name: decodedToken.name || null,
-        email_verified: decodedToken.email_verified || false
-      };
-      console.log(`✅ Utilisateur authentifié : ${req.user.uid}`);
-      next();
-    } catch (verifyError) {
-      console.error("❌ Jeton Firebase invalide :", verifyError.message);
-      
-      if (verifyError.code === "auth/id-token-expired") {
-        return res.status(401).json({
-          status: "error",
-          message: "Session expirée. Veuillez vous reconnecter.",
-          actionTrigger: "AUTH_EXPIRED",
-          actionData: { redirect: "/login" }
-        });
-      }
-      
-      return res.status(401).json({
-        status: "error",
-        message: "Jeton invalide.",
-        actionTrigger: "AUTH_EXPIRED",
-        actionData: { redirect: "/login" }
-      });
-    }
-  } catch (error) {
-    console.error("❌ Erreur middleware d'authentification :", error.message);
-    return res.status(500).json({
-      status: "error",
-      message: "Erreur lors de la vérification du jeton.",
-      actionTrigger: "NONE",
-      actionData: null
-    });
-  }
 }
 
 // ==================== DÉFINITION DES TOOLS (FUNCTION CALLING) ====================
@@ -478,7 +440,6 @@ async function executeWikipediaSearch(query, language = "fr") {
     
     const title = results[0].title;
     
-    // Récupération du résumé
     const summaryUrl = `https://${language}.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(title)}&format=json&origin=*`;
     const summaryResponse = await axios.get(summaryUrl, { timeout: 10000 });
     const pages = summaryResponse.data?.query?.pages;
@@ -571,14 +532,11 @@ async function executeImageSearch(query, limit = 5) {
 }
 
 /**
- * Exécute l'outil de productivité (simulation - à adapter selon les besoins)
+ * Exécute l'outil de productivité (simulation)
  */
 async function executeProductivityAction(action, details = "", dateTime = null) {
   try {
     console.log(`📋 Action productivité : ${action}`);
-    
-    // Logique simulée pour la démonstration
-    // À adapter avec les vraies intégrations Gmail, Google Calendar, etc.
     
     switch (action) {
       case "read_emails":
@@ -643,7 +601,6 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
     
     console.log("🤖 Appel OpenRouter avec Function Calling...");
     
-    // Construction des messages avec l'historique
     const messages = [
       {
         role: "system",
@@ -676,7 +633,7 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
           "HTTP-Referer": "https://milo-ead21.web.app",
           "X-Title": "MILO Orchestrator"
         },
-        timeout: 55000 // 55 secondes pour les réponses lentes
+        timeout: 55000
       }
     );
     
@@ -695,7 +652,6 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
       console.log(`🔧 Fonction appelée : ${functionName}`);
       console.log(`📝 Arguments :`, functionArgs);
       
-      // Exécuter la fonction appropriée
       let toolResult = null;
       let actionTrigger = "NONE";
       let actionData = null;
@@ -769,17 +725,6 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
           toolResult = { message: "Fonction inconnue" };
       }
       
-      // Sauvegarder le log dans Firebase
-      if (db) {
-        await db.ref("logs/ai_orchestrator").push({
-          userId: userId || "anonymous",
-          message: userMessage,
-          functionCalled: functionName,
-          actionTrigger: actionTrigger,
-          timestamp: Date.now()
-        });
-      }
-      
       return {
         status: "success",
         message: toolResult.message || responseMessage.content || "Action exécutée.",
@@ -793,16 +738,6 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
     
     if (!content) {
       throw new Error("Réponse OpenRouter vide");
-    }
-    
-    // Sauvegarder le log
-    if (db) {
-      await db.ref("logs/ai_chats").push({
-        userId: userId || "anonymous",
-        message: userMessage,
-        response: content,
-        timestamp: Date.now()
-      });
     }
     
     return {
@@ -830,7 +765,7 @@ app.get("/api/health", (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     services: {
-      firebase: firebaseReady,
+      apiKeyAuth: !!process.env.API_KEY,
       openrouter: !!process.env.OPENROUTER_API_KEY
     }
   });
@@ -842,12 +777,14 @@ app.get("/", (req, res) => {
     status: "success",
     message: "✅ API MILO active et opérationnelle",
     timestamp: new Date().toISOString(),
-    version: "1.0.0"
+    version: "1.0.0",
+    security: process.env.API_KEY ? "API Key configurée" : "API Key non configurée"
   });
 });
 
 // ==================== ROUTE PRINCIPALE DE CHAT ORCHESTRÉ ====================
-app.post("/api/chat", verifyFirebaseToken, sanitizeMiddleware, chatLimiter, async (req, res) => {
+// CORRECTION : verifyFirebaseToken → verifyApiKey
+app.post("/api/chat", verifyApiKey, sanitizeMiddleware, chatLimiter, async (req, res) => {
   try {
     const { message, history, userId } = req.body;
     
@@ -860,16 +797,14 @@ app.post("/api/chat", verifyFirebaseToken, sanitizeMiddleware, chatLimiter, asyn
       });
     }
     
-    console.log(`💬 Message reçu de ${req.user.uid} : "${message.substring(0, 100)}"`);
+    console.log(`💬 Message reçu : "${message.substring(0, 100)}"`);
     
-    // Appel à OpenRouter avec Function Calling
     const result = await callOpenRouterWithTools(
       message,
       history || [],
-      userId || req.user.uid
+      userId || "anonymous"
     );
     
-    // Définir le header d'action pour le frontend
     res.setHeader("X-Action-Trigger", result.actionTrigger);
     
     return res.status(200).json(result);
@@ -889,9 +824,8 @@ app.post("/api/chat", verifyFirebaseToken, sanitizeMiddleware, chatLimiter, asyn
 // ==================== ROUTES SPÉCIALISÉES /api/tools/* ====================
 
 // Route pour l'authentification WhatsApp
-app.get("/api/tools/whatsapp/qr", verifyFirebaseToken, async (req, res) => {
+app.get("/api/tools/whatsapp/qr", verifyApiKey, async (req, res) => {
   try {
-    // Simulation - à remplacer par la vraie logique Baileys
     res.status(200).json({
       status: "success",
       message: "QR Code WhatsApp généré.",
@@ -912,7 +846,7 @@ app.get("/api/tools/whatsapp/qr", verifyFirebaseToken, async (req, res) => {
 });
 
 // Route pour la recherche Wikipédia
-app.get("/api/tools/wiki/search", verifyFirebaseToken, async (req, res) => {
+app.get("/api/tools/wiki/search", verifyApiKey, async (req, res) => {
   try {
     const query = req.query.q;
     
@@ -944,7 +878,7 @@ app.get("/api/tools/wiki/search", verifyFirebaseToken, async (req, res) => {
 });
 
 // Route pour la recherche d'images
-app.get("/api/tools/images/search", verifyFirebaseToken, async (req, res) => {
+app.get("/api/tools/images/search", verifyApiKey, async (req, res) => {
   try {
     const query = req.query.q;
     const limit = parseInt(req.query.limit) || 5;
@@ -1023,10 +957,11 @@ const server = app.listen(PORT, () => {
   console.log(`📅 Démarrage : ${new Date().toISOString()}`);
   console.log(`🌍 Environnement : ${process.env.NODE_ENV || "development"}`);
   
-  if (firebaseReady) {
-    console.log("✅ Serveur actif et Firebase connecté avec succès");
+  if (process.env.API_KEY) {
+    console.log("✅ Sécurité API Key configurée avec succès");
   } else {
-    console.log("⚠️ Serveur actif mais Firebase non connecté");
+    console.log("⚠️ API_KEY non configurée. Les routes protégées seront indisponibles.");
+    console.log("⚠️ Ajoutez la variable API_KEY dans Render.");
   }
   
   if (process.env.OPENROUTER_API_KEY) {
@@ -1038,7 +973,7 @@ const server = app.listen(PORT, () => {
   console.log("========================================");
 });
 
-// Configuration des timeouts pour les réponses lentes
+// Configuration des timeouts
 server.timeout = 60000;
 server.keepAliveTimeout = 60000;
 server.headersTimeout = 65000;
