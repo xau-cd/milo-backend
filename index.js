@@ -1,7 +1,7 @@
-// ==================== INDEX.JS - CERVEAU ORCHESTRATEUR MILO ====================
+// ==================== SERVER.JS - CERVEAU ORCHESTRATEUR MILO ====================
 // Backend événementiel ultra-sécurisé pour l'agent MILO
-// Architecture : API Key Auth + OpenRouter Function Calling + Sécurité Zero Trust
-// CORRIGÉ : Authentification par clé API statique (sans firebase-admin)
+// Architecture : Supabase + OpenRouter Function Calling + Sécurité Zero Trust
+// REFACTORISÉ : Supabase remplace Firebase Admin SDK
 
 // ==================== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT ====================
 require("dotenv").config();
@@ -12,6 +12,42 @@ const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
+
+// ==================== INITIALISATION SUPABASE ====================
+// CORRECTION : Utilisation de Supabase au lieu de Firebase Admin
+function initializeSupabase() {
+  try {
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const supabaseKey = process.env.SUPABASE_KEY;
+    
+    if (!supabaseUrl || !supabaseKey) {
+      console.warn("⚠️ SUPABASE_URL ou SUPABASE_KEY non défini.");
+      console.warn("⚠️ Le serveur démarre en mode dégradé (sans base de données).");
+      console.warn("⚠️ Ajoutez SUPABASE_URL et SUPABASE_KEY dans les variables d'environnement Render.");
+      return null;
+    }
+    
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    });
+    
+    console.log("✅ Supabase initialisé avec succès.");
+    console.log(`📁 URL : ${supabaseUrl}`);
+    
+    return supabase;
+  } catch (error) {
+    console.error("❌ Erreur d'initialisation Supabase :", error.message);
+    console.error("❌ Le serveur démarre en mode dégradé (sans base de données).");
+    return null;
+  }
+}
+
+const supabase = initializeSupabase();
+const supabaseReady = supabase !== null;
 
 // ==================== INITIALISATION EXPRESS ====================
 const app = express();
@@ -43,12 +79,10 @@ const ALLOWED_ORIGINS = [
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Requêtes sans origine (curl, serveur-à-serveur)
     if (!origin) {
       return callback(null, true);
     }
     
-    // Vérification stricte de l'origine
     if (ALLOWED_ORIGINS.includes(origin)) {
       console.log(`✅ CORS autorisé : ${origin}`);
       callback(null, true);
@@ -64,7 +98,6 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// Gestion des requêtes preflight OPTIONS
 app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key");
   res.setHeader("Access-Control-Expose-Headers", "X-RateLimit-Remaining, X-Action-Trigger");
@@ -76,7 +109,6 @@ app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
 // ==================== RATE LIMITER ANTI-DDOS ====================
-// Limitation stricte : 30 requêtes / 15 minutes par IP
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
@@ -99,7 +131,6 @@ const apiLimiter = rateLimit({
   }
 });
 
-// Rate limiter plus strict pour le chat IA
 const chatLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -136,17 +167,10 @@ app.use((req, res, next) => {
 });
 
 // ==================== MIDDLEWARE DE SÉCURITÉ PAR CLÉ API ====================
-// CORRECTION : Nouveau middleware d'authentification par API Key
-// Remplacé : verifyFirebaseToken → verifyApiKey
-
 function verifyApiKey(req, res, next) {
   try {
-    // Vérifier si API_KEY est configurée dans les variables d'environnement
     if (!process.env.API_KEY) {
       console.error("❌ ERREUR CRITIQUE : API_KEY non définie.");
-      console.error("❌ Ajoutez la variable API_KEY dans les variables d'environnement Render.");
-      console.error("❌ Le serveur ne peut pas sécuriser les routes sans cette clé.");
-      
       return res.status(503).json({
         status: "error",
         message: "Service de sécurité indisponible. API_KEY non configurée.",
@@ -155,23 +179,17 @@ function verifyApiKey(req, res, next) {
       });
     }
     
-    // Récupérer la clé depuis l'en-tête Authorization ou x-api-key
     let providedKey = null;
     
-    // Option 1 : Header Authorization: Bearer <CLÉ>
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith("Bearer ")) {
       providedKey = authHeader.split("Bearer ")[1];
-      console.log("🔑 Clé API reçue via Authorization Bearer");
     }
     
-    // Option 2 : Header personnalisé x-api-key
     if (!providedKey && req.headers["x-api-key"]) {
       providedKey = req.headers["x-api-key"];
-      console.log("🔑 Clé API reçue via x-api-key");
     }
     
-    // Vérifier si la clé est présente
     if (!providedKey || providedKey.trim().length === 0) {
       console.warn("⛔ Tentative d'accès sans clé API.");
       return res.status(401).json({
@@ -182,7 +200,6 @@ function verifyApiKey(req, res, next) {
       });
     }
     
-    // Comparaison sécurisée de la clé (temps constant pour éviter le timing attack)
     const expectedKey = process.env.API_KEY;
     const providedKeyBuffer = Buffer.from(providedKey);
     const expectedKeyBuffer = Buffer.from(expectedKey);
@@ -197,7 +214,6 @@ function verifyApiKey(req, res, next) {
       });
     }
     
-    // Comparaison en temps constant
     let isValid = true;
     for (let i = 0; i < providedKeyBuffer.length; i++) {
       if (providedKeyBuffer[i] !== expectedKeyBuffer[i]) {
@@ -216,7 +232,6 @@ function verifyApiKey(req, res, next) {
       });
     }
     
-    // Clé valide
     console.log("✅ Clé API valide. Accès autorisé.");
     req.apiKeyAuthenticated = true;
     next();
@@ -233,7 +248,6 @@ function verifyApiKey(req, res, next) {
 }
 
 // ==================== FILTRE DE SÉCURITÉ - SANITIZATION ====================
-// Détection et masquage des données sensibles avant envoi à l'IA
 const SENSITIVE_PATTERNS = [
   { pattern: /password/i, replacement: "[DONNÉE_SENSIBLE]" },
   { pattern: /passwd/i, replacement: "[DONNÉE_SENSIBLE]" },
@@ -258,10 +272,7 @@ function sanitizeMessage(message) {
     }
   }
   
-  return {
-    sanitized,
-    sensitiveFound
-  };
+  return { sanitized, sensitiveFound };
 }
 
 function sanitizeMiddleware(req, res, next) {
@@ -277,8 +288,109 @@ function sanitizeMiddleware(req, res, next) {
   next();
 }
 
+// ==================== FONCTIONS SUPABASE (BASE DE DONNÉES) ====================
+
+/**
+ * Sauvegarde un log de chat dans Supabase
+ */
+async function saveChatLog(userId, message, response, actionTrigger) {
+  try {
+    if (!supabaseReady) {
+      console.warn("⚠️ Supabase non disponible. Log non sauvegardé.");
+      return null;
+    }
+    
+    const { data, error } = await supabase
+      .from("chat_logs")
+      .insert([
+        {
+          user_id: userId || "anonymous",
+          message: message,
+          response: response,
+          action_trigger: actionTrigger || "NONE",
+          created_at: new Date().toISOString()
+        }
+      ]);
+    
+    if (error) {
+      console.error("❌ Erreur Supabase (saveChatLog) :", error.message);
+      return null;
+    }
+    
+    console.log("✅ Log de chat sauvegardé dans Supabase.");
+    return data;
+  } catch (error) {
+    console.error("❌ Erreur saveChatLog :", error.message);
+    return null;
+  }
+}
+
+/**
+ * Récupère l'historique de chat d'un utilisateur
+ */
+async function getChatHistory(userId, limit = 10) {
+  try {
+    if (!supabaseReady) {
+      console.warn("⚠️ Supabase non disponible. Historique non récupéré.");
+      return [];
+    }
+    
+    const { data, error } = await supabase
+      .from("chat_logs")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    
+    if (error) {
+      console.error("❌ Erreur Supabase (getChatHistory) :", error.message);
+      return [];
+    }
+    
+    return data || [];
+  } catch (error) {
+    console.error("❌ Erreur getChatHistory :", error.message);
+    return [];
+  }
+}
+
+/**
+ * Sauvegarde un utilisateur dans Supabase
+ */
+async function saveUser(userData) {
+  try {
+    if (!supabaseReady) {
+      console.warn("⚠️ Supabase non disponible. Utilisateur non sauvegardé.");
+      return null;
+    }
+    
+    const { data, error } = await supabase
+      .from("users")
+      .upsert([
+        {
+          id: userData.id || userData.uid,
+          email: userData.email,
+          display_name: userData.displayName || userData.email?.split("@")[0],
+          whatsapp_connected: false,
+          created_at: new Date().toISOString(),
+          last_login: new Date().toISOString()
+        }
+      ], { onConflict: "id" });
+    
+    if (error) {
+      console.error("❌ Erreur Supabase (saveUser) :", error.message);
+      return null;
+    }
+    
+    console.log("✅ Utilisateur sauvegardé dans Supabase.");
+    return data;
+  } catch (error) {
+    console.error("❌ Erreur saveUser :", error.message);
+    return null;
+  }
+}
+
 // ==================== DÉFINITION DES TOOLS (FUNCTION CALLING) ====================
-// Ces définitions sont envoyées à OpenRouter pour le Function Calling
 const MILO_TOOLS = [
   {
     type: "function",
@@ -310,7 +422,7 @@ const MILO_TOOLS = [
     type: "function",
     function: {
       name: "trigger_voice_siri",
-      description: "Déclenche la synthèse vocale ou l'assistant Siri. À utiliser quand l'utilisateur veut parler à voix haute, activer Siri, ou utiliser des commandes vocales.",
+      description: "Déclenche la synthèse vocale ou l'assistant Siri.",
       parameters: {
         type: "object",
         properties: {
@@ -332,7 +444,7 @@ const MILO_TOOLS = [
     type: "function",
     function: {
       name: "search_wikipedia",
-      description: "Recherche des informations sur Wikipédia. À utiliser pour des explications scientifiques, des recherches encyclopédiques, ou des demandes de connaissances générales.",
+      description: "Recherche des informations sur Wikipédia.",
       parameters: {
         type: "object",
         properties: {
@@ -354,7 +466,7 @@ const MILO_TOOLS = [
     type: "function",
     function: {
       name: "search_web",
-      description: "Effectue une recherche web générale. À utiliser pour des recherches d'actualités, des informations récentes, ou des questions non encyclopédiques.",
+      description: "Effectue une recherche web générale.",
       parameters: {
         type: "object",
         properties: {
@@ -371,7 +483,7 @@ const MILO_TOOLS = [
     type: "function",
     function: {
       name: "search_images",
-      description: "Recherche des images sur Wikimedia Commons. À utiliser quand l'utilisateur demande des images, des photos, ou des illustrations.",
+      description: "Recherche des images sur Wikimedia Commons.",
       parameters: {
         type: "object",
         properties: {
@@ -403,11 +515,11 @@ const MILO_TOOLS = [
           },
           details: {
             type: "string",
-            description: "Les détails de l'action (contenu du rappel, description de l'événement, etc.)"
+            description: "Les détails de l'action"
           },
           dateTime: {
             type: "string",
-            description: "La date et l'heure pour les rappels et événements (format ISO 8601)"
+            description: "La date et l'heure (format ISO 8601)"
           }
         },
         required: ["action"]
@@ -418,9 +530,6 @@ const MILO_TOOLS = [
 
 // ==================== EXÉCUTION DES TOOLS ====================
 
-/**
- * Exécute l'outil de recherche Wikipédia
- */
 async function executeWikipediaSearch(query, language = "fr") {
   try {
     console.log(`📚 Recherche Wikipédia : ${query} (${language})`);
@@ -430,12 +539,7 @@ async function executeWikipediaSearch(query, language = "fr") {
     const results = searchResponse.data?.query?.search;
     
     if (!results || results.length === 0) {
-      return {
-        success: true,
-        title: null,
-        summary: null,
-        url: null
-      };
+      return { success: true, title: null, summary: null, url: null };
     }
     
     const title = results[0].title;
@@ -454,16 +558,10 @@ async function executeWikipediaSearch(query, language = "fr") {
     };
   } catch (error) {
     console.error("❌ Erreur recherche Wikipédia :", error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
-/**
- * Exécute l'outil de recherche web (DuckDuckGo)
- */
 async function executeWebSearch(query) {
   try {
     console.log(`🔍 Recherche web : ${query}`);
@@ -482,16 +580,10 @@ async function executeWebSearch(query) {
     };
   } catch (error) {
     console.error("❌ Erreur recherche web :", error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
-/**
- * Exécute l'outil de recherche d'images (Wikimedia Commons)
- */
 async function executeImageSearch(query, limit = 5) {
   try {
     console.log(`🖼️ Recherche d'images : ${query}`);
@@ -501,10 +593,7 @@ async function executeImageSearch(query, limit = 5) {
     const pages = response.data?.query?.pages;
     
     if (!pages) {
-      return {
-        success: true,
-        images: []
-      };
+      return { success: true, images: [] };
     }
     
     const images = Object.values(pages).map(page => {
@@ -517,23 +606,13 @@ async function executeImageSearch(query, limit = 5) {
       };
     }).filter(img => img.url);
     
-    return {
-      success: true,
-      images
-    };
+    return { success: true, images };
   } catch (error) {
     console.error("❌ Erreur recherche d'images :", error.message);
-    return {
-      success: false,
-      error: error.message,
-      images: []
-    };
+    return { success: false, error: error.message, images: [] };
   }
 }
 
-/**
- * Exécute l'outil de productivité (simulation)
- */
 async function executeProductivityAction(action, details = "", dateTime = null) {
   try {
     console.log(`📋 Action productivité : ${action}`);
@@ -548,7 +627,6 @@ async function executeProductivityAction(action, details = "", dateTime = null) 
             { id: 2, subject: "Rapport mensuel", from: "direction@hiklon.com", date: "2024-01-14" }
           ]
         };
-      
       case "create_reminder":
         return {
           success: true,
@@ -559,7 +637,6 @@ async function executeProductivityAction(action, details = "", dateTime = null) 
             status: "created"
           }
         };
-      
       case "add_event":
         return {
           success: true,
@@ -570,27 +647,17 @@ async function executeProductivityAction(action, details = "", dateTime = null) 
             status: "added"
           }
         };
-      
       default:
-        return {
-          success: false,
-          error: "Action inconnue"
-        };
+        return { success: false, error: "Action inconnue" };
     }
   } catch (error) {
     console.error("❌ Erreur action productivité :", error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
 // ==================== APPEL OPENROUTER AVEC FUNCTION CALLING ====================
 
-/**
- * Appelle OpenRouter avec le Function Calling pour orchestrer les actions
- */
 async function callOpenRouterWithTools(userMessage, history = [], userId = null) {
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
@@ -604,7 +671,7 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
     const messages = [
       {
         role: "system",
-        content: "Tu es MILO, une intelligence artificielle créée par HIKLON Technologie. Tu es un assistant personnel intelligent et proactif. Tu peux déclencher des actions spécifiques en utilisant les fonctions disponibles. Analyse l'intention de l'utilisateur et choisis la fonction appropriée."
+        content: "Tu es MILO, une intelligence artificielle créée par HIKLON Technologie. Tu es un assistant personnel intelligent et proactif. Analyse l'intention de l'utilisateur et choisis la fonction appropriée."
       },
       ...history.slice(-10).map(msg => ({
         role: msg.role || "user",
@@ -643,7 +710,6 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
       throw new Error("Réponse OpenRouter vide");
     }
     
-    // Vérifier si l'IA veut appeler une fonction
     if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
       const functionName = toolCall.function.name;
@@ -669,7 +735,6 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
             qrRequired: true
           };
           break;
-        
         case "trigger_voice_siri":
           actionTrigger = "VOICE_SIRI";
           actionData = {
@@ -681,49 +746,37 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
             audioText: functionArgs.text || "Je vous écoute"
           };
           break;
-        
         case "search_wikipedia":
           actionTrigger = "WIKI_MODAL";
-          const wikiResult = await executeWikipediaSearch(
-            functionArgs.query,
-            functionArgs.language || "fr"
-          );
+          const wikiResult = await executeWikipediaSearch(functionArgs.query, functionArgs.language || "fr");
           actionData = wikiResult;
           toolResult = wikiResult;
           break;
-        
         case "search_web":
           actionTrigger = "WIKI_MODAL";
           const webResult = await executeWebSearch(functionArgs.query);
           actionData = webResult;
           toolResult = webResult;
           break;
-        
         case "search_images":
           actionTrigger = "WIKI_MODAL";
-          const imageResult = await executeImageSearch(
-            functionArgs.query,
-            functionArgs.limit || 5
-          );
+          const imageResult = await executeImageSearch(functionArgs.query, functionArgs.limit || 5);
           actionData = imageResult;
           toolResult = imageResult;
           break;
-        
         case "manage_productivity":
           actionTrigger = "NONE";
-          const productivityResult = await executeProductivityAction(
-            functionArgs.action,
-            functionArgs.details || "",
-            functionArgs.dateTime || null
-          );
+          const productivityResult = await executeProductivityAction(functionArgs.action, functionArgs.details || "", functionArgs.dateTime || null);
           actionData = productivityResult;
           toolResult = productivityResult;
           break;
-        
         default:
           actionTrigger = "NONE";
           toolResult = { message: "Fonction inconnue" };
       }
+      
+      // Sauvegarder le log dans Supabase
+      await saveChatLog(userId, userMessage, toolResult.message || "Action exécutée", actionTrigger);
       
       return {
         status: "success",
@@ -733,12 +786,14 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
       };
     }
     
-    // Réponse directe sans appel de fonction
     const content = responseMessage.content;
     
     if (!content) {
       throw new Error("Réponse OpenRouter vide");
     }
+    
+    // Sauvegarder le log dans Supabase
+    await saveChatLog(userId, userMessage, content, "NONE");
     
     return {
       status: "success",
@@ -758,17 +813,55 @@ async function callOpenRouterWithTools(userMessage, history = [], userId = null)
 
 // ==================== ROUTES ====================
 
-// ==================== ROUTE HEALTHCHECK (PUBLIQUE) ====================
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    status: "online",
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    services: {
-      apiKeyAuth: !!process.env.API_KEY,
-      openrouter: !!process.env.OPENROUTER_API_KEY
+// ==================== ROUTE HEALTHCHECK OBLIGATOIRE ====================
+app.get("/api/health", async (req, res) => {
+  try {
+    console.log("🔍 Healthcheck demandé");
+    
+    let databaseStatus = "disconnected";
+    
+    if (supabaseReady && supabase) {
+      try {
+        // Requête test rapide sur Supabase
+        const { data, error } = await supabase
+          .from("health_check")
+          .select("*")
+          .limit(1);
+        
+        if (error) {
+          // La table n'existe peut-être pas encore, essayons une requête générique
+          const { error: fallbackError } = await supabase
+            .from("users")
+            .select("id")
+            .limit(1);
+          
+          if (!fallbackError) {
+            databaseStatus = "connected";
+          } else {
+            console.warn("⚠️ Erreur Supabase healthcheck :", fallbackError.message);
+          }
+        } else {
+          databaseStatus = "connected";
+        }
+      } catch (supabaseError) {
+        console.error("❌ Erreur Supabase healthcheck :", supabaseError.message);
+      }
     }
-  });
+    
+    res.status(200).json({
+      status: "ok",
+      database: databaseStatus,
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime()
+    });
+  } catch (error) {
+    console.error("❌ Erreur healthcheck :", error.message);
+    res.status(500).json({
+      status: "error",
+      database: "disconnected",
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // ==================== ROUTE RACINE ====================
@@ -778,12 +871,11 @@ app.get("/", (req, res) => {
     message: "✅ API MILO active et opérationnelle",
     timestamp: new Date().toISOString(),
     version: "1.0.0",
-    security: process.env.API_KEY ? "API Key configurée" : "API Key non configurée"
+    database: supabaseReady ? "Supabase connecté" : "Supabase non connecté"
   });
 });
 
 // ==================== ROUTE PRINCIPALE DE CHAT ORCHESTRÉ ====================
-// CORRECTION : verifyFirebaseToken → verifyApiKey
 app.post("/api/chat", verifyApiKey, sanitizeMiddleware, chatLimiter, async (req, res) => {
   try {
     const { message, history, userId } = req.body;
@@ -799,9 +891,19 @@ app.post("/api/chat", verifyApiKey, sanitizeMiddleware, chatLimiter, async (req,
     
     console.log(`💬 Message reçu : "${message.substring(0, 100)}"`);
     
+    // Récupérer l'historique depuis Supabase si non fourni
+    let chatHistory = history || [];
+    if (!chatHistory.length && userId && supabaseReady) {
+      const dbHistory = await getChatHistory(userId, 10);
+      chatHistory = dbHistory.map(log => ({
+        role: "user",
+        content: log.message
+      })).reverse();
+    }
+    
     const result = await callOpenRouterWithTools(
       message,
-      history || [],
+      chatHistory,
       userId || "anonymous"
     );
     
@@ -821,9 +923,55 @@ app.post("/api/chat", verifyApiKey, sanitizeMiddleware, chatLimiter, async (req,
   }
 });
 
+// ==================== ROUTE D'INSCRIPTION UTILISATEUR ====================
+app.post("/api/auth/register", verifyApiKey, async (req, res) => {
+  try {
+    const { email, displayName, userId } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({
+        status: "error",
+        message: "Email requis.",
+        actionTrigger: "NONE",
+        actionData: null
+      });
+    }
+    
+    // Sauvegarder l'utilisateur dans Supabase
+    const savedUser = await saveUser({
+      id: userId || `user_${Date.now()}`,
+      email: email,
+      displayName: displayName || email.split("@")[0]
+    });
+    
+    if (!savedUser) {
+      return res.status(500).json({
+        status: "error",
+        message: "Erreur lors de l'enregistrement de l'utilisateur.",
+        actionTrigger: "NONE",
+        actionData: null
+      });
+    }
+    
+    res.status(201).json({
+      status: "success",
+      message: "Utilisateur enregistré avec succès.",
+      actionTrigger: "NONE",
+      actionData: null
+    });
+  } catch (error) {
+    console.error("❌ Erreur inscription :", error.message);
+    res.status(500).json({
+      status: "error",
+      message: "Erreur lors de l'inscription.",
+      actionTrigger: "NONE",
+      actionData: null
+    });
+  }
+});
+
 // ==================== ROUTES SPÉCIALISÉES /api/tools/* ====================
 
-// Route pour l'authentification WhatsApp
 app.get("/api/tools/whatsapp/qr", verifyApiKey, async (req, res) => {
   try {
     res.status(200).json({
@@ -845,7 +993,6 @@ app.get("/api/tools/whatsapp/qr", verifyApiKey, async (req, res) => {
   }
 });
 
-// Route pour la recherche Wikipédia
 app.get("/api/tools/wiki/search", verifyApiKey, async (req, res) => {
   try {
     const query = req.query.q;
@@ -877,7 +1024,6 @@ app.get("/api/tools/wiki/search", verifyApiKey, async (req, res) => {
   }
 });
 
-// Route pour la recherche d'images
 app.get("/api/tools/images/search", verifyApiKey, async (req, res) => {
   try {
     const query = req.query.q;
@@ -949,7 +1095,7 @@ process.on("unhandledRejection", (reason, promise) => {
 });
 
 // ==================== DÉMARRAGE DU SERVEUR ====================
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, () => {
   console.log("========================================");
@@ -957,11 +1103,17 @@ const server = app.listen(PORT, () => {
   console.log(`📅 Démarrage : ${new Date().toISOString()}`);
   console.log(`🌍 Environnement : ${process.env.NODE_ENV || "development"}`);
   
+  if (supabaseReady) {
+    console.log("✅ Supabase connecté avec succès");
+  } else {
+    console.log("⚠️ Supabase non connecté");
+    console.log("⚠️ Ajoutez SUPABASE_URL et SUPABASE_KEY dans Render");
+  }
+  
   if (process.env.API_KEY) {
-    console.log("✅ Sécurité API Key configurée avec succès");
+    console.log("✅ Sécurité API Key configurée");
   } else {
     console.log("⚠️ API_KEY non configurée. Les routes protégées seront indisponibles.");
-    console.log("⚠️ Ajoutez la variable API_KEY dans Render.");
   }
   
   if (process.env.OPENROUTER_API_KEY) {
