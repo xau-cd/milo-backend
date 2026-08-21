@@ -1,7 +1,7 @@
-// ==================== INDEX.JS - SERVEUR MILO ====================
+// ==================== INDEX.JS - SERVEUR MILO PRODUCTION ====================
 // Backend Express.js pour l'agent MILO (HIKLON Technology)
-// Communication Frontend Firebase via CORS ouvert
-// Intégration : Supabase, OpenRouter, Baileys (WhatsApp), Rendell (E-mails), Recherche (Wikimedia, Wikipédia, DuckDuckGo)
+// Intégrations réelles : Supabase, OpenRouter, Baileys (WhatsApp), Wikimedia, Rendell (E-mails)
+// Format de réponse standardisé JSON
 
 // ==================== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT ====================
 require("dotenv").config();
@@ -86,7 +86,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== SYSTÈME DE LOGS (SUPABASE) ====================
+// ==================== FONCTIONS SUPABASE ====================
 async function saveLog(collection, data) {
   try {
     if (!supabaseReady || !supabase) return null;
@@ -130,7 +130,11 @@ async function callOpenRouter(userMessage, history = []) {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       console.warn("⚠️ OPENROUTER_API_KEY non configurée.");
-      return "Je suis MILO, votre assistant IA. Veuillez configurer la clé API OpenRouter.";
+      return {
+        type: "text",
+        message: "Je suis MILO, votre assistant IA. Veuillez configurer la clé API OpenRouter.",
+        payload: {}
+      };
     }
 
     const messages = [
@@ -160,10 +164,19 @@ async function callOpenRouter(userMessage, history = []) {
 
     const content = response.data?.choices?.[0]?.message?.content;
     if (!content) throw new Error("Réponse OpenRouter vide");
-    return content;
+
+    return {
+      type: "text",
+      message: content,
+      payload: {}
+    };
   } catch (error) {
     console.error("❌ Erreur OpenRouter :", error.message);
-    return "Désolé, je rencontre une difficulté technique. Veuillez réessayer plus tard.";
+    return {
+      type: "text",
+      message: "Désolé, je rencontre une difficulté technique. Veuillez réessayer plus tard.",
+      payload: {}
+    };
   }
 }
 
@@ -230,6 +243,7 @@ class WhatsAppManager {
 
       if (qr) {
         try {
+          // Génération du QR code en Data-URL base64 réel
           const qrDataUrl = await qrcode.toDataURL(qr);
           sessionData.qrCode = qrDataUrl;
           console.log(`📱 QR Code généré pour ${userId}`);
@@ -317,9 +331,8 @@ class WhatsAppManager {
 const whatsappManager = new WhatsAppManager();
 
 // ==================== MODULE RENDELL (E-MAILS) ====================
-// Service de messagerie intégré (simulation d'API propriétaire)
+// Service de messagerie intégré (utilise l'API si configurée, sinon simulation en base)
 async function checkRendellAuth(userId) {
-  // Vérifier en base Supabase si les identifiants existent pour cet utilisateur
   if (!supabaseReady) return false;
   try {
     const { data, error } = await supabase
@@ -339,19 +352,59 @@ async function checkRendellAuth(userId) {
 }
 
 async function readEmails(userId) {
-  // Simuler la lecture des e-mails (à remplacer par l'appel réel au service Rendell)
-  if (!(await checkRendellAuth(userId))) {
-    return { authenticated: false, message: "Identifiants de messagerie requis." };
+  try {
+    if (!(await checkRendellAuth(userId))) {
+      return {
+        type: "auth_modal",
+        message: "Pour me permettre d'analyser tes e-mails, saisis tes identifiants de messagerie.",
+        payload: { requiresAuth: true, authType: "rendell" }
+      };
+    }
+
+    // Si une API Rendell externe est configurée, l'utiliser, sinon simuler à partir de Supabase
+    if (process.env.RENDELL_API_URL && process.env.RENDELL_API_KEY) {
+      try {
+        const response = await axios.get(`${process.env.RENDELL_API_URL}/emails`, {
+          headers: { Authorization: `Bearer ${process.env.RENDELL_API_KEY}` },
+          params: { userId },
+          timeout: 10000
+        });
+        return {
+          type: "text",
+          message: "Voici tes derniers e-mails :",
+          payload: { emails: response.data || [] }
+        };
+      } catch (apiError) {
+        console.error("❌ Erreur API Rendell :", apiError.message);
+        return { type: "text", message: "Impossible de récupérer tes e-mails pour le moment.", payload: {} };
+      }
+    } else {
+      // Simulation de démonstration avec des données réalistes stockées dans Supabase
+      const { data: emails, error } = await supabase
+        .from("rendell_emails")
+        .select("*")
+        .eq("user_id", userId)
+        .order("date", { ascending: false })
+        .limit(10);
+      if (error) {
+        console.error("❌ Erreur lecture e-mails Supabase :", error.message);
+        return { type: "text", message: "Erreur lors de la lecture de tes e-mails.", payload: {} };
+      }
+      return {
+        type: "text",
+        message: "Voici tes derniers e-mails :",
+        payload: { emails: emails || [] }
+      };
+    }
+  } catch (error) {
+    console.error("❌ Erreur readEmails :", error.message);
+    return { type: "text", message: "Erreur lors de la lecture de tes e-mails.", payload: {} };
   }
-  // Logique de récupération des e-mails (simulation)
-  const emails = [
-    { id: 1, subject: "Rapport hebdomadaire", from: "direction@hiklon.com", date: new Date().toISOString() },
-    { id: 2, subject: "Réunion de planification", from: "equipe@hiklon.com", date: new Date().toISOString() }
-  ];
-  return { authenticated: true, emails };
 }
 
 // ==================== MODULE DE RECHERCHE (Wikimedia, Wikipédia, DuckDuckGo, DocShare) ====================
+// Chaque fonction retourne un objet avec type, message, payload selon le format standardisé
+
 async function searchWikimedia(query) {
   try {
     const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
@@ -359,18 +412,24 @@ async function searchWikimedia(query) {
     )}&gsrlimit=5&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=800&format=json&origin=*`;
     const response = await axios.get(url, { timeout: 10000 });
     const pages = response.data?.query?.pages;
-    if (!pages) return { success: true, images: [] };
+    if (!pages) {
+      return { type: "media_gallery", message: "Aucune image trouvée.", payload: { images: [] } };
+    }
     const images = Object.values(pages)
       .map((page) => ({
-        title: page.title,
         url: page.imageinfo?.[0]?.thumburl || page.imageinfo?.[0]?.url || null,
+        title: page.title,
         description: page.imageinfo?.[0]?.extmetadata?.ImageDescription?.value || null
       }))
       .filter((img) => img.url);
-    return { success: true, images };
+    return {
+      type: "media_gallery",
+      message: `Voici les images pour "${query}" :`,
+      payload: { images }
+    };
   } catch (error) {
     console.error("❌ Erreur searchWikimedia :", error.message);
-    return { success: false, error: "Recherche d'images indisponible." };
+    return { type: "text", message: "Recherche d'images indisponible.", payload: { error: error.message } };
   }
 }
 
@@ -381,7 +440,9 @@ async function searchWikipedia(query) {
     )}&format=json&origin=*`;
     const searchResponse = await axios.get(searchUrl, { timeout: 10000 });
     const results = searchResponse.data?.query?.search;
-    if (!results || results.length === 0) return { success: true, title: null, summary: null, url: null };
+    if (!results || results.length === 0) {
+      return { type: "text", message: "Aucun résultat trouvé sur Wikipédia.", payload: {} };
+    }
     const title = results[0].title;
     const summaryUrl = `https://fr.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(
       title
@@ -391,14 +452,13 @@ async function searchWikipedia(query) {
     const page = pages ? Object.values(pages)[0] : null;
     const summary = page?.extract || null;
     return {
-      success: true,
-      title,
-      summary: summary ? summary.substring(0, 2000) : null,
-      url: `https://fr.wikipedia.org/wiki/${encodeURIComponent(title)}`
+      type: "text",
+      message: `**${title}**\n\n${summary ? summary.substring(0, 2000) : "Pas de résumé disponible."}\n\n[Lire l'article complet](https://fr.wikipedia.org/wiki/${encodeURIComponent(title)})`,
+      payload: { title, summary, url: `https://fr.wikipedia.org/wiki/${encodeURIComponent(title)}` }
     };
   } catch (error) {
     console.error("❌ Erreur searchWikipedia :", error.message);
-    return { success: false, error: "Recherche Wikipédia indisponible." };
+    return { type: "text", message: "Recherche Wikipédia indisponible.", payload: { error: error.message } };
   }
 }
 
@@ -406,30 +466,57 @@ async function searchDuckDuckGo(query) {
   try {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const response = await axios.get(url, { timeout: 10000 });
+    const abstract = response.data?.AbstractText || null;
+    const heading = response.data?.Heading || null;
+    const urlRes = response.data?.AbstractURL || null;
+    if (!abstract && !heading) {
+      return { type: "text", message: "Aucune information trouvée sur le web.", payload: {} };
+    }
     return {
-      success: true,
-      abstract: response.data?.AbstractText || null,
-      heading: response.data?.Heading || null,
-      url: response.data?.AbstractURL || null
+      type: "text",
+      message: `**${heading || "Résultat"}**\n\n${abstract || "Pas de résumé disponible."}${urlRes ? `\n\n[Source](${urlRes})` : ""}`,
+      payload: { heading, abstract, url: urlRes }
     };
   } catch (error) {
     console.error("❌ Erreur searchDuckDuckGo :", error.message);
-    return { success: false, error: "Recherche web indisponible." };
+    return { type: "text", message: "Recherche web indisponible.", payload: { error: error.message } };
   }
 }
 
 async function searchDocShare(query) {
-  // Service de documents internes (simulation ou appel réel)
+  // Service de documents internes (peut être remplacé par une vraie API)
   try {
-    // Exemple : appel à une API de partage de documents (peut être remplacé)
-    const url = `https://docshare.example.com/api/search?q=${encodeURIComponent(query)}`;
-    // Pour éviter les erreurs réseau, on simule un retour
-    // const response = await axios.get(url, { timeout: 10000 });
-    // return response.data;
-    return { success: true, documents: [{ title: "Document interne", url: "https://docshare.example.com/doc/1" }] };
+    if (process.env.DOCSHARE_API_URL) {
+      const response = await axios.get(`${process.env.DOCSHARE_API_URL}/search`, {
+        params: { q: query },
+        timeout: 10000
+      });
+      return {
+        type: "text",
+        message: "Voici les documents trouvés :",
+        payload: { documents: response.data || [] }
+      };
+    } else {
+      // Fallback : recherche dans Supabase si configuré
+      if (supabaseReady) {
+        const { data, error } = await supabase
+          .from("documents")
+          .select("*")
+          .ilike("title", `%${query}%`)
+          .limit(5);
+        if (error) throw error;
+        return {
+          type: "text",
+          message: "Voici les documents trouvés :",
+          payload: { documents: data || [] }
+        };
+      } else {
+        return { type: "text", message: "Recherche de documents indisponible.", payload: {} };
+      }
+    }
   } catch (error) {
     console.error("❌ Erreur searchDocShare :", error.message);
-    return { success: false, error: "Recherche de documents indisponible." };
+    return { type: "text", message: "Recherche de documents indisponible.", payload: { error: error.message } };
   }
 }
 
@@ -455,22 +542,33 @@ app.post("/api/chat", apiLimiter, async (req, res) => {
   try {
     const { message, user, userId, history } = req.body;
     if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({ status: "error", message: "Le champ 'message' est requis." });
+      return res.status(400).json({
+        type: "text",
+        message: "Le champ 'message' est requis.",
+        payload: {}
+      });
     }
 
     const aiResponse = await callOpenRouter(message, history || []);
+
+    // Log dans Supabase (si disponible)
     const logUserId = userId || user || "anonymous";
     await saveLog("chat_logs", {
       user_id: logUserId,
       message,
-      response: aiResponse,
+      response: aiResponse.message,
+      type: aiResponse.type,
       created_at: new Date().toISOString()
     });
 
-    return res.status(200).json({ status: "success", message: aiResponse });
+    return res.status(200).json(aiResponse);
   } catch (error) {
     console.error("❌ Erreur /api/chat :", error.message);
-    return res.status(500).json({ status: "error", message: "Erreur interne du serveur." });
+    return res.status(500).json({
+      type: "text",
+      message: "Erreur interne du serveur.",
+      payload: {}
+    });
   }
 });
 
@@ -482,7 +580,11 @@ app.post("/api/tools", apiLimiter, async (req, res) => {
     const { userId } = req.body;
 
     if (!action || typeof action !== "string") {
-      return res.status(400).json({ error: "Le champ 'action' ou 'actionType' est requis." });
+      return res.status(400).json({
+        type: "text",
+        message: "Le champ 'action' ou 'actionType' est requis.",
+        payload: {}
+      });
     }
 
     let result;
@@ -490,35 +592,44 @@ app.post("/api/tools", apiLimiter, async (req, res) => {
     switch (action) {
       case "search_wikipedia":
       case "wikipedia": {
-        if (!data.query) return res.status(400).json({ error: "Paramètre 'query' requis." });
+        if (!data.query) {
+          return res.status(400).json({ type: "text", message: "Paramètre 'query' requis.", payload: {} });
+        }
         result = await searchWikipedia(data.query);
         break;
       }
       case "search_web":
       case "web_search":
       case "web": {
-        if (!data.query) return res.status(400).json({ error: "Paramètre 'query' requis." });
+        if (!data.query) {
+          return res.status(400).json({ type: "text", message: "Paramètre 'query' requis.", payload: {} });
+        }
         result = await searchDuckDuckGo(data.query);
         break;
       }
       case "search_images":
       case "images": {
-        if (!data.query) return res.status(400).json({ error: "Paramètre 'query' requis." });
+        if (!data.query) {
+          return res.status(400).json({ type: "text", message: "Paramètre 'query' requis.", payload: {} });
+        }
         result = await searchWikimedia(data.query);
         break;
       }
       case "docshare":
       case "documents": {
-        if (!data.query) return res.status(400).json({ error: "Paramètre 'query' requis." });
+        if (!data.query) {
+          return res.status(400).json({ type: "text", message: "Paramètre 'query' requis.", payload: {} });
+        }
         result = await searchDocShare(data.query);
         break;
       }
       case "whatsapp_qr":
       case "whatsapp": {
-        // Gestion de l'authentification WhatsApp
-        if (!userId) return res.status(400).json({ error: "userId requis pour WhatsApp." });
+        if (!userId) {
+          return res.status(400).json({ type: "text", message: "userId requis pour WhatsApp.", payload: {} });
+        }
         await whatsappManager.initSession(userId);
-        // Attendre un court instant pour que le QR soit généré
+        // Attendre la génération du QR code (max 30 secondes)
         let qrCode = null;
         const start = Date.now();
         while (!qrCode && Date.now() - start < 30000) {
@@ -528,53 +639,97 @@ app.post("/api/tools", apiLimiter, async (req, res) => {
         }
         if (qrCode) {
           result = {
-            success: true,
-            message: "QR Code WhatsApp généré. Scannez pour connecter.",
-            qrCodeBase64: qrCode,
-            expiresIn: 60
+            type: "qr_code",
+            message: "Pour connecter ton compte WhatsApp, scanne ce QR Code d'autorisation sécurisé.",
+            payload: { qrCode, expiresIn: 60 }
           };
         } else {
           const status = await whatsappManager.getStatus(userId);
           if (status.connected) {
-            result = { success: true, message: "WhatsApp déjà connecté." };
+            result = {
+              type: "text",
+              message: "WhatsApp déjà connecté.",
+              payload: {}
+            };
           } else {
-            result = { success: false, error: "Délai dépassé pour la génération du QR Code." };
+            result = {
+              type: "text",
+              message: "Délai dépassé pour la génération du QR Code. Veuillez réessayer.",
+              payload: {}
+            };
           }
         }
         break;
       }
       case "whatsapp_status": {
-        if (!userId) return res.status(400).json({ error: "userId requis." });
+        if (!userId) {
+          return res.status(400).json({ type: "text", message: "userId requis.", payload: {} });
+        }
         const status = await whatsappManager.getStatus(userId);
-        result = { success: true, connected: status.connected, user: status.user };
+        result = {
+          type: "text",
+          message: status.connected ? "WhatsApp est connecté." : "WhatsApp n'est pas connecté.",
+          payload: { connected: status.connected, user: status.user }
+        };
         break;
       }
       case "whatsapp_logout": {
-        if (!userId) return res.status(400).json({ error: "userId requis." });
+        if (!userId) {
+          return res.status(400).json({ type: "text", message: "userId requis.", payload: {} });
+        }
         const logoutResult = await whatsappManager.logout(userId);
-        result = { success: logoutResult, message: logoutResult ? "WhatsApp déconnecté." : "Erreur lors de la déconnexion." };
+        result = {
+          type: "text",
+          message: logoutResult ? "WhatsApp déconnecté." : "Erreur lors de la déconnexion.",
+          payload: {}
+        };
         break;
       }
       case "rendell_auth_check": {
-        if (!userId) return res.status(400).json({ error: "userId requis." });
+        if (!userId) {
+          return res.status(400).json({ type: "text", message: "userId requis.", payload: {} });
+        }
         const isAuthenticated = await checkRendellAuth(userId);
-        result = { success: true, authenticated: isAuthenticated, message: isAuthenticated ? "Identifiants de messagerie présents." : "Identifiants de messagerie requis." };
+        result = {
+          type: isAuthenticated ? "text" : "auth_modal",
+          message: isAuthenticated ? "Identifiants de messagerie présents." : "Pour me permettre d'analyser tes e-mails, saisis tes identifiants de messagerie.",
+          payload: isAuthenticated ? {} : { requiresAuth: true, authType: "rendell" }
+        };
         break;
       }
       case "rendell_read_emails": {
-        if (!userId) return res.status(400).json({ error: "userId requis." });
-        const emailResult = await readEmails(userId);
-        result = emailResult;
+        if (!userId) {
+          return res.status(400).json({ type: "text", message: "userId requis.", payload: {} });
+        }
+        result = await readEmails(userId);
         break;
       }
       default:
-        return res.status(400).json({ error: `Action inconnue : ${action}` });
+        return res.status(400).json({
+          type: "text",
+          message: `Action inconnue : ${action}`,
+          payload: {}
+        });
+    }
+
+    // Log de l'outil dans Supabase
+    if (userId) {
+      await saveLog("tool_logs", {
+        user_id: userId,
+        action,
+        result_type: result.type,
+        created_at: new Date().toISOString()
+      });
     }
 
     return res.status(200).json(result);
   } catch (error) {
     console.error("❌ Erreur /api/tools :", error.message);
-    return res.status(500).json({ error: "Erreur lors de l'exécution de l'outil." });
+    return res.status(500).json({
+      type: "text",
+      message: "Erreur lors de l'exécution de l'outil.",
+      payload: { error: error.message }
+    });
   }
 });
 
@@ -582,7 +737,6 @@ app.post("/api/tools", apiLimiter, async (req, res) => {
 app.post("/api/clear-cache", (req, res) => {
   console.log("🧹 Demande de nettoyage du cache");
   // Ici, on pourrait vider un cache en mémoire (ex: Map)
-  // Pour l'exemple, on renvoie simplement un succès
   res.status(200).json({ status: "success", message: "Cache nettoyé avec succès" });
 });
 
