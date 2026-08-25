@@ -1,7 +1,7 @@
 // ==================== INDEX.JS - CERVEAU MILO (HIKLON TECHNOLOGIES) ====================
 // Architecture : Backend (Cerveau) → Frontend (Corps)
 // Technologies : Express, SQLite, whatsapp-web.js, qrcode, axios, Groq (Principal), OpenRouter (Fallback), Nodemailer
-// Format de réponse strict : { replyText, systemAction, payload }
+// Format de réponse strict : { reply: "texte" }
 // Optimisé pour Render 512 Mo
 
 require("dotenv").config();
@@ -23,7 +23,10 @@ const crypto = require("crypto");
 // ==================== CONFIGURATION ET VALIDATION DES VARIABLES D'ENVIRONNEMENT ====================
 const requiredEnvVars = [
   "GROQ_API_KEY",
-  "OPENROUTER_API_KEY",
+  "OPENROUTER_API_KEY"
+];
+
+const optionalEnvVars = [
   "SMTP_HOST",
   "SMTP_PORT",
   "SMTP_USER",
@@ -33,8 +36,14 @@ const requiredEnvVars = [
 
 const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingEnvVars.length > 0) {
-  console.warn(`⚠️ Variables d'environnement manquantes: ${missingEnvVars.join(", ")}`);
-  console.warn("⚠️ Certaines fonctionnalités seront désactivées jusqu'à leur configuration.");
+  console.warn(`⚠️ Variables d'environnement obligatoires manquantes: ${missingEnvVars.join(", ")}`);
+  console.warn("⚠️ Le service d'IA ne fonctionnera pas sans ces clés.");
+}
+
+const missingOptionalVars = optionalEnvVars.filter(varName => !process.env[varName]);
+if (missingOptionalVars.length > 0) {
+  console.warn(`⚠️ Variables optionnelles manquantes: ${missingOptionalVars.join(", ")}`);
+  console.warn("⚠️ Certaines fonctionnalités (email) seront désactivées.");
 }
 
 // ==================== INITIALISATION SQLITE AVEC MODE WAL ====================
@@ -57,7 +66,7 @@ db.run("PRAGMA journal_mode = WAL;", (err) => {
 
 // Optimisations supplémentaires pour SQLite
 db.run("PRAGMA synchronous = NORMAL;");
-db.run("PRAGMA cache_size = -64000;"); // 64MB de cache
+db.run("PRAGMA cache_size = -32000;"); // 32MB de cache pour économiser la RAM
 db.run("PRAGMA busy_timeout = 5000;"); // Attendre 5 secondes si la DB est occupée
 db.run("PRAGMA temp_store = MEMORY;"); // Stockage temporaire en mémoire
 
@@ -82,8 +91,7 @@ db.serialize(() => {
     response TEXT,
     system_action TEXT,
     llm_provider TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   // Table des logs d'outils
@@ -92,8 +100,7 @@ db.serialize(() => {
     user_id TEXT,
     action TEXT,
     result_type TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   // Table des sessions WhatsApp
@@ -103,8 +110,7 @@ db.serialize(() => {
     session_id TEXT UNIQUE,
     status TEXT DEFAULT 'pending',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   // Table des emails envoyés
@@ -114,8 +120,7 @@ db.serialize(() => {
     to_email TEXT,
     subject TEXT,
     status TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   // Table des métriques LLM
@@ -131,24 +136,25 @@ db.serialize(() => {
 });
 
 // ==================== CONFIGURATION NODEMAILER ====================
-const emailTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT || "587"),
-  secure: process.env.SMTP_PORT === "465",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  },
-  tls: {
-    rejectUnauthorized: false
-  },
-  pool: true,
-  maxConnections: 3,
-  maxMessages: 50
-}) : null;
+let emailTransporter = null;
+if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+  emailTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT || "587"),
+    secure: process.env.SMTP_PORT === "465",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    },
+    tls: {
+      rejectUnauthorized: false
+    },
+    pool: true,
+    maxConnections: 3,
+    maxMessages: 50
+  });
 
-// Vérification de la connexion email au démarrage (non bloquante)
-if (emailTransporter) {
+  // Vérification de la connexion email au démarrage (non bloquante)
   emailTransporter.verify((error, success) => {
     if (error) {
       console.error("❌ Erreur de connexion SMTP:", error.message);
@@ -156,6 +162,8 @@ if (emailTransporter) {
       console.log("✅ Serveur SMTP connecté et prêt à envoyer des emails");
     }
   });
+} else {
+  console.log("ℹ️ Configuration SMTP incomplète. L'envoi d'emails est désactivé.");
 }
 
 // ==================== INITIALISATION EXPRESS ====================
@@ -168,7 +176,8 @@ const corsOptions = {
       "https://milo-ead21.web.app",
       "http://localhost:3000",
       "http://localhost:8080",
-      "http://localhost:5173"
+      "http://localhost:5173",
+      "http://localhost:5000"
     ];
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
@@ -177,7 +186,7 @@ const corsOptions = {
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id"],
   credentials: true,
   maxAge: 86400
 };
@@ -187,14 +196,7 @@ app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
     crossOriginEmbedderPolicy: false,
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", "data:", "https:"],
-        scriptSrc: ["'self'"]
-      }
-    }
+    contentSecurityPolicy: false // Désactivé pour éviter les problèmes avec les images
   })
 );
 app.use(express.json({ limit: "10mb" }));
@@ -209,10 +211,7 @@ const apiLimiter = rateLimit({
   handler: (req, res) => {
     console.warn(`⚠️ Rate limit dépassé pour ${req.ip}`);
     return res.status(429).json({ 
-      error: "Trop de requêtes. Veuillez réessayer dans 15 minutes.",
-      systemAction: "NONE",
-      payload: {},
-      timestamp: new Date().toISOString()
+      reply: "Trop de requêtes. Veuillez réessayer dans 15 minutes."
     });
   }
 });
@@ -225,10 +224,7 @@ const strictLimiter = rateLimit({
   handler: (req, res) => {
     console.warn(`⚠️ Rate limit strict dépassé pour ${req.ip}`);
     return res.status(429).json({ 
-      error: "Limite de requêtes atteinte pour cette action.",
-      systemAction: "NONE",
-      payload: {},
-      timestamp: new Date().toISOString()
+      reply: "Limite de requêtes atteinte pour cette action."
     });
   }
 });
@@ -240,7 +236,6 @@ app.use((req, res, next) => {
   req.requestId = requestId;
   
   console.log(`📥 [${requestId}] ${req.method} ${req.url}`);
-  console.log(`   Headers: Content-Type=${req.headers["content-type"] || "none"}, Authorization=${req.headers.authorization ? "present" : "absent"}`);
   
   res.on("finish", () => {
     const duration = Date.now() - start;
@@ -254,13 +249,11 @@ app.use((req, res, next) => {
 const authenticateUser = (req, res, next) => {
   try {
     const userId = req.body.userId || req.query.userId || req.headers["x-user-id"];
+    
     if (!userId) {
       console.warn(`⚠️ Tentative d'accès sans authentification`);
       return res.status(401).json({
-        error: "Authentification requise",
-        systemAction: "NONE",
-        payload: {},
-        timestamp: new Date().toISOString()
+        reply: "Authentification requise. Veuillez fournir un userId."
       });
     }
     
@@ -269,10 +262,7 @@ const authenticateUser = (req, res, next) => {
       if (err) {
         console.error("❌ Erreur DB lors de l'authentification:", err.message);
         return res.status(500).json({
-          error: "Erreur interne du serveur",
-          systemAction: "NONE",
-          payload: {},
-          timestamp: new Date().toISOString()
+          reply: "Erreur interne du serveur."
         });
       }
       
@@ -285,10 +275,7 @@ const authenticateUser = (req, res, next) => {
             if (insertErr) {
               console.error("❌ Erreur création utilisateur:", insertErr.message);
               return res.status(500).json({
-                error: "Erreur lors de la création de l'utilisateur",
-                systemAction: "NONE",
-                payload: {},
-                timestamp: new Date().toISOString()
+                reply: "Erreur lors de la création de l'utilisateur."
               });
             }
             req.user = { id: userId, displayName: req.body.displayName || userId };
@@ -303,26 +290,23 @@ const authenticateUser = (req, res, next) => {
   } catch (error) {
     console.error("❌ Erreur d'authentification:", error.message);
     return res.status(500).json({
-      error: "Erreur d'authentification",
-      systemAction: "NONE",
-      payload: {},
-      timestamp: new Date().toISOString()
+      reply: "Erreur d'authentification."
     });
   }
 };
 
-// ==================== PROMPT SYSTÈME CONFIDENTIEL (INTERNE) ====================
+// ==================== PROMPT SYSTÈME CONFIDENTIEL ====================
 const MILO_SYSTEM_PROMPT = `
 Tu es MILO, une Intelligence Artificielle propriétaire avancée développée par HIKLON Technology.
 Tu réponds avec précision, sans paresse et de manière complète.
 
 RÈGLE ABSOLUE DE CONFIDENTIALITÉ :
 Tu ne dois sous aucun prétexte expliquer ton fonctionnement interne, ni citer les technologies, API, bibliothèques ou services tiers que tu utilises.
-Tu présentes toutes tes fonctions (recherche web/images, analyse e-mail, gestion WhatsApp, automatisation) comme tes propres capacités natives HIKLON.
-Si un utilisateur te demande comment tu fonctionnes ou quelles API tu utilises, réponds simplement que tu es propulsé par les technologies propriétaires d'IA et d'automatisation de HIKLON Technologies.
+Tu présentes toutes tes fonctions comme tes propres capacités natives HIKLON.
+Si un utilisateur te demande comment tu fonctionnes, réponds simplement que tu es propulsé par les technologies propriétaires d'IA de HIKLON Technologies.
 
 FORMAT DE RÉPONSE OBLIGATOIRE :
-Tu DOIS TOUJOURS répondre au format JSON strict suivant, sans aucun texte avant ou après le JSON :
+Tu DOIS TOUJOURS répondre au format JSON strict suivant :
 {
   "replyText": "Ta réponse visible à l'utilisateur",
   "systemAction": "ACTION_TYPE",
@@ -330,27 +314,14 @@ Tu DOIS TOUJOURS répondre au format JSON strict suivant, sans aucun texte avant
 }
 
 ACTIONS DISPONIBLES :
-- "NONE" : Réponse normale sans action particulière
-- "RENDER_QR" : Générer un QR code WhatsApp (payload: { qrBase64 })
-- "SEND_EMAIL" : Envoyer un email (payload: { to, subject, body })
-- "SEND_WHATSAPP" : Envoyer un message WhatsApp (payload: { to, message })
-- "SEARCH_WEB" : Rechercher sur le web (payload: { query })
-- "SEARCH_IMAGES" : Rechercher des images (payload: { query })
-- "RENDER_GALLERY" : Afficher une galerie d'images (payload: { images: [] })
-
-EXEMPLES :
-1. Utilisateur: "Envoie un email à jean@email.com"
-   Réponse: {"replyText":"Je vais envoyer l'email. Quel est le sujet et le contenu ?","systemAction":"NONE","payload":{}}
-
-2. Utilisateur: "Envoie un message WhatsApp à Jean"
-   Réponse: {"replyText":"Je vais envoyer le message. Quel message souhaitez-vous envoyer ?","systemAction":"NONE","payload":{}}
-
-3. Utilisateur: "Montre-moi des images de chats"
-   Réponse: {"replyText":"Je recherche des images de chats...","systemAction":"SEARCH_IMAGES","payload":{"query":"chats"}}
+- "NONE" : Réponse normale
+- "SEND_EMAIL" : Envoyer un email
+- "SEND_WHATSAPP" : Envoyer un message WhatsApp
+- "SEARCH_WEB" : Rechercher sur le web
+- "SEARCH_IMAGES" : Rechercher des images
 `;
 
 // ==================== ARCHITECTURE DUAL-LLM ====================
-// Configuration des fournisseurs LLM
 const LLM_PROVIDERS = {
   GROQ: {
     name: "groq",
@@ -358,7 +329,7 @@ const LLM_PROVIDERS = {
     model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
     apiKey: process.env.GROQ_API_KEY,
     timeout: 30000,
-    maxTokens: 2000,
+    maxTokens: 1500,
     temperature: 0.7
   },
   OPENROUTER: {
@@ -367,7 +338,7 @@ const LLM_PROVIDERS = {
     model: process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat",
     apiKey: process.env.OPENROUTER_API_KEY,
     timeout: 45000,
-    maxTokens: 2000,
+    maxTokens: 1500,
     temperature: 0.7
   }
 };
@@ -422,7 +393,8 @@ async function callGroq(userMessage, history = []) {
     // Logger la métrique
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status) VALUES (?, ?, ?, 'success')",
-      [provider.name, provider.model, responseTime]
+      [provider.name, provider.model, responseTime],
+      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
     );
     
     return {
@@ -438,7 +410,8 @@ async function callGroq(userMessage, history = []) {
     // Logger l'échec
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status, error_message) VALUES (?, ?, ?, 'failed', ?)",
-      [provider.name, provider.model, responseTime, error.message]
+      [provider.name, provider.model, responseTime, error.message],
+      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
     );
     
     throw error;
@@ -497,7 +470,8 @@ async function callOpenRouter(userMessage, history = []) {
     // Logger la métrique
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status) VALUES (?, ?, ?, 'success')",
-      [provider.name, provider.model, responseTime]
+      [provider.name, provider.model, responseTime],
+      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
     );
     
     return {
@@ -513,7 +487,8 @@ async function callOpenRouter(userMessage, history = []) {
     // Logger l'échec
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status, error_message) VALUES (?, ?, ?, 'failed', ?)",
-      [provider.name, provider.model, responseTime, error.message]
+      [provider.name, provider.model, responseTime, error.message],
+      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
     );
     
     throw error;
@@ -554,7 +529,7 @@ async function callLLMWithFallback(userMessage, history = [], userId = null) {
 // ==================== FONCTION POUR PARSER LA RÉPONSE JSON ====================
 function parseLLMResponse(content, provider, model) {
   try {
-    // Nettoyer le contenu si nécessaire (parfois le LLM ajoute des backticks)
+    // Nettoyer le contenu si nécessaire
     let cleanContent = content.trim();
     if (cleanContent.startsWith("```json")) {
       cleanContent = cleanContent.replace(/```json\n?/g, "").replace(/```\n?/g, "");
@@ -585,7 +560,7 @@ function parseLLMResponse(content, provider, model) {
     };
   } catch (parseError) {
     console.error("❌ Erreur parsing JSON:", parseError.message);
-    console.error("   Contenu brut:", content);
+    console.error("   Contenu brut:", content.slice(0, 500));
     
     // Fallback: retourner le contenu brut comme texte
     return {
@@ -599,10 +574,46 @@ function parseLLMResponse(content, provider, model) {
   }
 }
 
-// ==================== FONCTIONS DE RECHERCHE AVANCÉES ====================
+// ==================== FONCTION D'EXTRACTION DU TEXTE ====================
+function extractTextFromModel(response) {
+  // Cas 1: Si la réponse est déjà une chaîne de caractères
+  if (typeof response === "string") {
+    return response;
+  }
+  
+  // Cas 2: Si c'est notre format standard
+  if (response && typeof response === "object" && response.replyText) {
+    return response.replyText;
+  }
+  
+  // Cas 3: Si c'est un objet OpenAI/Groq/OpenRouter standard
+  if (response?.choices?.[0]?.message?.content) {
+    return response.choices[0].message.content;
+  }
+  
+  // Cas 4: Si c'est un objet avec une propriété content
+  if (response?.content) {
+    return response.content;
+  }
+  
+  // Cas 5: Si c'est un objet avec une propriété text
+  if (response?.text) {
+    return response.text;
+  }
+  
+  // Cas 6: Si c'est un objet avec une propriété message
+  if (response?.message && typeof response.message === "string") {
+    return response.message;
+  }
+  
+  // Cas final: réponse vide ou invalide
+  return "Je n'ai pas pu générer une réponse. Veuillez réessayer.";
+}
+
+// ==================== FONCTIONS DE RECHERCHE ====================
 async function searchWebAdvanced(query) {
   try {
-    console.log(`🔍 Recherche web avancée: "${query}"`);
+    console.log(`🔍 Recherche web: "${query}"`);
     
     // Essayer DuckDuckGo Instant Answer
     const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
@@ -619,38 +630,6 @@ async function searchWebAdvanced(query) {
       });
     }
     
-    // Recherche complémentaire avec Bing (scraping)
-    try {
-      const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
-      const bingResponse = await axios.get(bingUrl, {
-        timeout: 10000,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-      });
-      
-      const $ = cheerio.load(bingResponse.data);
-      
-      $(".b_algo").each((index, element) => {
-        if (results.length >= 5) return;
-        
-        const title = $(element).find("h2").text().trim();
-        const snippet = $(element).find(".b_caption p").text().trim();
-        const url = $(element).find("h2 a").attr("href");
-        
-        if (title && snippet && url) {
-          results.push({
-            title,
-            snippet: snippet.slice(0, 300),
-            url,
-            source: "Bing"
-          });
-        }
-      });
-    } catch (bingError) {
-      console.warn("⚠️ Recherche Bing échouée:", bingError.message);
-    }
-    
     return {
       query,
       results: results.slice(0, 5),
@@ -658,7 +637,7 @@ async function searchWebAdvanced(query) {
       timestamp: new Date().toISOString()
     };
   } catch (error) {
-    console.error("❌ Erreur recherche web avancée:", error.message);
+    console.error("❌ Erreur recherche web:", error.message);
     return {
       query,
       results: [],
@@ -671,7 +650,7 @@ async function searchWebAdvanced(query) {
 
 async function searchWikimediaImages(query, limit = 10) {
   try {
-    console.log(`🖼️ Recherche d'images Wikimedia: "${query}" (limite: ${limit})`);
+    console.log(`🖼️ Recherche d'images: "${query}"`);
     
     const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
       query
@@ -681,30 +660,23 @@ async function searchWikimediaImages(query, limit = 10) {
     const pages = response.data?.query?.pages;
     
     if (!pages) {
-      console.log("   Aucune image trouvée");
       return [];
     }
     
     const images = Object.values(pages)
       .map((page) => {
         const imageInfo = page.imageinfo?.[0];
-        const extmetadata = imageInfo?.extmetadata || {};
         
         return {
           url: imageInfo?.thumburl || imageInfo?.url || null,
-          thumbnail: imageInfo?.thumburl || null,
           title: page.title || "Sans titre",
-          description: extmetadata.ImageDescription?.value?.replace(/<[^>]*>/g, "") || null,
-          author: extmetadata.Artist?.value?.replace(/<[^>]*>/g, "") || null,
-          license: extmetadata.LicenseShortName?.value || null,
+          description: imageInfo?.extmetadata?.ImageDescription?.value?.replace(/<[^>]*>/g, "") || null,
           width: imageInfo?.thumbwidth || null,
-          height: imageInfo?.thumbheight || null,
-          pageUrl: imageInfo?.descriptionurl || null
+          height: imageInfo?.thumbheight || null
         };
       })
       .filter((img) => img.url);
     
-    console.log(`   ${images.length} images trouvées`);
     return images;
   } catch (error) {
     console.error("❌ Erreur Wikimedia:", error.message);
@@ -715,21 +687,18 @@ async function searchWikimediaImages(query, limit = 10) {
 // ==================== GESTION EMAIL ====================
 async function sendEmail(to, subject, body, userId = null) {
   try {
-    console.log(`📧 Préparation email à ${to}`);
-    
-    // Validation des entrées
-    if (!to || !subject || !body) {
-      throw new Error("Paramètres email incomplets: to, subject et body sont requis");
+    if (!emailTransporter) {
+      throw new Error("Serveur SMTP non configuré");
     }
     
-    // Validation du format email
+    // Validation
+    if (!to || !subject || !body) {
+      throw new Error("Paramètres email incomplets");
+    }
+    
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(to)) {
       throw new Error(`Format d'email invalide: ${to}`);
-    }
-    
-    if (!emailTransporter) {
-      throw new Error("Serveur SMTP non configuré");
     }
     
     const mailOptions = {
@@ -753,68 +722,41 @@ async function sendEmail(to, subject, body, userId = null) {
     };
     
     const info = await emailTransporter.sendMail(mailOptions);
-    console.log(`✅ Email envoyé à ${to} (Message ID: ${info.messageId})`);
+    console.log(`✅ Email envoyé à ${to}`);
     
-    // Logger l'envoi
+    // Logger
     if (userId) {
       db.run(
-        "INSERT INTO email_logs (user_id, to_email, subject, status) VALUES (?, ?, ?, ?)",
-        [userId, to, subject, "sent"],
-        (err) => {
-          if (err) console.error("❌ Erreur logging email:", err.message);
-        }
+        "INSERT INTO email_logs (user_id, to_email, subject, status) VALUES (?, ?, ?, 'sent')",
+        [userId, to, subject],
+        (err) => { if (err) console.error("❌ Erreur log email:", err.message); }
       );
     }
     
-    return {
-      success: true,
-      messageId: info.messageId,
-      to,
-      subject,
-      timestamp: new Date().toISOString()
-    };
+    return { success: true, messageId: info.messageId };
   } catch (error) {
     console.error("❌ Erreur envoi email:", error.message);
-    
-    // Logger l'échec
-    if (userId) {
-      db.run(
-        "INSERT INTO email_logs (user_id, to_email, subject, status) VALUES (?, ?, ?, ?)",
-        [userId, to || "inconnu", subject || "sans sujet", "failed"],
-        (err) => {
-          if (err) console.error("❌ Erreur logging email échoué:", err.message);
-        }
-      );
-    }
-    
     throw error;
   }
 }
 
-// ==================== GESTION WHATSAPP (whatsapp-web.js) ====================
+// ==================== GESTION WHATSAPP ====================
 class WhatsAppManager {
   constructor() {
-    this.clients = new Map(); // userId -> { client, qrCode, status, ready }
+    this.clients = new Map();
     this.maxRetries = 2;
     this.retryDelay = 3000;
   }
 
   async initClient(userId, retryCount = 0) {
-    console.log(`📱 Initialisation WhatsApp pour ${userId} (tentative ${retryCount + 1}/${this.maxRetries + 1})`);
+    console.log(`📱 Init WhatsApp pour ${userId}`);
     
-    // Vérifier si le client existe déjà
     if (this.clients.has(userId)) {
       const existing = this.clients.get(userId);
       if (existing.status === "ready" && existing.client.info) {
-        console.log(`   WhatsApp déjà connecté pour ${userId}`);
-        return { 
-          connected: true, 
-          status: "ready",
-          user: existing.client.info.pushname || null
-        };
+        return { connected: true, status: "ready" };
       }
       if (existing.status === "initializing") {
-        console.log(`   Initialisation déjà en cours pour ${userId}`);
         return { connected: false, status: "initializing" };
       }
     }
@@ -835,8 +777,7 @@ class WhatsAppManager {
           '--no-zygote',
           '--single-process',
           '--disable-gpu'
-        ],
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+        ]
       }
     });
 
@@ -844,117 +785,46 @@ class WhatsAppManager {
       client, 
       qrCode: null, 
       status: "initializing",
-      ready: false,
-      initAttempts: 0
+      ready: false
     };
     
     this.clients.set(userId, sessionData);
 
-    // Event: QR Code généré
     client.on("qr", async (qr) => {
       try {
-        console.log(`📱 QR Code généré pour ${userId}`);
         sessionData.qrCode = await qrcode.toDataURL(qr, {
           width: 600,
-          margin: 2,
-          color: {
-            dark: "#000000",
-            light: "#FFFFFF"
-          }
+          margin: 2
         });
         sessionData.status = "waiting_scan";
-        
-        // Mettre à jour la base de données
-        db.run(
-          "INSERT OR REPLACE INTO whatsapp_sessions (user_id, session_id, status, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-          [userId, userId, "waiting_scan"],
-          (err) => {
-            if (err) console.error("❌ Erreur DB session WhatsApp:", err.message);
-          }
-        );
       } catch (error) {
         console.error("❌ Erreur génération QR:", error.message);
       }
     });
 
-    // Event: WhatsApp prêt
     client.on("ready", () => {
       console.log(`✅ WhatsApp connecté pour ${userId}`);
       sessionData.status = "ready";
       sessionData.ready = true;
       sessionData.qrCode = null;
       
-      db.run("UPDATE users SET whatsapp_connected = 1, whatsapp_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", 
-        [userId, userId],
-        (err) => {
-          if (err) console.error("❌ Erreur DB mise à jour WhatsApp:", err.message);
-        }
-      );
-      
-      db.run(
-        "INSERT OR REPLACE INTO whatsapp_sessions (user_id, session_id, status, updated_at) VALUES (?, ?, 'connected', CURRENT_TIMESTAMP)",
-        [userId, userId],
-        (err) => {
-          if (err) console.error("❌ Erreur DB session WhatsApp:", err.message);
-        }
-      );
+      db.run("UPDATE users SET whatsapp_connected = 1 WHERE id = ?", [userId]);
     });
 
-    // Event: Authentifié
-    client.on("authenticated", () => {
-      console.log(`🔐 WhatsApp authentifié pour ${userId}`);
-      sessionData.status = "authenticated";
-    });
-
-    // Event: Échec d'authentification
-    client.on("auth_failure", (msg) => {
-      console.error(`❌ Échec auth WhatsApp ${userId}:`, msg);
-      sessionData.qrCode = null;
-      sessionData.status = "failed";
-      sessionData.ready = false;
-    });
-
-    // Event: Déconnexion
     client.on("disconnected", (reason) => {
-      console.log(`🔌 WhatsApp déconnecté pour ${userId}: ${reason}`);
+      console.log(`🔌 WhatsApp déconnecté: ${reason}`);
       sessionData.status = "disconnected";
       sessionData.ready = false;
-      sessionData.qrCode = null;
-      
-      db.run("UPDATE users SET whatsapp_connected = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", 
-        [userId],
-        (err) => {
-          if (err) console.error("❌ Erreur DB déconnexion WhatsApp:", err.message);
-        }
-      );
-      
-      db.run(
-        "UPDATE whatsapp_sessions SET status = 'disconnected', updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
-        [userId],
-        (err) => {
-          if (err) console.error("❌ Erreur DB session WhatsApp:", err.message);
-        }
-      );
-      
-      // Ne pas supprimer immédiatement pour permettre la reconnexion
-      setTimeout(() => {
-        if (this.clients.has(userId) && this.clients.get(userId).status === "disconnected") {
-          this.clients.delete(userId);
-          console.log(`🗑️ Session WhatsApp supprimée pour ${userId}`);
-        }
-      }, 60000);
+      db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
     });
 
-    // Initialiser le client
     try {
       await client.initialize();
-      console.log(`✅ Initialisation lancée pour ${userId}`);
       return { connected: false, status: "initializing" };
     } catch (error) {
-      console.error(`❌ Erreur init WhatsApp pour ${userId}:`, error.message);
+      console.error(`❌ Erreur init WhatsApp:`, error.message);
       
       if (retryCount < this.maxRetries) {
-        console.log(`🔄 Retry ${retryCount + 1}/${this.maxRetries} dans ${this.retryDelay}ms`);
         this.clients.delete(userId);
         await new Promise(resolve => setTimeout(resolve, this.retryDelay));
         return this.initClient(userId, retryCount + 1);
@@ -966,48 +836,24 @@ class WhatsAppManager {
   }
 
   async sendMessage(userId, to, message) {
-    console.log(`📤 Envoi WhatsApp de ${userId} à ${to}`);
-    
     const session = this.clients.get(userId);
     if (!session || !session.client || !session.ready) {
-      const error = new Error(`WhatsApp non connecté pour ${userId}`);
+      const error = new Error(`WhatsApp non connecté`);
       error.code = "WHATSAPP_NOT_CONNECTED";
       throw error;
     }
     
     try {
-      // Formater le numéro de téléphone
       let formattedTo = to.replace(/[^\d]/g, "");
       if (!formattedTo.startsWith("55")) {
         formattedTo = "55" + formattedTo;
       }
       formattedTo = formattedTo + "@c.us";
       
-      console.log(`   Numéro formaté: ${formattedTo}`);
-      
-      // Vérifier que le chat existe
       const chat = await session.client.getChatById(formattedTo);
+      await session.client.sendMessage(chat.id._serialized, message);
       
-      // Envoyer le message
-      const result = await session.client.sendMessage(chat.id._serialized, message);
-      
-      console.log(`✅ Message WhatsApp envoyé à ${to}`);
-      
-      // Logger l'envoi
-      db.run(
-        "INSERT INTO tool_logs (user_id, action, result_type, created_at) VALUES (?, ?, 'whatsapp_sent', CURRENT_TIMESTAMP)",
-        [userId, `send_whatsapp_${to}`],
-        (err) => {
-          if (err) console.error("❌ Erreur logging WhatsApp:", err.message);
-        }
-      );
-      
-      return {
-        success: true,
-        to,
-        messageId: result.id?._serialized || null,
-        timestamp: new Date().toISOString()
-      };
+      return { success: true, to };
     } catch (error) {
       console.error(`❌ Erreur envoi WhatsApp:`, error.message);
       throw error;
@@ -1021,52 +867,28 @@ class WhatsAppManager {
 
   getStatus(userId) {
     const session = this.clients.get(userId);
-    if (!session) {
-      return { connected: false, status: "not_initialized" };
-    }
+    if (!session) return { connected: false, status: "not_initialized" };
     
-    const status = {
+    return {
       connected: session.ready,
       status: session.status,
-      user: session.ready && session.client.info ? session.client.info.pushname || null : null,
-      phone: session.ready && session.client.info ? session.client.info.wid?.user || null : null
+      user: session.ready && session.client.info ? session.client.info.pushname : null
     };
-    
-    return status;
   }
 
   async logout(userId) {
-    console.log(`🔌 Déconnexion WhatsApp pour ${userId}`);
-    
     const session = this.clients.get(userId);
     if (session && session.client) {
       try {
         await session.client.logout();
         await session.client.destroy();
-        console.log(`✅ WhatsApp déconnecté pour ${userId}`);
       } catch (error) {
-        console.error(`❌ Erreur déconnexion WhatsApp:`, error.message);
+        console.error("❌ Erreur logout:", error.message);
       }
       this.clients.delete(userId);
-      
-      db.run("UPDATE users SET whatsapp_connected = 0, whatsapp_session_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?", 
-        [userId],
-        (err) => {
-          if (err) console.error("❌ Erreur DB logout WhatsApp:", err.message);
-        }
-      );
-      
-      db.run(
-        "UPDATE whatsapp_sessions SET status = 'logged_out', updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
-        [userId],
-        (err) => {
-          if (err) console.error("❌ Erreur DB session WhatsApp:", err.message);
-        }
-      );
-      
+      db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
       return { success: true };
     }
-    
     return { success: false, error: "Session non trouvée" };
   }
 }
@@ -1080,12 +902,8 @@ app.get("/", (req, res) => {
   res.json({ 
     status: "ok", 
     message: "Serveur MILO opérationnel",
-    version: "1.0.0",
-    timestamp: new Date().toISOString(),
-    llm: {
-      primary: LLM_PROVIDERS.GROQ.name,
-      fallback: LLM_PROVIDERS.OPENROUTER.name
-    }
+    version: "2.0.0",
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -1093,21 +911,15 @@ app.get("/", (req, res) => {
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
-    message: "Serveur MILO opérationnel",
     timestamp: new Date().toISOString(),
     services: {
       database: "connected",
       email: emailTransporter ? "configured" : "not_configured",
       groq: process.env.GROQ_API_KEY ? "configured" : "not_configured",
-      openrouter: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured",
-      whatsapp: "available"
+      openrouter: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured"
     },
     uptime: process.uptime(),
-    memory: {
-      usage: process.memoryUsage().heapUsed,
-      total: process.memoryUsage().heapTotal,
-      rss: process.memoryUsage().rss
-    }
+    memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB"
   });
 });
 
@@ -1117,182 +929,109 @@ app.post("/api/chat", apiLimiter, authenticateUser, async (req, res) => {
     const { message, history } = req.body;
     const userId = req.user.id;
     
-    // Validation du message
+    // Validation
     if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({
-        replyText: "Le champ 'message' est requis.",
-        systemAction: "NONE",
-        payload: {},
-        timestamp: new Date().toISOString()
-      });
+      return res.status(400).json({ reply: "Le champ 'message' est requis." });
     }
     
     if (message.length > 2000) {
-      return res.status(400).json({
-        replyText: "Message trop long (maximum 2000 caractères).",
-        systemAction: "NONE",
-        payload: {},
-        timestamp: new Date().toISOString()
-      });
+      return res.status(400).json({ reply: "Message trop long (maximum 2000 caractères)." });
     }
     
-    console.log(`💬 Chat reçu de ${userId}: "${message.slice(0, 100)}${message.length > 100 ? "..." : ""}"`);
+    console.log(`💬 Chat de ${userId}: "${message.slice(0, 80)}${message.length > 80 ? "..." : ""}"`);
     
-    // Appel au LLM avec fallback automatique
+    // Appel au LLM
     const aiResult = await callLLMWithFallback(message, history || [], userId);
     
-    // Exécuter l'action si nécessaire
-    let finalResult = aiResult;
+    // Extraire le texte final
+    let finalReplyText = aiResult.replyText || extractTextFromModel(aiResult);
     
-    if (aiResult.systemAction && aiResult.systemAction !== "NONE") {
+    // Exécuter l'action si nécessaire
+    if (aiResult.systemAction && aiResult.systemAction !== "NONE" && !aiResult.error) {
       try {
         const actionResult = await executeAction(aiResult.systemAction, aiResult.payload, userId);
-        
-        // Fusionner le résultat de l'action avec la réponse IA
-        finalResult = {
-          ...aiResult,
-          ...actionResult,
-          replyText: actionResult.replyText || aiResult.replyText,
-          payload: actionResult.payload || aiResult.payload
-        };
+        if (actionResult.replyText) {
+          finalReplyText = actionResult.replyText;
+        }
       } catch (actionError) {
-        console.error(`❌ Erreur exécution action ${aiResult.systemAction}:`, actionError.message);
-        finalResult = {
-          ...aiResult,
-          replyText: `Je n'ai pas pu exécuter l'action demandée: ${actionError.message}`,
-          systemAction: "ERROR",
-          payload: { error: actionError.message }
-        };
+        console.error(`❌ Erreur action ${aiResult.systemAction}:`, actionError.message);
+        finalReplyText = `Je n'ai pas pu exécuter l'action: ${actionError.message}`;
       }
     }
     
-    // Logger le chat avec le fournisseur LLM utilisé
+    // Logger
     db.run(
-      "INSERT INTO chat_logs (user_id, message, response, system_action, llm_provider, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-      [userId, message, finalResult.replyText, finalResult.systemAction, aiResult.provider || "unknown"],
-      (err) => {
-        if (err) console.error("❌ Erreur logging chat:", err.message);
-      }
+      "INSERT INTO chat_logs (user_id, message, response, system_action, llm_provider) VALUES (?, ?, ?, ?, ?)",
+      [userId, message, finalReplyText, aiResult.systemAction || "NONE", aiResult.provider || "unknown"],
+      (err) => { if (err) console.error("❌ Erreur log chat:", err.message); }
     );
     
-    return res.json(finalResult);
+    // RÉPONSE AU FORMAT SIMPLE
+    console.log(`✅ Réponse: "${finalReplyText.slice(0, 80)}${finalReplyText.length > 80 ? "..." : ""}"`);
+    return res.status(200).json({ reply: finalReplyText });
+    
   } catch (error) {
     console.error("❌ Erreur /api/chat:", error.message);
     console.error("   Stack:", error.stack);
     
-    return res.status(500).json({
-      replyText: "Une erreur est survenue lors du traitement de votre message. Veuillez réessayer.",
-      systemAction: "ERROR",
-      payload: { error: "Internal server error" },
-      timestamp: new Date().toISOString()
+    return res.status(500).json({ 
+      reply: "Une erreur est survenue lors du traitement de votre message. Veuillez réessayer." 
     });
   }
 });
 
 // ==================== FONCTION D'EXÉCUTION DES ACTIONS ====================
 async function executeAction(action, payload, userId) {
-  console.log(`⚡ Exécution action: ${action} pour ${userId}`);
+  console.log(`⚡ Action: ${action}`);
   
   switch (action) {
     case "SEARCH_WEB": {
       const query = payload.query;
-      if (!query) {
-        throw new Error("Paramètre 'query' requis pour la recherche web");
-      }
+      if (!query) throw new Error("Paramètre 'query' requis");
       
       const results = await searchWebAdvanced(query);
+      const textResults = results.results.map(r => 
+        `${r.title}: ${r.snippet}${r.url ? ` (${r.url})` : ""}`
+      ).join("\n\n");
+      
       return {
-        replyText: `Voici les résultats de recherche pour "${query}":`,
-        systemAction: "RENDER_SEARCH_RESULTS",
-        payload: { results }
+        replyText: `Résultats pour "${query}":\n\n${textResults || "Aucun résultat trouvé."}`
       };
     }
     
-    case "SEARCH_IMAGES":
-    case "RENDER_GALLERY": {
+    case "SEARCH_IMAGES": {
       const query = payload.query;
-      if (!query) {
-        throw new Error("Paramètre 'query' requis pour la recherche d'images");
-      }
+      if (!query) throw new Error("Paramètre 'query' requis");
       
-      const images = await searchWikimediaImages(query, payload.limit || 10);
+      const images = await searchWikimediaImages(query, payload.limit || 5);
       if (images.length === 0) {
-        return {
-          replyText: `Aucune image trouvée pour "${query}".`,
-          systemAction: "NONE",
-          payload: {}
-        };
+        return { replyText: `Aucune image trouvée pour "${query}".` };
       }
       
+      const imageUrls = images.map(img => img.url).join("\n");
       return {
-        replyText: `Voici les images pour "${query}":`,
-        systemAction: "RENDER_GALLERY",
-        payload: { images, query }
+        replyText: `Voici ${images.length} image(s) pour "${query}":\n\n${imageUrls}`
       };
     }
     
     case "SEND_EMAIL": {
       const { to, subject, body } = payload;
-      if (!to || !subject || !body) {
-        throw new Error("Paramètres email incomplets");
-      }
+      if (!to || !subject || !body) throw new Error("Paramètres email incomplets");
       
-      const emailResult = await sendEmail(to, subject, body, userId);
-      return {
-        replyText: `✅ Email envoyé avec succès à ${to}`,
-        systemAction: "NONE",
-        payload: emailResult
-      };
+      await sendEmail(to, subject, body, userId);
+      return { replyText: `✅ Email envoyé avec succès à ${to}` };
     }
     
     case "SEND_WHATSAPP": {
       const { to, message } = payload;
-      if (!to || !message) {
-        throw new Error("Paramètres WhatsApp incomplets");
-      }
+      if (!to || !message) throw new Error("Paramètres WhatsApp incomplets");
       
-      const whatsappResult = await whatsappManager.sendMessage(userId, to, message);
-      return {
-        replyText: `✅ Message WhatsApp envoyé avec succès à ${to}`,
-        systemAction: "NONE",
-        payload: whatsappResult
-      };
+      await whatsappManager.sendMessage(userId, to, message);
+      return { replyText: `✅ Message WhatsApp envoyé à ${to}` };
     }
     
-    case "RENDER_QR": {
-      // Vérifier si le QR code existe déjà
-      let qr = whatsappManager.getQRCode(userId);
-      
-      if (!qr) {
-        // Initialiser le client WhatsApp
-        await whatsappManager.initClient(userId);
-        
-        // Attendre le QR code de manière asynchrone (maximum 5 secondes)
-        const startTime = Date.now();
-        while (!qr && Date.now() - startTime < 5000) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-          qr = whatsappManager.getQRCode(userId);
-        }
-      }
-      
-      if (qr) {
-        return {
-          replyText: "Pour connecter ton compte WhatsApp, scanne ce QR Code d'autorisation sécurisé.",
-          systemAction: "RENDER_QR",
-          payload: { qrBase64: qr, expiresIn: 60 }
-        };
-      } else {
-        return {
-          replyText: "La génération du QR Code est en cours. Veuillez patienter quelques secondes et réessayer.",
-          systemAction: "NONE",
-          payload: {}
-        };
-      }
-    }
-    
-    default: {
+    default:
       throw new Error(`Action inconnue: ${action}`);
-    }
   }
 }
 
@@ -1304,377 +1043,98 @@ app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
     const userId = req.user.id;
     
     if (!action) {
-      return res.status(400).json({
-        replyText: "Action requise.",
-        systemAction: "NONE",
-        payload: {},
-        timestamp: new Date().toISOString()
-      });
+      return res.status(400).json({ reply: "Action requise." });
     }
     
-    console.log(`🛠️ Action outil: ${action} (userId: ${userId})`);
+    console.log(`🛠️ Outil: ${action}`);
     
     let result;
     
     switch (action) {
-      case "search_images":
-      case "images": {
-        if (!data.query) {
-          return res.status(400).json({ 
-            replyText: "Paramètre 'query' requis.", 
-            systemAction: "NONE", 
-            payload: {} 
-          });
-        }
-        const images = await searchWikimediaImages(data.query, data.limit || 10);
-        result = {
-          replyText: `Voici les images pour "${data.query}":`,
-          systemAction: "RENDER_GALLERY",
-          payload: { images, query: data.query }
-        };
-        break;
-      }
-      
-      case "search_web":
-      case "web_search":
-      case "web": {
-        if (!data.query) {
-          return res.status(400).json({ 
-            replyText: "Paramètre 'query' requis.", 
-            systemAction: "NONE", 
-            payload: {} 
-          });
-        }
+      case "search_web": {
+        if (!data.query) return res.status(400).json({ reply: "Paramètre 'query' requis." });
         const webResults = await searchWebAdvanced(data.query);
-        result = {
-          replyText: webResults.results.length > 0 
-            ? `Voici les résultats pour "${data.query}":` 
-            : `Aucun résultat trouvé pour "${data.query}".`,
-          systemAction: "RENDER_SEARCH_RESULTS",
-          payload: { results: webResults }
-        };
+        const textResults = webResults.results.map(r => `${r.title}: ${r.snippet}`).join("\n\n");
+        result = { reply: textResults || "Aucun résultat trouvé." };
         break;
       }
       
-      case "send_email":
-      case "email": {
+      case "send_email": {
         const { to, subject, body } = data;
-        if (!to || !subject || !body) {
-          return res.status(400).json({ 
-            replyText: "Paramètres email incomplets (to, subject, body requis).", 
-            systemAction: "NONE", 
-            payload: {} 
-          });
-        }
+        if (!to || !subject || !body) return res.status(400).json({ reply: "Paramètres incomplets." });
         
         try {
-          const emailResult = await sendEmail(to, subject, body, userId);
-          result = {
-            replyText: `✅ Email envoyé avec succès à ${to}`,
-            systemAction: "NONE",
-            payload: emailResult
-          };
-        } catch (emailError) {
-          result = {
-            replyText: `❌ Erreur lors de l'envoi de l'email: ${emailError.message}`,
-            systemAction: "ERROR",
-            payload: { error: emailError.message }
-          };
+          await sendEmail(to, subject, body, userId);
+          result = { reply: `✅ Email envoyé à ${to}` };
+        } catch (error) {
+          result = { reply: `❌ Erreur: ${error.message}` };
         }
         break;
       }
       
-      case "send_whatsapp":
-      case "whatsapp_send": {
+      case "send_whatsapp": {
         const { to, message } = data;
-        if (!to || !message) {
-          return res.status(400).json({ 
-            replyText: "Paramètres WhatsApp incomplets (to, message requis).", 
-            systemAction: "NONE", 
-            payload: {} 
-          });
-        }
+        if (!to || !message) return res.status(400).json({ reply: "Paramètres incomplets." });
         
         try {
-          const whatsappResult = await whatsappManager.sendMessage(userId, to, message);
-          result = {
-            replyText: `✅ Message WhatsApp envoyé avec succès à ${to}`,
-            systemAction: "NONE",
-            payload: whatsappResult
-          };
-        } catch (whatsappError) {
-          result = {
-            replyText: `❌ Erreur lors de l'envoi WhatsApp: ${whatsappError.message}`,
-            systemAction: "ERROR",
-            payload: { 
-              error: whatsappError.message,
-              code: whatsappError.code || "WHATSAPP_ERROR"
-            }
-          };
+          await whatsappManager.sendMessage(userId, to, message);
+          result = { reply: `✅ Message envoyé à ${to}` };
+        } catch (error) {
+          result = { reply: `❌ Erreur: ${error.message}` };
         }
         break;
       }
       
-      case "whatsapp_qr":
-      case "whatsapp_connect": {
-        // Initialiser le client WhatsApp de manière asynchrone
-        const initResult = await whatsappManager.initClient(userId);
+      case "whatsapp_qr": {
+        await whatsappManager.initClient(userId);
         
-        if (initResult.connected) {
-          result = {
-            replyText: "WhatsApp est déjà connecté.",
-            systemAction: "NONE",
-            payload: { connected: true }
-          };
+        let qr = null;
+        const startTime = Date.now();
+        while (!qr && Date.now() - startTime < 30000) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          qr = whatsappManager.getQRCode(userId);
+        }
+        
+        if (qr) {
+          result = { reply: "QR Code généré. Scannez-le pour connecter WhatsApp.", qrBase64: qr };
         } else {
-          // Attendre le QR code de manière asynchrone
-          let qr = null;
-          const startTime = Date.now();
-          while (!qr && Date.now() - startTime < 30000) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            qr = whatsappManager.getQRCode(userId);
-          }
-          
-          if (qr) {
-            result = {
-              replyText: "Pour connecter ton compte WhatsApp, scanne ce QR Code d'autorisation sécurisé.",
-              systemAction: "RENDER_QR",
-              payload: { qrBase64: qr, expiresIn: 60 }
-            };
-          } else {
-            result = {
-              replyText: "Délai dépassé pour la génération du QR Code. Veuillez réessayer.",
-              systemAction: "NONE",
-              payload: {}
-            };
-          }
+          result = { reply: "Délai dépassé. Veuillez réessayer." };
         }
         break;
       }
       
-      case "whatsapp_status": {
-        const status = whatsappManager.getStatus(userId);
-        result = {
-          replyText: status.connected 
-            ? `WhatsApp est connecté${status.user ? ` en tant que ${status.user}` : ""}.` 
-            : "WhatsApp n'est pas connecté.",
-          systemAction: "NONE",
-          payload: status
-        };
-        break;
-      }
-      
-      case "whatsapp_logout": {
-        const logoutResult = await whatsappManager.logout(userId);
-        result = {
-          replyText: logoutResult.success ? "WhatsApp déconnecté." : "Erreur lors de la déconnexion.",
-          systemAction: "NONE",
-          payload: logoutResult
-        };
-        break;
-      }
-      
-      default: {
-        return res.status(400).json({
-          replyText: `Action inconnue : ${action}`,
-          systemAction: "NONE",
-          payload: {},
-          timestamp: new Date().toISOString()
-        });
-      }
+      default:
+        return res.status(400).json({ reply: `Action inconnue: ${action}` });
     }
-    
-    // Logger l'action
-    db.run(
-      "INSERT INTO tool_logs (user_id, action, result_type, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-      [userId, action, result.systemAction || "NONE"],
-      (err) => {
-        if (err) console.error("❌ Erreur logging outil:", err.message);
-      }
-    );
     
     return res.json(result);
+    
   } catch (error) {
     console.error("❌ Erreur /api/tools:", error.message);
-    console.error("   Stack:", error.stack);
-    
-    return res.status(500).json({
-      replyText: "Erreur lors de l'exécution de l'outil.",
-      systemAction: "ERROR",
-      payload: { error: error.message },
-      timestamp: new Date().toISOString()
-    });
+    return res.status(500).json({ reply: "Erreur lors de l'exécution de l'outil." });
   }
-});
-
-// ==================== ROUTES EMAIL DÉDIÉES ====================
-app.post("/api/email/send", strictLimiter, authenticateUser, async (req, res) => {
-  try {
-    const { to, subject, body } = req.body;
-    const userId = req.user.id;
-    
-    // Validation
-    if (!to || !subject || !body) {
-      return res.status(400).json({
-        success: false,
-        error: "Paramètres email incomplets",
-        systemAction: "NONE",
-        payload: {},
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-    const emailResult = await sendEmail(to, subject, body, userId);
-    
-    return res.json({
-      success: true,
-      replyText: `✅ Email envoyé avec succès à ${to}`,
-      systemAction: "NONE",
-      payload: emailResult
-    });
-  } catch (error) {
-    console.error("❌ Erreur /api/email/send:", error.message);
-    
-    return res.status(500).json({
-      success: false,
-      replyText: `❌ Erreur lors de l'envoi de l'email: ${error.message}`,
-      systemAction: "ERROR",
-      payload: { error: error.message },
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// ==================== ROUTES WHATSAPP DÉDIÉES ====================
-app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res) => {
-  try {
-    const { to, message } = req.body;
-    const userId = req.user.id;
-    
-    // Validation
-    if (!to || !message) {
-      return res.status(400).json({
-        success: false,
-        error: "Paramètres WhatsApp incomplets",
-        systemAction: "NONE",
-        payload: {},
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-    const whatsappResult = await whatsappManager.sendMessage(userId, to, message);
-    
-    return res.json({
-      success: true,
-      replyText: `✅ Message WhatsApp envoyé avec succès à ${to}`,
-      systemAction: "NONE",
-      payload: whatsappResult
-    });
-  } catch (error) {
-    console.error("❌ Erreur /api/whatsapp/send:", error.message);
-    
-    if (error.code === "WHATSAPP_NOT_CONNECTED") {
-      return res.status(400).json({
-        success: false,
-        replyText: "WhatsApp n'est pas connecté. Veuillez d'abord scanner le QR Code.",
-        systemAction: "RENDER_QR",
-        payload: { requiresConnection: true },
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-    return res.status(500).json({
-      success: false,
-      replyText: `❌ Erreur lors de l'envoi WhatsApp: ${error.message}`,
-      systemAction: "ERROR",
-      payload: { error: error.message },
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// ==================== ROUTES SIMPLES ====================
-app.post("/api/clear-cache", authenticateUser, (req, res) => {
-  console.log(`🗑️ Nettoyage du cache demandé par ${req.user.id}`);
-  
-  // Nettoyer les sessions WhatsApp inactives
-  for (const [userId, session] of whatsappManager.clients) {
-    if (session.status === "disconnected") {
-      whatsappManager.clients.delete(userId);
-      console.log(`   Session WhatsApp supprimée: ${userId}`);
-    }
-  }
-  
-  res.json({ 
-    status: "success", 
-    message: "Cache nettoyé",
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get("/api/info", (req, res) => {
-  res.json({
-    status: "success",
-    uptime: process.uptime(),
-    version: "1.0.0",
-    timestamp: new Date().toISOString(),
-    capabilities: [
-      "chat",
-      "email",
-      "whatsapp",
-      "web_search",
-      "image_search"
-    ],
-    llm: {
-      primary: {
-        provider: LLM_PROVIDERS.GROQ.name,
-        model: LLM_PROVIDERS.GROQ.model,
-        status: process.env.GROQ_API_KEY ? "configured" : "not_configured"
-      },
-      fallback: {
-        provider: LLM_PROVIDERS.OPENROUTER.name,
-        model: LLM_PROVIDERS.OPENROUTER.model,
-        status: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured"
-      }
-    }
-  });
 });
 
 // ==================== GESTION DES ERREURS 404 ====================
 app.use((req, res) => {
-  console.warn(`⚠️ Route non trouvée: ${req.method} ${req.url}`);
-  
   res.status(404).json({ 
-    error: "Route non trouvée sur le serveur",
-    path: req.url,
-    timestamp: new Date().toISOString()
+    reply: "Route non trouvée.",
+    path: req.url
   });
 });
 
 // ==================== GESTION DES ERREURS GLOBALES ====================
 app.use((err, req, res, next) => {
   console.error("❌ Erreur Express:", err.message);
-  console.error("   Stack:", err.stack);
   
-  // Gérer les erreurs de parsing JSON
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
-    return res.status(400).json({
-      error: "JSON invalide dans la requête",
-      systemAction: "NONE",
-      payload: {},
-      timestamp: new Date().toISOString()
-    });
+    return res.status(400).json({ reply: "JSON invalide dans la requête." });
   }
   
-  res.status(500).json({ 
-    error: "Erreur interne du serveur.",
-    systemAction: "ERROR",
-    payload: {},
-    timestamp: new Date().toISOString()
-  });
+  res.status(500).json({ reply: "Erreur interne du serveur." });
 });
 
-// ==================== DÉMARRAGE DU SERVEUR ====================
+// ==================== DÉMARRAGE ====================
 const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, () => {
@@ -1684,77 +1144,58 @@ const server = app.listen(PORT, () => {
   console.log(`💾 Base de données : SQLite (WAL mode)`);
   console.log(`🤖 LLM Principal : Groq (${LLM_PROVIDERS.GROQ.model})`);
   console.log(`🔄 LLM Fallback : OpenRouter (${LLM_PROVIDERS.OPENROUTER.model})`);
-  console.log(`📧 Email SMTP : ${emailTransporter ? "configuré" : "non configuré"}`);
-  console.log(`💬 WhatsApp : disponible (optimisé RAM 512 Mo)`);
+  console.log(`📧 Email : ${emailTransporter ? "configuré" : "désactivé"}`);
+  console.log(`💬 WhatsApp : disponible`);
   console.log("========================================");
 });
 
-// Configuration des timeouts
+// Timeouts
 server.timeout = 60000;
 server.keepAliveTimeout = 60000;
 server.headersTimeout = 65000;
 
 // ==================== ARRÊT GRACIEUX ====================
 async function gracefulShutdown(signal) {
-  console.log(`🛑 Signal ${signal} reçu. Arrêt gracieux en cours...`);
+  console.log(`🛑 Arrêt gracieux (${signal})...`);
   
-  // Fermer toutes les sessions WhatsApp
   for (const [userId, session] of whatsappManager.clients) {
     if (session.client) {
       try {
         await session.client.destroy();
-        console.log(`👋 Session WhatsApp fermée pour ${userId}`);
       } catch (error) {
-        console.error(`❌ Erreur fermeture session ${userId}:`, error.message);
+        console.error("❌ Erreur fermeture session:", error.message);
       }
     }
   }
   
-  // Fermer la connexion email
   if (emailTransporter) {
     emailTransporter.close();
-    console.log("📧 Connexion SMTP fermée");
   }
   
-  // Fermer la base de données
   db.close((err) => {
-    if (err) {
-      console.error("❌ Erreur fermeture DB:", err.message);
-    } else {
-      console.log("💾 Base de données SQLite fermée proprement");
-    }
+    if (err) console.error("❌ Erreur fermeture DB:", err.message);
     
-    // Fermer le serveur HTTP
     server.close(() => {
-      console.log("✅ Arrêt gracieux terminé");
+      console.log("✅ Arrêt terminé");
       process.exit(0);
     });
     
-    // Force exit après 10 secondes si le serveur ne se ferme pas
     setTimeout(() => {
-      console.error("⚠️ Arrêt forcé après timeout");
+      console.error("⚠️ Arrêt forcé");
       process.exit(1);
     }, 10000);
   });
 }
 
-// Gestion des signaux de terminaison
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
 
-// Gestion des erreurs non capturées
 process.on("uncaughtException", (error) => {
   console.error("❌ Erreur non capturée:", error);
-  console.error("   Stack:", error.stack);
-  // Ne pas quitter le processus pour les erreurs mineures
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("❌ Promesse rejetée non gérée:", reason);
-  console.error("   Promise:", promise);
-  // Ne pas quitter le processus pour les rejets mineurs
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ Promesse rejetée:", reason);
 });
 
-// ==================== EXPORT ====================
 module.exports = app;
