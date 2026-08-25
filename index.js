@@ -1,7 +1,8 @@
 // ==================== INDEX.JS - CERVEAU MILO (HIKLON TECHNOLOGIES) ====================
 // Architecture : Backend (Cerveau) → Frontend (Corps)
-// Technologies : Express, Supabase (optionnel), SQLite, whatsapp-web.js, qrcode, axios, cheerio, OpenRouter, Nodemailer
+// Technologies : Express, SQLite, whatsapp-web.js, qrcode, axios, Groq (Principal), OpenRouter (Fallback), Nodemailer
 // Format de réponse strict : { replyText, systemAction, payload }
+// Optimisé pour Render 512 Mo
 
 require("dotenv").config();
 
@@ -21,6 +22,7 @@ const crypto = require("crypto");
 
 // ==================== CONFIGURATION ET VALIDATION DES VARIABLES D'ENVIRONNEMENT ====================
 const requiredEnvVars = [
+  "GROQ_API_KEY",
   "OPENROUTER_API_KEY",
   "SMTP_HOST",
   "SMTP_PORT",
@@ -35,7 +37,7 @@ if (missingEnvVars.length > 0) {
   console.warn("⚠️ Certaines fonctionnalités seront désactivées jusqu'à leur configuration.");
 }
 
-// ==================== INITIALISATION SQLITE ====================
+// ==================== INITIALISATION SQLITE AVEC MODE WAL ====================
 const dbDir = path.join(__dirname, "data");
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
@@ -43,6 +45,22 @@ if (!fs.existsSync(dbDir)) {
 }
 
 const db = new sqlite3.Database(path.join(dbDir, "milo.db"));
+
+// Activer le mode WAL pour de meilleures performances et stabilité
+db.run("PRAGMA journal_mode = WAL;", (err) => {
+  if (err) {
+    console.error("❌ Erreur activation WAL:", err.message);
+  } else {
+    console.log("✅ Mode WAL activé pour SQLite");
+  }
+});
+
+// Optimisations supplémentaires pour SQLite
+db.run("PRAGMA synchronous = NORMAL;");
+db.run("PRAGMA cache_size = -64000;"); // 64MB de cache
+db.run("PRAGMA busy_timeout = 5000;"); // Attendre 5 secondes si la DB est occupée
+db.run("PRAGMA temp_store = MEMORY;"); // Stockage temporaire en mémoire
+
 db.serialize(() => {
   // Table des utilisateurs
   db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -63,6 +81,7 @@ db.serialize(() => {
     message TEXT,
     response TEXT,
     system_action TEXT,
+    llm_provider TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
   )`);
@@ -98,6 +117,17 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
   )`);
+
+  // Table des métriques LLM
+  db.run(`CREATE TABLE IF NOT EXISTS llm_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT,
+    model TEXT,
+    response_time INTEGER,
+    status TEXT,
+    error_message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
 });
 
 // ==================== CONFIGURATION NODEMAILER ====================
@@ -111,10 +141,13 @@ const emailTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
   },
   tls: {
     rejectUnauthorized: false
-  }
+  },
+  pool: true,
+  maxConnections: 3,
+  maxMessages: 50
 }) : null;
 
-// Vérification de la connexion email au démarrage
+// Vérification de la connexion email au démarrage (non bloquante)
 if (emailTransporter) {
   emailTransporter.verify((error, success) => {
     if (error) {
@@ -173,10 +206,14 @@ const apiLimiter = rateLimit({
   max: 100, // limite de 100 requêtes par fenêtre
   standardHeaders: true,
   legacyHeaders: false,
-  message: { 
-    error: "Trop de requêtes. Veuillez réessayer dans 15 minutes.",
-    systemAction: "NONE",
-    payload: {}
+  handler: (req, res) => {
+    console.warn(`⚠️ Rate limit dépassé pour ${req.ip}`);
+    return res.status(429).json({ 
+      error: "Trop de requêtes. Veuillez réessayer dans 15 minutes.",
+      systemAction: "NONE",
+      payload: {},
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -185,10 +222,14 @@ const strictLimiter = rateLimit({
   max: 30, // limite de 30 requêtes par heure pour les actions sensibles
   standardHeaders: true,
   legacyHeaders: false,
-  message: { 
-    error: "Limite de requêtes atteinte pour cette action.",
-    systemAction: "NONE",
-    payload: {}
+  handler: (req, res) => {
+    console.warn(`⚠️ Rate limit strict dépassé pour ${req.ip}`);
+    return res.status(429).json({ 
+      error: "Limite de requêtes atteinte pour cette action.",
+      systemAction: "NONE",
+      payload: {},
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -210,15 +251,16 @@ app.use((req, res, next) => {
 });
 
 // ==================== MIDDLEWARE D'AUTHENTIFICATION ====================
-// Simplifié pour le moment - à remplacer par Firebase Admin SDK en production
 const authenticateUser = (req, res, next) => {
   try {
     const userId = req.body.userId || req.query.userId || req.headers["x-user-id"];
     if (!userId) {
+      console.warn(`⚠️ Tentative d'accès sans authentification`);
       return res.status(401).json({
         error: "Authentification requise",
         systemAction: "NONE",
-        payload: {}
+        payload: {},
+        timestamp: new Date().toISOString()
       });
     }
     
@@ -229,7 +271,8 @@ const authenticateUser = (req, res, next) => {
         return res.status(500).json({
           error: "Erreur interne du serveur",
           systemAction: "NONE",
-          payload: {}
+          payload: {},
+          timestamp: new Date().toISOString()
         });
       }
       
@@ -244,7 +287,8 @@ const authenticateUser = (req, res, next) => {
               return res.status(500).json({
                 error: "Erreur lors de la création de l'utilisateur",
                 systemAction: "NONE",
-                payload: {}
+                payload: {},
+                timestamp: new Date().toISOString()
               });
             }
             req.user = { id: userId, displayName: req.body.displayName || userId };
@@ -261,7 +305,8 @@ const authenticateUser = (req, res, next) => {
     return res.status(500).json({
       error: "Erreur d'authentification",
       systemAction: "NONE",
-      payload: {}
+      payload: {},
+      timestamp: new Date().toISOString()
     });
   }
 };
@@ -304,106 +349,252 @@ EXEMPLES :
    Réponse: {"replyText":"Je recherche des images de chats...","systemAction":"SEARCH_IMAGES","payload":{"query":"chats"}}
 `;
 
-// ==================== FONCTION OPENROUTER AVEC JSON NATIF ====================
-async function callOpenRouter(userMessage, history = [], userId = null) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    console.error("❌ OPENROUTER_API_KEY non configurée");
-    return {
-      replyText: "Service d'IA non configuré. Contactez l'administrateur.",
-      systemAction: "NONE",
-      payload: {},
-      error: true
-    };
+// ==================== ARCHITECTURE DUAL-LLM ====================
+// Configuration des fournisseurs LLM
+const LLM_PROVIDERS = {
+  GROQ: {
+    name: "groq",
+    baseURL: "https://api.groq.com/openai/v1",
+    model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+    apiKey: process.env.GROQ_API_KEY,
+    timeout: 30000,
+    maxTokens: 2000,
+    temperature: 0.7
+  },
+  OPENROUTER: {
+    name: "openrouter",
+    baseURL: "https://openrouter.ai/api/v1",
+    model: process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat",
+    apiKey: process.env.OPENROUTER_API_KEY,
+    timeout: 45000,
+    maxTokens: 2000,
+    temperature: 0.7
   }
+};
 
+// ==================== FONCTION POUR APPELER GROQ ====================
+async function callGroq(userMessage, history = []) {
+  console.log("🚀 Appel Groq (LLM Principal)");
+  
+  const provider = LLM_PROVIDERS.GROQ;
+  if (!provider.apiKey) {
+    throw new Error("GROQ_API_KEY non configurée");
+  }
+  
+  const messages = [
+    { role: "system", content: MILO_SYSTEM_PROMPT },
+    ...history.slice(-10).map((m) => ({ 
+      role: m.role || "user", 
+      content: typeof m.content === "string" ? m.content : m.message || JSON.stringify(m.content || "")
+    })),
+    { role: "user", content: userMessage }
+  ];
+  
+  const startTime = Date.now();
+  
   try {
-    const messages = [
-      { role: "system", content: MILO_SYSTEM_PROMPT },
-      ...history.slice(-10).map((m) => ({ 
-        role: m.role || "user", 
-        content: typeof m.content === "string" ? m.content : m.message || JSON.stringify(m.content || "")
-      })),
-      { role: "user", content: userMessage }
-    ];
-
-    console.log(`🤖 Appel OpenRouter avec ${messages.length} messages (userId: ${userId || "anonymous"})`);
-
     const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
+      `${provider.baseURL}/chat/completions`,
       {
-        model: process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat",
+        model: provider.model,
         messages,
-        temperature: 0.7,
-        max_tokens: 2000,
+        temperature: provider.temperature,
+        max_tokens: provider.maxTokens,
         response_format: { type: "json_object" }
       },
       {
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization: `Bearer ${provider.apiKey}`,
+          "Content-Type": "application/json"
+        },
+        timeout: provider.timeout
+      }
+    );
+    
+    const content = response.data?.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error("Réponse Groq vide");
+    }
+    
+    const responseTime = Date.now() - startTime;
+    console.log(`✅ Groq répondu en ${responseTime}ms`);
+    
+    // Logger la métrique
+    db.run(
+      "INSERT INTO llm_metrics (provider, model, response_time, status) VALUES (?, ?, ?, 'success')",
+      [provider.name, provider.model, responseTime]
+    );
+    
+    return {
+      content,
+      provider: provider.name,
+      model: provider.model,
+      responseTime
+    };
+  } catch (error) {
+    const responseTime = Date.now() - startTime;
+    console.error(`❌ Erreur Groq (${responseTime}ms):`, error.message);
+    
+    // Logger l'échec
+    db.run(
+      "INSERT INTO llm_metrics (provider, model, response_time, status, error_message) VALUES (?, ?, ?, 'failed', ?)",
+      [provider.name, provider.model, responseTime, error.message]
+    );
+    
+    throw error;
+  }
+}
+
+// ==================== FONCTION POUR APPELER OPENROUTER (FALLBACK) ====================
+async function callOpenRouter(userMessage, history = []) {
+  console.log("🔄 Fallback vers OpenRouter");
+  
+  const provider = LLM_PROVIDERS.OPENROUTER;
+  if (!provider.apiKey) {
+    throw new Error("OPENROUTER_API_KEY non configurée");
+  }
+  
+  const messages = [
+    { role: "system", content: MILO_SYSTEM_PROMPT },
+    ...history.slice(-10).map((m) => ({ 
+      role: m.role || "user", 
+      content: typeof m.content === "string" ? m.content : m.message || JSON.stringify(m.content || "")
+    })),
+    { role: "user", content: userMessage }
+  ];
+  
+  const startTime = Date.now();
+  
+  try {
+    const response = await axios.post(
+      `${provider.baseURL}/chat/completions`,
+      {
+        model: provider.model,
+        messages,
+        temperature: provider.temperature,
+        max_tokens: provider.maxTokens,
+        response_format: { type: "json_object" }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${provider.apiKey}`,
           "Content-Type": "application/json",
           "HTTP-Referer": "https://milo-ead21.web.app",
           "X-Title": "MILO Assistant"
         },
-        timeout: 45000
+        timeout: provider.timeout
       }
     );
-
+    
     const content = response.data?.choices?.[0]?.message?.content;
     if (!content) {
-      console.error("❌ Réponse OpenRouter vide");
-      return {
-        replyText: "Je n'ai pas pu générer une réponse. Veuillez réessayer.",
-        systemAction: "NONE",
-        payload: {},
-        error: true
-      };
-    }
-
-    // Parser la réponse JSON
-    try {
-      const parsedResponse = JSON.parse(content);
-      
-      // Valider les champs requis
-      if (!parsedResponse.replyText || typeof parsedResponse.replyText !== "string") {
-        throw new Error("Champ 'replyText' manquant ou invalide");
-      }
-      
-      const systemAction = parsedResponse.systemAction || "NONE";
-      const payload = parsedResponse.payload || {};
-      
-      console.log(`✅ Action détectée: ${systemAction}`);
-      
-      return {
-        replyText: parsedResponse.replyText,
-        systemAction,
-        payload,
-        error: false
-      };
-    } catch (parseError) {
-      console.error("❌ Erreur parsing JSON OpenRouter:", parseError.message);
-      console.error("   Contenu brut:", content);
-      
-      // Fallback: retourner le contenu brut comme texte
-      return {
-        replyText: content.replace(/```json\n?|\n?```/g, "").trim(),
-        systemAction: "NONE",
-        payload: {},
-        error: false
-      };
-    }
-  } catch (error) {
-    console.error("❌ Erreur OpenRouter:", error.message);
-    if (error.response) {
-      console.error("   Status:", error.response.status);
-      console.error("   Data:", JSON.stringify(error.response.data).slice(0, 500));
+      throw new Error("Réponse OpenRouter vide");
     }
     
+    const responseTime = Date.now() - startTime;
+    console.log(`✅ OpenRouter répondu en ${responseTime}ms`);
+    
+    // Logger la métrique
+    db.run(
+      "INSERT INTO llm_metrics (provider, model, response_time, status) VALUES (?, ?, ?, 'success')",
+      [provider.name, provider.model, responseTime]
+    );
+    
     return {
-      replyText: "Je rencontre des difficultés techniques. Veuillez réessayer dans un instant.",
+      content,
+      provider: provider.name,
+      model: provider.model,
+      responseTime
+    };
+  } catch (error) {
+    const responseTime = Date.now() - startTime;
+    console.error(`❌ Erreur OpenRouter (${responseTime}ms):`, error.message);
+    
+    // Logger l'échec
+    db.run(
+      "INSERT INTO llm_metrics (provider, model, response_time, status, error_message) VALUES (?, ?, ?, 'failed', ?)",
+      [provider.name, provider.model, responseTime, error.message]
+    );
+    
+    throw error;
+  }
+}
+
+// ==================== FONCTION PRINCIPALE AVEC FALLBACK AUTOMATIQUE ====================
+async function callLLMWithFallback(userMessage, history = [], userId = null) {
+  console.log(`🤖 Traitement LLM pour ${userId || "anonymous"}`);
+  
+  // Essayer Groq en premier
+  try {
+    const groqResult = await callGroq(userMessage, history);
+    return parseLLMResponse(groqResult.content, groqResult.provider, groqResult.model);
+  } catch (groqError) {
+    console.warn(`⚠️ Groq a échoué: ${groqError.message}`);
+    console.warn(`🔄 Basculement automatique vers OpenRouter...`);
+    
+    // Fallback vers OpenRouter
+    try {
+      const openRouterResult = await callOpenRouter(userMessage, history);
+      return parseLLMResponse(openRouterResult.content, openRouterResult.provider, openRouterResult.model);
+    } catch (openRouterError) {
+      console.error(`❌ OpenRouter a également échoué: ${openRouterError.message}`);
+      
+      // Les deux fournisseurs ont échoué
+      return {
+        replyText: "Je rencontre des difficultés techniques avec mes services d'IA. Veuillez réessayer dans un instant.",
+        systemAction: "NONE",
+        payload: {},
+        error: true,
+        providersFailed: true
+      };
+    }
+  }
+}
+
+// ==================== FONCTION POUR PARSER LA RÉPONSE JSON ====================
+function parseLLMResponse(content, provider, model) {
+  try {
+    // Nettoyer le contenu si nécessaire (parfois le LLM ajoute des backticks)
+    let cleanContent = content.trim();
+    if (cleanContent.startsWith("```json")) {
+      cleanContent = cleanContent.replace(/```json\n?/g, "").replace(/```\n?/g, "");
+    } else if (cleanContent.startsWith("```")) {
+      cleanContent = cleanContent.replace(/```\n?/g, "");
+    }
+    
+    // Parser le JSON
+    const parsedResponse = JSON.parse(cleanContent);
+    
+    // Valider les champs requis
+    if (!parsedResponse.replyText || typeof parsedResponse.replyText !== "string") {
+      throw new Error("Champ 'replyText' manquant ou invalide");
+    }
+    
+    const systemAction = parsedResponse.systemAction || "NONE";
+    const payload = parsedResponse.payload || {};
+    
+    console.log(`✅ Réponse parsée - Action: ${systemAction} (via ${provider}/${model})`);
+    
+    return {
+      replyText: parsedResponse.replyText,
+      systemAction,
+      payload,
+      error: false,
+      provider,
+      model
+    };
+  } catch (parseError) {
+    console.error("❌ Erreur parsing JSON:", parseError.message);
+    console.error("   Contenu brut:", content);
+    
+    // Fallback: retourner le contenu brut comme texte
+    return {
+      replyText: content.replace(/```json\n?|\n?```/g, "").trim(),
       systemAction: "NONE",
       payload: {},
-      error: true
+      error: false,
+      provider,
+      model
     };
   }
 }
@@ -458,40 +649,6 @@ async function searchWebAdvanced(query) {
       });
     } catch (bingError) {
       console.warn("⚠️ Recherche Bing échouée:", bingError.message);
-    }
-    
-    // Recherche avec Google (scraping simplifié)
-    if (results.length < 3) {
-      try {
-        const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=fr`;
-        const googleResponse = await axios.get(googleUrl, {
-          timeout: 10000,
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-          }
-        });
-        
-        const $ = cheerio.load(googleResponse.data);
-        
-        $("div.g").each((index, element) => {
-          if (results.length >= 5) return;
-          
-          const title = $(element).find("h3").text().trim();
-          const snippet = $(element).find(".VwiC3b").text().trim();
-          const url = $(element).find("a").attr("href");
-          
-          if (title && snippet && url && url.startsWith("http")) {
-            results.push({
-              title,
-              snippet: snippet.slice(0, 300),
-              url,
-              source: "Google"
-            });
-          }
-        });
-      } catch (googleError) {
-        console.warn("⚠️ Recherche Google échouée:", googleError.message);
-      }
     }
     
     return {
@@ -638,8 +795,8 @@ async function sendEmail(to, subject, body, userId = null) {
 class WhatsAppManager {
   constructor() {
     this.clients = new Map(); // userId -> { client, qrCode, status, ready }
-    this.maxRetries = 3;
-    this.retryDelay = 5000;
+    this.maxRetries = 2;
+    this.retryDelay = 3000;
   }
 
   async initClient(userId, retryCount = 0) {
@@ -670,13 +827,16 @@ class WhatsAppManager {
       puppeteer: {
         headless: true,
         args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-          "--disable-software-rasterizer",
-          "--disable-extensions"
-        ]
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerate',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu'
+        ],
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
       }
     });
 
@@ -695,7 +855,7 @@ class WhatsAppManager {
       try {
         console.log(`📱 QR Code généré pour ${userId}`);
         sessionData.qrCode = await qrcode.toDataURL(qr, {
-          width: 800,
+          width: 600,
           margin: 2,
           color: {
             dark: "#000000",
@@ -921,7 +1081,11 @@ app.get("/", (req, res) => {
     status: "ok", 
     message: "Serveur MILO opérationnel",
     version: "1.0.0",
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    llm: {
+      primary: LLM_PROVIDERS.GROQ.name,
+      fallback: LLM_PROVIDERS.OPENROUTER.name
+    }
   });
 });
 
@@ -934,10 +1098,16 @@ app.get("/api/health", (req, res) => {
     services: {
       database: "connected",
       email: emailTransporter ? "configured" : "not_configured",
+      groq: process.env.GROQ_API_KEY ? "configured" : "not_configured",
       openrouter: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured",
       whatsapp: "available"
     },
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    memory: {
+      usage: process.memoryUsage().heapUsed,
+      total: process.memoryUsage().heapTotal,
+      rss: process.memoryUsage().rss
+    }
   });
 });
 
@@ -952,7 +1122,8 @@ app.post("/api/chat", apiLimiter, authenticateUser, async (req, res) => {
       return res.status(400).json({
         replyText: "Le champ 'message' est requis.",
         systemAction: "NONE",
-        payload: {}
+        payload: {},
+        timestamp: new Date().toISOString()
       });
     }
     
@@ -960,14 +1131,15 @@ app.post("/api/chat", apiLimiter, authenticateUser, async (req, res) => {
       return res.status(400).json({
         replyText: "Message trop long (maximum 2000 caractères).",
         systemAction: "NONE",
-        payload: {}
+        payload: {},
+        timestamp: new Date().toISOString()
       });
     }
     
     console.log(`💬 Chat reçu de ${userId}: "${message.slice(0, 100)}${message.length > 100 ? "..." : ""}"`);
     
-    // Appel à OpenRouter avec JSON natif
-    const aiResult = await callOpenRouter(message, history || [], userId);
+    // Appel au LLM avec fallback automatique
+    const aiResult = await callLLMWithFallback(message, history || [], userId);
     
     // Exécuter l'action si nécessaire
     let finalResult = aiResult;
@@ -994,10 +1166,10 @@ app.post("/api/chat", apiLimiter, authenticateUser, async (req, res) => {
       }
     }
     
-    // Logger le chat
+    // Logger le chat avec le fournisseur LLM utilisé
     db.run(
-      "INSERT INTO chat_logs (user_id, message, response, system_action, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-      [userId, message, finalResult.replyText, finalResult.systemAction],
+      "INSERT INTO chat_logs (user_id, message, response, system_action, llm_provider, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+      [userId, message, finalResult.replyText, finalResult.systemAction, aiResult.provider || "unknown"],
       (err) => {
         if (err) console.error("❌ Erreur logging chat:", err.message);
       }
@@ -1006,10 +1178,13 @@ app.post("/api/chat", apiLimiter, authenticateUser, async (req, res) => {
     return res.json(finalResult);
   } catch (error) {
     console.error("❌ Erreur /api/chat:", error.message);
+    console.error("   Stack:", error.stack);
+    
     return res.status(500).json({
-      replyText: "Erreur interne du serveur. Veuillez réessayer.",
-      systemAction: "NONE",
-      payload: {}
+      replyText: "Une erreur est survenue lors du traitement de votre message. Veuillez réessayer.",
+      systemAction: "ERROR",
+      payload: { error: "Internal server error" },
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -1132,7 +1307,8 @@ app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
       return res.status(400).json({
         replyText: "Action requise.",
         systemAction: "NONE",
-        payload: {}
+        payload: {},
+        timestamp: new Date().toISOString()
       });
     }
     
@@ -1302,7 +1478,8 @@ app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
         return res.status(400).json({
           replyText: `Action inconnue : ${action}`,
           systemAction: "NONE",
-          payload: {}
+          payload: {},
+          timestamp: new Date().toISOString()
         });
       }
     }
@@ -1319,10 +1496,13 @@ app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("❌ Erreur /api/tools:", error.message);
+    console.error("   Stack:", error.stack);
+    
     return res.status(500).json({
       replyText: "Erreur lors de l'exécution de l'outil.",
       systemAction: "ERROR",
-      payload: { error: error.message }
+      payload: { error: error.message },
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -1339,7 +1519,8 @@ app.post("/api/email/send", strictLimiter, authenticateUser, async (req, res) =>
         success: false,
         error: "Paramètres email incomplets",
         systemAction: "NONE",
-        payload: {}
+        payload: {},
+        timestamp: new Date().toISOString()
       });
     }
     
@@ -1353,11 +1534,13 @@ app.post("/api/email/send", strictLimiter, authenticateUser, async (req, res) =>
     });
   } catch (error) {
     console.error("❌ Erreur /api/email/send:", error.message);
+    
     return res.status(500).json({
       success: false,
       replyText: `❌ Erreur lors de l'envoi de l'email: ${error.message}`,
       systemAction: "ERROR",
-      payload: { error: error.message }
+      payload: { error: error.message },
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -1374,7 +1557,8 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
         success: false,
         error: "Paramètres WhatsApp incomplets",
         systemAction: "NONE",
-        payload: {}
+        payload: {},
+        timestamp: new Date().toISOString()
       });
     }
     
@@ -1389,21 +1573,22 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
   } catch (error) {
     console.error("❌ Erreur /api/whatsapp/send:", error.message);
     
-    let errorMessage = error.message;
     if (error.code === "WHATSAPP_NOT_CONNECTED") {
       return res.status(400).json({
         success: false,
         replyText: "WhatsApp n'est pas connecté. Veuillez d'abord scanner le QR Code.",
         systemAction: "RENDER_QR",
-        payload: { requiresConnection: true }
+        payload: { requiresConnection: true },
+        timestamp: new Date().toISOString()
       });
     }
     
     return res.status(500).json({
       success: false,
-      replyText: `❌ Erreur lors de l'envoi WhatsApp: ${errorMessage}`,
+      replyText: `❌ Erreur lors de l'envoi WhatsApp: ${error.message}`,
       systemAction: "ERROR",
-      payload: { error: errorMessage }
+      payload: { error: error.message },
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -1439,12 +1624,26 @@ app.get("/api/info", (req, res) => {
       "whatsapp",
       "web_search",
       "image_search"
-    ]
+    ],
+    llm: {
+      primary: {
+        provider: LLM_PROVIDERS.GROQ.name,
+        model: LLM_PROVIDERS.GROQ.model,
+        status: process.env.GROQ_API_KEY ? "configured" : "not_configured"
+      },
+      fallback: {
+        provider: LLM_PROVIDERS.OPENROUTER.name,
+        model: LLM_PROVIDERS.OPENROUTER.model,
+        status: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured"
+      }
+    }
   });
 });
 
 // ==================== GESTION DES ERREURS 404 ====================
 app.use((req, res) => {
+  console.warn(`⚠️ Route non trouvée: ${req.method} ${req.url}`);
+  
   res.status(404).json({ 
     error: "Route non trouvée sur le serveur",
     path: req.url,
@@ -1462,27 +1661,31 @@ app.use((err, req, res, next) => {
     return res.status(400).json({
       error: "JSON invalide dans la requête",
       systemAction: "NONE",
-      payload: {}
+      payload: {},
+      timestamp: new Date().toISOString()
     });
   }
   
   res.status(500).json({ 
     error: "Erreur interne du serveur.",
-    systemAction: "NONE",
-    payload: {}
+    systemAction: "ERROR",
+    payload: {},
+    timestamp: new Date().toISOString()
   });
 });
 
 // ==================== DÉMARRAGE DU SERVEUR ====================
 const PORT = process.env.PORT || 3000;
+
 const server = app.listen(PORT, () => {
   console.log("========================================");
   console.log(`🚀 Serveur MILO actif sur le port ${PORT}`);
   console.log(`📅 Démarrage : ${new Date().toISOString()}`);
-  console.log(`💾 Base de données : SQLite (locale)`);
-  console.log(`🔑 OpenRouter : ${process.env.OPENROUTER_API_KEY ? "configuré" : "non configuré"}`);
+  console.log(`💾 Base de données : SQLite (WAL mode)`);
+  console.log(`🤖 LLM Principal : Groq (${LLM_PROVIDERS.GROQ.model})`);
+  console.log(`🔄 LLM Fallback : OpenRouter (${LLM_PROVIDERS.OPENROUTER.model})`);
   console.log(`📧 Email SMTP : ${emailTransporter ? "configuré" : "non configuré"}`);
-  console.log(`💬 WhatsApp : disponible`);
+  console.log(`💬 WhatsApp : disponible (optimisé RAM 512 Mo)`);
   console.log("========================================");
 });
 
