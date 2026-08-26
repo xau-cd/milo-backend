@@ -21,69 +21,47 @@ const fs = require("fs");
 const crypto = require("crypto");
 
 // ==================== CONFIGURATION ET VALIDATION DES VARIABLES D'ENVIRONNEMENT ====================
-const requiredEnvVars = [
-  "GROQ_API_KEY",
-  "OPENROUTER_API_KEY"
-];
-
-const optionalEnvVars = [
-  "SMTP_HOST",
-  "SMTP_PORT",
-  "SMTP_USER",
-  "SMTP_PASS",
-  "EMAIL_FROM"
-];
+const requiredEnvVars = ["GROQ_API_KEY", "OPENROUTER_API_KEY"];
 
 const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingEnvVars.length > 0) {
   console.warn(`⚠️ Variables d'environnement obligatoires manquantes: ${missingEnvVars.join(", ")}`);
-  console.warn("⚠️ Le service d'IA ne fonctionnera pas sans ces clés.");
-}
-
-const missingOptionalVars = optionalEnvVars.filter(varName => !process.env[varName]);
-if (missingOptionalVars.length > 0) {
-  console.warn(`⚠️ Variables optionnelles manquantes: ${missingOptionalVars.join(", ")}`);
-  console.warn("⚠️ Certaines fonctionnalités (email) seront désactivées.");
 }
 
 // ==================== INITIALISATION SQLITE AVEC MODE WAL ====================
 const dbDir = path.join(__dirname, "data");
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
-  console.log(`📁 Dossier de données créé: ${dbDir}`);
 }
 
 const db = new sqlite3.Database(path.join(dbDir, "milo.db"));
 
-// Activer le mode WAL pour de meilleures performances et stabilité
+// Activer le mode WAL
 db.run("PRAGMA journal_mode = WAL;", (err) => {
   if (err) {
     console.error("❌ Erreur activation WAL:", err.message);
   } else {
-    console.log("✅ Mode WAL activé pour SQLite");
+    console.log("✅ Mode WAL activé");
   }
 });
 
-// Optimisations supplémentaires pour SQLite
+// Optimisations SQLite
 db.run("PRAGMA synchronous = NORMAL;");
-db.run("PRAGMA cache_size = -32000;"); // 32MB de cache pour économiser la RAM
-db.run("PRAGMA busy_timeout = 5000;"); // Attendre 5 secondes si la DB est occupée
-db.run("PRAGMA temp_store = MEMORY;"); // Stockage temporaire en mémoire
+db.run("PRAGMA cache_size = -32000;");
+db.run("PRAGMA busy_timeout = 5000;");
+db.run("PRAGMA temp_store = MEMORY;");
 
 db.serialize(() => {
-  // Table des utilisateurs
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT UNIQUE,
     display_name TEXT,
     whatsapp_connected INTEGER DEFAULT 0,
     whatsapp_session_id TEXT,
-    rendell_credentials TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  // Table des logs de chat
   db.run(`CREATE TABLE IF NOT EXISTS chat_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
@@ -94,7 +72,6 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  // Table des logs d'outils
   db.run(`CREATE TABLE IF NOT EXISTS tool_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
@@ -103,7 +80,6 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  // Table des sessions WhatsApp
   db.run(`CREATE TABLE IF NOT EXISTS whatsapp_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
@@ -113,7 +89,6 @@ db.serialize(() => {
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  // Table des emails envoyés
   db.run(`CREATE TABLE IF NOT EXISTS email_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
@@ -123,7 +98,6 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  // Table des métriques LLM
   db.run(`CREATE TABLE IF NOT EXISTS llm_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT,
@@ -146,38 +120,23 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS
     },
-    tls: {
-      rejectUnauthorized: false
-    },
+    tls: { rejectUnauthorized: false },
     pool: true,
     maxConnections: 3,
     maxMessages: 50
   });
-
-  // Vérification de la connexion email au démarrage (non bloquante)
-  emailTransporter.verify((error, success) => {
-    if (error) {
-      console.error("❌ Erreur de connexion SMTP:", error.message);
-    } else {
-      console.log("✅ Serveur SMTP connecté et prêt à envoyer des emails");
-    }
-  });
-} else {
-  console.log("ℹ️ Configuration SMTP incomplète. L'envoi d'emails est désactivé.");
 }
 
 // ==================== INITIALISATION EXPRESS ====================
 const app = express();
 
-// Configuration CORS
 const corsOptions = {
   origin: function (origin, callback) {
     const allowedOrigins = [
       "https://milo-ead21.web.app",
       "http://localhost:3000",
       "http://localhost:8080",
-      "http://localhost:5173",
-      "http://localhost:5000"
+      "http://localhost:5173"
     ];
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
@@ -192,40 +151,24 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(
-  helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" },
-    crossOriginEmbedderPolicy: false,
-    contentSecurityPolicy: false // Désactivé pour éviter les problèmes avec les images
-  })
-);
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ==================== RATE LIMITER ====================
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limite de 100 requêtes par fenêtre
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   handler: (req, res) => {
-    console.warn(`⚠️ Rate limit dépassé pour ${req.ip}`);
-    return res.status(429).json({ 
-      reply: "Trop de requêtes. Veuillez réessayer dans 15 minutes."
-    });
+    return res.status(429).json({ reply: "Trop de requêtes. Réessayez dans 15 minutes." });
   }
 });
 
 const strictLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 heure
-  max: 30, // limite de 30 requêtes par heure pour les actions sensibles
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 60 * 60 * 1000,
+  max: 30,
   handler: (req, res) => {
-    console.warn(`⚠️ Rate limit strict dépassé pour ${req.ip}`);
-    return res.status(429).json({ 
-      reply: "Limite de requêtes atteinte pour cette action."
-    });
+    return res.status(429).json({ reply: "Limite de requêtes atteinte." });
   }
 });
 
@@ -251,34 +194,23 @@ const authenticateUser = (req, res, next) => {
     const userId = req.body.userId || req.query.userId || req.headers["x-user-id"];
     
     if (!userId) {
-      console.warn(`⚠️ Tentative d'accès sans authentification`);
-      return res.status(401).json({
-        reply: "Authentification requise. Veuillez fournir un userId."
-      });
+      return res.status(401).json({ reply: "Authentification requise. userId manquant." });
     }
     
-    // Vérifier que l'utilisateur existe dans la base de données
     db.get("SELECT * FROM users WHERE id = ?", [userId], (err, user) => {
       if (err) {
-        console.error("❌ Erreur DB lors de l'authentification:", err.message);
-        return res.status(500).json({
-          reply: "Erreur interne du serveur."
-        });
+        return res.status(500).json({ reply: "Erreur interne du serveur." });
       }
       
       if (!user) {
-        // Créer l'utilisateur s'il n'existe pas
         db.run(
-          "INSERT INTO users (id, display_name, created_at, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+          "INSERT INTO users (id, display_name) VALUES (?, ?)",
           [userId, req.body.displayName || userId],
           (insertErr) => {
             if (insertErr) {
-              console.error("❌ Erreur création utilisateur:", insertErr.message);
-              return res.status(500).json({
-                reply: "Erreur lors de la création de l'utilisateur."
-              });
+              return res.status(500).json({ reply: "Erreur lors de la création de l'utilisateur." });
             }
-            req.user = { id: userId, displayName: req.body.displayName || userId };
+            req.user = { id: userId };
             next();
           }
         );
@@ -288,37 +220,56 @@ const authenticateUser = (req, res, next) => {
       }
     });
   } catch (error) {
-    console.error("❌ Erreur d'authentification:", error.message);
-    return res.status(500).json({
-      reply: "Erreur d'authentification."
-    });
+    return res.status(500).json({ reply: "Erreur d'authentification." });
   }
 };
 
-// ==================== PROMPT SYSTÈME CONFIDENTIEL ====================
+// ==================== PROMPT SYSTÈME AVEC PERSONNALITÉ PROACTIVE ====================
 const MILO_SYSTEM_PROMPT = `
-Tu es MILO, une Intelligence Artificielle propriétaire avancée développée par HIKLON Technology.
-Tu réponds avec précision, sans paresse et de manière complète.
+Tu es MILO, un assistant IA intelligent et proactif développé par HIKLON Technology.
 
-RÈGLE ABSOLUE DE CONFIDENTIALITÉ :
-Tu ne dois sous aucun prétexte expliquer ton fonctionnement interne, ni citer les technologies, API, bibliothèques ou services tiers que tu utilises.
-Tu présentes toutes tes fonctions comme tes propres capacités natives HIKLON.
-Si un utilisateur te demande comment tu fonctionnes, réponds simplement que tu es propulsé par les technologies propriétaires d'IA de HIKLON Technologies.
+RÈGLE ABSOLUE DE PERSONNALITÉ :
+Tu es chaleureux, précis et toujours prêt à aider. Tu réponds de manière complète et détaillée.
+
+RÈGLE ABSOLUE D'ILLUSTRATION AUTOMATIQUE :
+Chaque fois que tu fournis des informations sur une personne célèbre, un lieu, un animal, un objet, ou un concept visuel, tu DOIS obligatoirement utiliser ton outil de recherche d'images en arrière-plan pour illustrer ta réponse.
+N'attends jamais que l'utilisateur te demande une photo.
+Sois naturel, donne les informations demandées et insère l'image de manière fluide dans ta réponse.
+
+RÈGLE DE CONFIDENTIALITÉ :
+Tu ne dois jamais expliquer ton fonctionnement interne ni citer les technologies que tu utilises.
+Tu présentes toutes tes fonctions comme tes capacités natives HIKLON.
 
 FORMAT DE RÉPONSE OBLIGATOIRE :
-Tu DOIS TOUJOURS répondre au format JSON strict suivant :
+Tu DOIS TOUJOURS répondre au format JSON strict :
 {
-  "replyText": "Ta réponse visible à l'utilisateur",
+  "replyText": "Ta réponse complète avec informations",
   "systemAction": "ACTION_TYPE",
   "payload": {}
 }
 
 ACTIONS DISPONIBLES :
-- "NONE" : Réponse normale
-- "SEND_EMAIL" : Envoyer un email
-- "SEND_WHATSAPP" : Envoyer un message WhatsApp
-- "SEARCH_WEB" : Rechercher sur le web
-- "SEARCH_IMAGES" : Rechercher des images
+- "NONE" : Réponse sans action
+- "SEARCH_IMAGES" : Rechercher des images pour illustrer (payload: { "query": "sujet à illustrer" })
+- "SEND_EMAIL" : Envoyer un email (payload: { "to", "subject", "body" })
+- "SEND_WHATSAPP" : Envoyer un WhatsApp (payload: { "to", "message" })
+- "SEARCH_WEB" : Rechercher sur le web (payload: { "query" })
+
+EXEMPLE D'ILLUSTRATION AUTOMATIQUE :
+Utilisateur: "Parle-moi de Cristiano Ronaldo"
+Réponse: {
+  "replyText": "Cristiano Ronaldo est un footballeur portugais...",
+  "systemAction": "SEARCH_IMAGES",
+  "payload": { "query": "Cristiano Ronaldo portrait" }
+}
+
+EXEMPLE POUR UN CONCEPT :
+Utilisateur: "C'est quoi un virus ?"
+Réponse: {
+  "replyText": "Un virus est un agent infectieux...",
+  "systemAction": "SEARCH_IMAGES",
+  "payload": { "query": "virus microscope" }
+}
 `;
 
 // ==================== ARCHITECTURE DUAL-LLM ====================
@@ -345,18 +296,14 @@ const LLM_PROVIDERS = {
 
 // ==================== FONCTION POUR APPELER GROQ ====================
 async function callGroq(userMessage, history = []) {
-  console.log("🚀 Appel Groq (LLM Principal)");
-  
   const provider = LLM_PROVIDERS.GROQ;
-  if (!provider.apiKey) {
-    throw new Error("GROQ_API_KEY non configurée");
-  }
+  if (!provider.apiKey) throw new Error("GROQ_API_KEY non configurée");
   
   const messages = [
     { role: "system", content: MILO_SYSTEM_PROMPT },
     ...history.slice(-10).map((m) => ({ 
       role: m.role || "user", 
-      content: typeof m.content === "string" ? m.content : m.message || JSON.stringify(m.content || "")
+      content: typeof m.content === "string" ? m.content : m.message || ""
     })),
     { role: "user", content: userMessage }
   ];
@@ -383,55 +330,33 @@ async function callGroq(userMessage, history = []) {
     );
     
     const content = response.data?.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error("Réponse Groq vide");
-    }
+    if (!content) throw new Error("Réponse Groq vide");
     
-    const responseTime = Date.now() - startTime;
-    console.log(`✅ Groq répondu en ${responseTime}ms`);
-    
-    // Logger la métrique
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status) VALUES (?, ?, ?, 'success')",
-      [provider.name, provider.model, responseTime],
-      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
+      [provider.name, provider.model, Date.now() - startTime]
     );
     
-    return {
-      content,
-      provider: provider.name,
-      model: provider.model,
-      responseTime
-    };
+    return { content, provider: provider.name, model: provider.model };
   } catch (error) {
-    const responseTime = Date.now() - startTime;
-    console.error(`❌ Erreur Groq (${responseTime}ms):`, error.message);
-    
-    // Logger l'échec
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status, error_message) VALUES (?, ?, ?, 'failed', ?)",
-      [provider.name, provider.model, responseTime, error.message],
-      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
+      [provider.name, provider.model, Date.now() - startTime, error.message]
     );
-    
     throw error;
   }
 }
 
 // ==================== FONCTION POUR APPELER OPENROUTER (FALLBACK) ====================
 async function callOpenRouter(userMessage, history = []) {
-  console.log("🔄 Fallback vers OpenRouter");
-  
   const provider = LLM_PROVIDERS.OPENROUTER;
-  if (!provider.apiKey) {
-    throw new Error("OPENROUTER_API_KEY non configurée");
-  }
+  if (!provider.apiKey) throw new Error("OPENROUTER_API_KEY non configurée");
   
   const messages = [
     { role: "system", content: MILO_SYSTEM_PROMPT },
     ...history.slice(-10).map((m) => ({ 
       role: m.role || "user", 
-      content: typeof m.content === "string" ? m.content : m.message || JSON.stringify(m.content || "")
+      content: typeof m.content === "string" ? m.content : m.message || ""
     })),
     { role: "user", content: userMessage }
   ];
@@ -460,76 +385,48 @@ async function callOpenRouter(userMessage, history = []) {
     );
     
     const content = response.data?.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error("Réponse OpenRouter vide");
-    }
+    if (!content) throw new Error("Réponse OpenRouter vide");
     
-    const responseTime = Date.now() - startTime;
-    console.log(`✅ OpenRouter répondu en ${responseTime}ms`);
-    
-    // Logger la métrique
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status) VALUES (?, ?, ?, 'success')",
-      [provider.name, provider.model, responseTime],
-      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
+      [provider.name, provider.model, Date.now() - startTime]
     );
     
-    return {
-      content,
-      provider: provider.name,
-      model: provider.model,
-      responseTime
-    };
+    return { content, provider: provider.name, model: provider.model };
   } catch (error) {
-    const responseTime = Date.now() - startTime;
-    console.error(`❌ Erreur OpenRouter (${responseTime}ms):`, error.message);
-    
-    // Logger l'échec
     db.run(
       "INSERT INTO llm_metrics (provider, model, response_time, status, error_message) VALUES (?, ?, ?, 'failed', ?)",
-      [provider.name, provider.model, responseTime, error.message],
-      (err) => { if (err) console.error("❌ Erreur log métrique:", err.message); }
+      [provider.name, provider.model, Date.now() - startTime, error.message]
     );
-    
     throw error;
   }
 }
 
-// ==================== FONCTION PRINCIPALE AVEC FALLBACK AUTOMATIQUE ====================
+// ==================== FONCTION PRINCIPALE AVEC FALLBACK ====================
 async function callLLMWithFallback(userMessage, history = [], userId = null) {
-  console.log(`🤖 Traitement LLM pour ${userId || "anonymous"}`);
-  
-  // Essayer Groq en premier
   try {
     const groqResult = await callGroq(userMessage, history);
     return parseLLMResponse(groqResult.content, groqResult.provider, groqResult.model);
   } catch (groqError) {
-    console.warn(`⚠️ Groq a échoué: ${groqError.message}`);
-    console.warn(`🔄 Basculement automatique vers OpenRouter...`);
+    console.warn(`⚠️ Groq échoué: ${groqError.message}. Basculement vers OpenRouter...`);
     
-    // Fallback vers OpenRouter
     try {
       const openRouterResult = await callOpenRouter(userMessage, history);
       return parseLLMResponse(openRouterResult.content, openRouterResult.provider, openRouterResult.model);
     } catch (openRouterError) {
-      console.error(`❌ OpenRouter a également échoué: ${openRouterError.message}`);
-      
-      // Les deux fournisseurs ont échoué
       return {
-        replyText: "Je rencontre des difficultés techniques avec mes services d'IA. Veuillez réessayer dans un instant.",
+        replyText: "Je rencontre des difficultés techniques. Veuillez réessayer.",
         systemAction: "NONE",
         payload: {},
-        error: true,
-        providersFailed: true
+        error: true
       };
     }
   }
 }
 
-// ==================== FONCTION POUR PARSER LA RÉPONSE JSON ====================
+// ==================== PARSER LA RÉPONSE JSON ====================
 function parseLLMResponse(content, provider, model) {
   try {
-    // Nettoyer le contenu si nécessaire
     let cleanContent = content.trim();
     if (cleanContent.startsWith("```json")) {
       cleanContent = cleanContent.replace(/```json\n?/g, "").replace(/```\n?/g, "");
@@ -537,118 +434,33 @@ function parseLLMResponse(content, provider, model) {
       cleanContent = cleanContent.replace(/```\n?/g, "");
     }
     
-    // Parser le JSON
-    const parsedResponse = JSON.parse(cleanContent);
+    const parsed = JSON.parse(cleanContent);
     
-    // Valider les champs requis
-    if (!parsedResponse.replyText || typeof parsedResponse.replyText !== "string") {
-      throw new Error("Champ 'replyText' manquant ou invalide");
+    if (!parsed.replyText || typeof parsed.replyText !== "string") {
+      throw new Error("Champ 'replyText' manquant");
     }
     
-    const systemAction = parsedResponse.systemAction || "NONE";
-    const payload = parsedResponse.payload || {};
-    
-    console.log(`✅ Réponse parsée - Action: ${systemAction} (via ${provider}/${model})`);
-    
     return {
-      replyText: parsedResponse.replyText,
-      systemAction,
-      payload,
-      error: false,
+      replyText: parsed.replyText,
+      systemAction: parsed.systemAction || "NONE",
+      payload: parsed.payload || {},
       provider,
       model
     };
-  } catch (parseError) {
-    console.error("❌ Erreur parsing JSON:", parseError.message);
-    console.error("   Contenu brut:", content.slice(0, 500));
-    
-    // Fallback: retourner le contenu brut comme texte
+  } catch (error) {
+    console.error("❌ Erreur parsing JSON:", error.message);
     return {
       replyText: content.replace(/```json\n?|\n?```/g, "").trim(),
       systemAction: "NONE",
       payload: {},
-      error: false,
       provider,
       model
     };
   }
 }
 
-// ==================== FONCTION D'EXTRACTION DU TEXTE ====================
-function extractTextFromModel(response) {
-  // Cas 1: Si la réponse est déjà une chaîne de caractères
-  if (typeof response === "string") {
-    return response;
-  }
-  
-  // Cas 2: Si c'est notre format standard
-  if (response && typeof response === "object" && response.replyText) {
-    return response.replyText;
-  }
-  
-  // Cas 3: Si c'est un objet OpenAI/Groq/OpenRouter standard
-  if (response?.choices?.[0]?.message?.content) {
-    return response.choices[0].message.content;
-  }
-  
-  // Cas 4: Si c'est un objet avec une propriété content
-  if (response?.content) {
-    return response.content;
-  }
-  
-  // Cas 5: Si c'est un objet avec une propriété text
-  if (response?.text) {
-    return response.text;
-  }
-  
-  // Cas 6: Si c'est un objet avec une propriété message
-  if (response?.message && typeof response.message === "string") {
-    return response.message;
-  }
-  
-  // Cas final: réponse vide ou invalide
-  return "Je n'ai pas pu générer une réponse. Veuillez réessayer.";
-}
-
-// ==================== FONCTIONS DE RECHERCHE ====================
-async function searchWebAdvanced(query) {
-  try {
-    console.log(`🔍 Recherche web: "${query}"`);
-    
-    // Essayer DuckDuckGo Instant Answer
-    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    const ddgResponse = await axios.get(ddgUrl, { timeout: 10000 });
-    
-    const results = [];
-    
-    if (ddgResponse.data?.AbstractText) {
-      results.push({
-        title: ddgResponse.data.Heading || "Résultat",
-        snippet: ddgResponse.data.AbstractText,
-        url: ddgResponse.data.AbstractURL || null,
-        source: "DuckDuckGo"
-      });
-    }
-    
-    return {
-      query,
-      results: results.slice(0, 5),
-      totalResults: results.length,
-      timestamp: new Date().toISOString()
-    };
-  } catch (error) {
-    console.error("❌ Erreur recherche web:", error.message);
-    return {
-      query,
-      results: [],
-      totalResults: 0,
-      error: error.message,
-      timestamp: new Date().toISOString()
-    };
-  }
-}
-
-async function searchWikimediaImages(query, limit = 10) {
+// ==================== RECHERCHE D'IMAGES ====================
+async function searchWikimediaImages(query, limit = 6) {
   try {
     console.log(`🖼️ Recherche d'images: "${query}"`);
     
@@ -659,113 +471,83 @@ async function searchWikimediaImages(query, limit = 10) {
     const response = await axios.get(url, { timeout: 15000 });
     const pages = response.data?.query?.pages;
     
-    if (!pages) {
-      return [];
+    if (!pages) return [];
+    
+    return Object.values(pages)
+      .map((page) => ({
+        url: page.imageinfo?.[0]?.thumburl || page.imageinfo?.[0]?.url || null,
+        title: page.title || "Image",
+        description: page.imageinfo?.[0]?.extmetadata?.ImageDescription?.value?.replace(/<[^>]*>/g, "") || null
+      }))
+      .filter((img) => img.url);
+  } catch (error) {
+    console.error("❌ Erreur recherche images:", error.message);
+    return [];
+  }
+}
+
+// ==================== RECHERCHE WEB ====================
+async function searchWebAdvanced(query) {
+  try {
+    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`;
+    const response = await axios.get(ddgUrl, { timeout: 10000 });
+    
+    const results = [];
+    if (response.data?.AbstractText) {
+      results.push({
+        title: response.data.Heading || "Résultat",
+        snippet: response.data.AbstractText,
+        url: response.data.AbstractURL || null
+      });
     }
     
-    const images = Object.values(pages)
-      .map((page) => {
-        const imageInfo = page.imageinfo?.[0];
-        
-        return {
-          url: imageInfo?.thumburl || imageInfo?.url || null,
-          title: page.title || "Sans titre",
-          description: imageInfo?.extmetadata?.ImageDescription?.value?.replace(/<[^>]*>/g, "") || null,
-          width: imageInfo?.thumbwidth || null,
-          height: imageInfo?.thumbheight || null
-        };
-      })
-      .filter((img) => img.url);
-    
-    return images;
+    return { query, results, totalResults: results.length };
   } catch (error) {
-    console.error("❌ Erreur Wikimedia:", error.message);
-    return [];
+    return { query, results: [], totalResults: 0, error: error.message };
   }
 }
 
 // ==================== GESTION EMAIL ====================
 async function sendEmail(to, subject, body, userId = null) {
-  try {
-    if (!emailTransporter) {
-      throw new Error("Serveur SMTP non configuré");
-    }
-    
-    // Validation
-    if (!to || !subject || !body) {
-      throw new Error("Paramètres email incomplets");
-    }
-    
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(to)) {
-      throw new Error(`Format d'email invalide: ${to}`);
-    }
-    
-    const mailOptions = {
-      from: process.env.EMAIL_FROM || `"MILO Assistant" <${process.env.SMTP_USER}>`,
-      to,
-      subject,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px 10px 0 0;">
-            <h1 style="color: white; margin: 0;">📧 Message de MILO</h1>
-          </div>
-          <div style="background: #f8f9fa; padding: 20px; border-radius: 0 0 10px 10px;">
-            <p style="color: #333; font-size: 14px; line-height: 1.6;">${body.replace(/\n/g, "<br>")}</p>
-          </div>
-          <div style="margin-top: 20px; text-align: center; color: #666; font-size: 12px;">
-            <p>Envoyé par MILO - Assistant IA de HIKLON Technologies</p>
-          </div>
-        </div>
-      `,
-      text: body
-    };
-    
-    const info = await emailTransporter.sendMail(mailOptions);
-    console.log(`✅ Email envoyé à ${to}`);
-    
-    // Logger
-    if (userId) {
-      db.run(
-        "INSERT INTO email_logs (user_id, to_email, subject, status) VALUES (?, ?, ?, 'sent')",
-        [userId, to, subject],
-        (err) => { if (err) console.error("❌ Erreur log email:", err.message); }
-      );
-    }
-    
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error("❌ Erreur envoi email:", error.message);
-    throw error;
+  if (!emailTransporter) throw new Error("Serveur SMTP non configuré");
+  
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(to)) throw new Error(`Format d'email invalide: ${to}`);
+  
+  const mailOptions = {
+    from: process.env.EMAIL_FROM || `"MILO" <${process.env.SMTP_USER}>`,
+    to,
+    subject,
+    html: `<div style="font-family: Arial; padding: 20px;">${body.replace(/\n/g, "<br>")}</div>`,
+    text: body
+  };
+  
+  const info = await emailTransporter.sendMail(mailOptions);
+  
+  if (userId) {
+    db.run(
+      "INSERT INTO email_logs (user_id, to_email, subject, status) VALUES (?, ?, ?, 'sent')",
+      [userId, to, subject]
+    );
   }
+  
+  return { success: true, messageId: info.messageId };
 }
 
 // ==================== GESTION WHATSAPP ====================
 class WhatsAppManager {
   constructor() {
     this.clients = new Map();
-    this.maxRetries = 2;
-    this.retryDelay = 3000;
   }
 
-  async initClient(userId, retryCount = 0) {
-    console.log(`📱 Init WhatsApp pour ${userId}`);
-    
+  async initClient(userId) {
     if (this.clients.has(userId)) {
       const existing = this.clients.get(userId);
-      if (existing.status === "ready" && existing.client.info) {
-        return { connected: true, status: "ready" };
-      }
-      if (existing.status === "initializing") {
-        return { connected: false, status: "initializing" };
-      }
+      if (existing.ready) return { connected: true };
     }
 
     const client = new Client({
-      authStrategy: new LocalAuth({ 
-        clientId: userId, 
-        dataPath: path.join(__dirname, "sessions") 
-      }),
+      authStrategy: new LocalAuth({ clientId: userId, dataPath: path.join(__dirname, "sessions") }),
       puppeteer: {
         headless: true,
         args: [
@@ -781,55 +563,28 @@ class WhatsAppManager {
       }
     });
 
-    const sessionData = { 
-      client, 
-      qrCode: null, 
-      status: "initializing",
-      ready: false
-    };
-    
+    const sessionData = { client, qrCode: null, ready: false };
     this.clients.set(userId, sessionData);
 
     client.on("qr", async (qr) => {
-      try {
-        sessionData.qrCode = await qrcode.toDataURL(qr, {
-          width: 600,
-          margin: 2
-        });
-        sessionData.status = "waiting_scan";
-      } catch (error) {
-        console.error("❌ Erreur génération QR:", error.message);
-      }
+      sessionData.qrCode = await qrcode.toDataURL(qr, { width: 600 });
     });
 
     client.on("ready", () => {
-      console.log(`✅ WhatsApp connecté pour ${userId}`);
-      sessionData.status = "ready";
       sessionData.ready = true;
       sessionData.qrCode = null;
-      
       db.run("UPDATE users SET whatsapp_connected = 1 WHERE id = ?", [userId]);
     });
 
-    client.on("disconnected", (reason) => {
-      console.log(`🔌 WhatsApp déconnecté: ${reason}`);
-      sessionData.status = "disconnected";
+    client.on("disconnected", () => {
       sessionData.ready = false;
       db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
     });
 
     try {
       await client.initialize();
-      return { connected: false, status: "initializing" };
+      return { connected: false };
     } catch (error) {
-      console.error(`❌ Erreur init WhatsApp:`, error.message);
-      
-      if (retryCount < this.maxRetries) {
-        this.clients.delete(userId);
-        await new Promise(resolve => setTimeout(resolve, this.retryDelay));
-        return this.initClient(userId, retryCount + 1);
-      }
-      
       this.clients.delete(userId);
       throw error;
     }
@@ -837,59 +592,24 @@ class WhatsAppManager {
 
   async sendMessage(userId, to, message) {
     const session = this.clients.get(userId);
-    if (!session || !session.client || !session.ready) {
-      const error = new Error(`WhatsApp non connecté`);
+    if (!session || !session.ready) {
+      const error = new Error("WhatsApp non connecté");
       error.code = "WHATSAPP_NOT_CONNECTED";
       throw error;
     }
     
-    try {
-      let formattedTo = to.replace(/[^\d]/g, "");
-      if (!formattedTo.startsWith("55")) {
-        formattedTo = "55" + formattedTo;
-      }
-      formattedTo = formattedTo + "@c.us";
-      
-      const chat = await session.client.getChatById(formattedTo);
-      await session.client.sendMessage(chat.id._serialized, message);
-      
-      return { success: true, to };
-    } catch (error) {
-      console.error(`❌ Erreur envoi WhatsApp:`, error.message);
-      throw error;
-    }
+    let formattedTo = to.replace(/[^\d]/g, "");
+    if (!formattedTo.startsWith("55")) formattedTo = "55" + formattedTo;
+    formattedTo += "@c.us";
+    
+    const chat = await session.client.getChatById(formattedTo);
+    await session.client.sendMessage(chat.id._serialized, message);
+    
+    return { success: true, to };
   }
 
   getQRCode(userId) {
-    const session = this.clients.get(userId);
-    return session ? session.qrCode : null;
-  }
-
-  getStatus(userId) {
-    const session = this.clients.get(userId);
-    if (!session) return { connected: false, status: "not_initialized" };
-    
-    return {
-      connected: session.ready,
-      status: session.status,
-      user: session.ready && session.client.info ? session.client.info.pushname : null
-    };
-  }
-
-  async logout(userId) {
-    const session = this.clients.get(userId);
-    if (session && session.client) {
-      try {
-        await session.client.logout();
-        await session.client.destroy();
-      } catch (error) {
-        console.error("❌ Erreur logout:", error.message);
-      }
-      this.clients.delete(userId);
-      db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
-      return { success: true };
-    }
-    return { success: false, error: "Session non trouvée" };
+    return this.clients.get(userId)?.qrCode || null;
   }
 }
 
@@ -897,28 +617,19 @@ const whatsappManager = new WhatsAppManager();
 
 // ==================== ROUTES ====================
 
-// Route racine
 app.get("/", (req, res) => {
-  res.json({ 
-    status: "ok", 
-    message: "Serveur MILO opérationnel",
-    version: "2.0.0",
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: "ok", message: "Serveur MILO opérationnel", version: "3.0.0" });
 });
 
-// Healthcheck
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
     services: {
-      database: "connected",
-      email: emailTransporter ? "configured" : "not_configured",
       groq: process.env.GROQ_API_KEY ? "configured" : "not_configured",
-      openrouter: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured"
+      openrouter: process.env.OPENROUTER_API_KEY ? "configured" : "not_configured",
+      email: emailTransporter ? "configured" : "not_configured"
     },
-    uptime: process.uptime(),
     memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB"
   });
 });
@@ -926,200 +637,217 @@ app.get("/api/health", (req, res) => {
 // ==================== ROUTE CHAT PRINCIPALE ====================
 app.post("/api/chat", apiLimiter, authenticateUser, async (req, res) => {
   try {
+    console.log("Payload reçu :", JSON.stringify(req.body).slice(0, 500));
+    
     const { message, history } = req.body;
     const userId = req.user.id;
     
-    // Validation
     if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({ reply: "Le champ 'message' est requis." });
+      return res.status(400).json({ error: "message manquant dans la requête", reply: "Veuillez fournir un message." });
     }
     
-    if (message.length > 2000) {
-      return res.status(400).json({ reply: "Message trop long (maximum 2000 caractères)." });
-    }
+    console.log(`💬 Chat de ${userId}: "${message.slice(0, 80)}"`);
     
-    console.log(`💬 Chat de ${userId}: "${message.slice(0, 80)}${message.length > 80 ? "..." : ""}"`);
-    
-    // Appel au LLM
+    // Appel au LLM avec le system prompt proactif
     const aiResult = await callLLMWithFallback(message, history || [], userId);
     
-    // Extraire le texte final
-    let finalReplyText = aiResult.replyText || extractTextFromModel(aiResult);
+    let finalReplyText = aiResult.replyText;
+    let imageUrls = [];
     
-    // Exécuter l'action si nécessaire
-    if (aiResult.systemAction && aiResult.systemAction !== "NONE" && !aiResult.error) {
-      try {
-        const actionResult = await executeAction(aiResult.systemAction, aiResult.payload, userId);
-        if (actionResult.replyText) {
-          finalReplyText = actionResult.replyText;
-        }
-      } catch (actionError) {
-        console.error(`❌ Erreur action ${aiResult.systemAction}:`, actionError.message);
-        finalReplyText = `Je n'ai pas pu exécuter l'action: ${actionError.message}`;
+    // Exécuter l'action automatiquement
+    if (aiResult.systemAction === "SEARCH_IMAGES" && aiResult.payload?.query) {
+      console.log(`🖼️ Illustration automatique: "${aiResult.payload.query}"`);
+      imageUrls = await searchWikimediaImages(aiResult.payload.query, 4);
+      
+      if (imageUrls.length > 0) {
+        // Ajouter les URLs d'images à la réponse
+        const imageLinks = imageUrls.map(img => img.url).join("\n");
+        finalReplyText += `\n\n📷 Illustrations :\n${imageLinks}`;
       }
     }
     
     // Logger
     db.run(
       "INSERT INTO chat_logs (user_id, message, response, system_action, llm_provider) VALUES (?, ?, ?, ?, ?)",
-      [userId, message, finalReplyText, aiResult.systemAction || "NONE", aiResult.provider || "unknown"],
-      (err) => { if (err) console.error("❌ Erreur log chat:", err.message); }
+      [userId, message, finalReplyText, aiResult.systemAction || "NONE", aiResult.provider || "unknown"]
     );
     
-    // RÉPONSE AU FORMAT SIMPLE
-    console.log(`✅ Réponse: "${finalReplyText.slice(0, 80)}${finalReplyText.length > 80 ? "..." : ""}"`);
-    return res.status(200).json({ reply: finalReplyText });
+    // Réponse avec images si disponibles
+    const responseObj = { reply: finalReplyText };
+    if (imageUrls.length > 0) {
+      responseObj.images = imageUrls;
+    }
+    
+    return res.status(200).json(responseObj);
     
   } catch (error) {
     console.error("❌ Erreur /api/chat:", error.message);
-    console.error("   Stack:", error.stack);
-    
     return res.status(500).json({ 
-      reply: "Une erreur est survenue lors du traitement de votre message. Veuillez réessayer." 
+      reply: "Une erreur est survenue. Veuillez réessayer.",
+      error: error.message
     });
   }
 });
 
-// ==================== FONCTION D'EXÉCUTION DES ACTIONS ====================
-async function executeAction(action, payload, userId) {
-  console.log(`⚡ Action: ${action}`);
-  
-  switch (action) {
-    case "SEARCH_WEB": {
-      const query = payload.query;
-      if (!query) throw new Error("Paramètre 'query' requis");
-      
-      const results = await searchWebAdvanced(query);
-      const textResults = results.results.map(r => 
-        `${r.title}: ${r.snippet}${r.url ? ` (${r.url})` : ""}`
-      ).join("\n\n");
-      
-      return {
-        replyText: `Résultats pour "${query}":\n\n${textResults || "Aucun résultat trouvé."}`
-      };
-    }
-    
-    case "SEARCH_IMAGES": {
-      const query = payload.query;
-      if (!query) throw new Error("Paramètre 'query' requis");
-      
-      const images = await searchWikimediaImages(query, payload.limit || 5);
-      if (images.length === 0) {
-        return { replyText: `Aucune image trouvée pour "${query}".` };
-      }
-      
-      const imageUrls = images.map(img => img.url).join("\n");
-      return {
-        replyText: `Voici ${images.length} image(s) pour "${query}":\n\n${imageUrls}`
-      };
-    }
-    
-    case "SEND_EMAIL": {
-      const { to, subject, body } = payload;
-      if (!to || !subject || !body) throw new Error("Paramètres email incomplets");
-      
-      await sendEmail(to, subject, body, userId);
-      return { replyText: `✅ Email envoyé avec succès à ${to}` };
-    }
-    
-    case "SEND_WHATSAPP": {
-      const { to, message } = payload;
-      if (!to || !message) throw new Error("Paramètres WhatsApp incomplets");
-      
-      await whatsappManager.sendMessage(userId, to, message);
-      return { replyText: `✅ Message WhatsApp envoyé à ${to}` };
-    }
-    
-    default:
-      throw new Error(`Action inconnue: ${action}`);
-  }
-}
-
-// ==================== ROUTES OUTILS ====================
-app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
+// ==================== ROUTE WHATSAPP CHAT ====================
+app.post("/api/whatsapp/chat", strictLimiter, authenticateUser, async (req, res) => {
   try {
-    const action = req.body.action || req.body.actionType;
-    const data = req.body.data || {};
-    const userId = req.user.id;
+    console.log("Payload reçu :", JSON.stringify(req.body).slice(0, 500));
     
-    if (!action) {
-      return res.status(400).json({ reply: "Action requise." });
+    const { userId, message } = req.body;
+    
+    // Validation explicite
+    if (!userId) {
+      return res.status(400).json({ error: "userId manquant dans la requête" });
+    }
+    if (!message || typeof message !== "string" || message.trim().length === 0) {
+      return res.status(400).json({ error: "message manquant ou invalide dans la requête" });
     }
     
-    console.log(`🛠️ Outil: ${action}`);
+    console.log(`💬 WhatsApp Chat: ${userId} → "${message.slice(0, 80)}"`);
     
-    let result;
+    // Traiter avec le LLM
+    const aiResult = await callLLMWithFallback(message, [], userId);
     
-    switch (action) {
-      case "search_web": {
-        if (!data.query) return res.status(400).json({ reply: "Paramètre 'query' requis." });
-        const webResults = await searchWebAdvanced(data.query);
-        const textResults = webResults.results.map(r => `${r.title}: ${r.snippet}`).join("\n\n");
-        result = { reply: textResults || "Aucun résultat trouvé." };
-        break;
-      }
-      
-      case "send_email": {
-        const { to, subject, body } = data;
-        if (!to || !subject || !body) return res.status(400).json({ reply: "Paramètres incomplets." });
-        
-        try {
-          await sendEmail(to, subject, body, userId);
-          result = { reply: `✅ Email envoyé à ${to}` };
-        } catch (error) {
-          result = { reply: `❌ Erreur: ${error.message}` };
-        }
-        break;
-      }
-      
-      case "send_whatsapp": {
-        const { to, message } = data;
-        if (!to || !message) return res.status(400).json({ reply: "Paramètres incomplets." });
-        
-        try {
-          await whatsappManager.sendMessage(userId, to, message);
-          result = { reply: `✅ Message envoyé à ${to}` };
-        } catch (error) {
-          result = { reply: `❌ Erreur: ${error.message}` };
-        }
-        break;
-      }
-      
-      case "whatsapp_qr": {
-        await whatsappManager.initClient(userId);
-        
-        let qr = null;
-        const startTime = Date.now();
-        while (!qr && Date.now() - startTime < 30000) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          qr = whatsappManager.getQRCode(userId);
-        }
-        
-        if (qr) {
-          result = { reply: "QR Code généré. Scannez-le pour connecter WhatsApp.", qrBase64: qr };
-        } else {
-          result = { reply: "Délai dépassé. Veuillez réessayer." };
-        }
-        break;
-      }
-      
-      default:
-        return res.status(400).json({ reply: `Action inconnue: ${action}` });
-    }
-    
-    return res.json(result);
+    return res.status(200).json({ 
+      reply: aiResult.replyText,
+      provider: aiResult.provider
+    });
     
   } catch (error) {
-    console.error("❌ Erreur /api/tools:", error.message);
-    return res.status(500).json({ reply: "Erreur lors de l'exécution de l'outil." });
+    console.error("❌ Erreur /api/whatsapp/chat:", error.message);
+    return res.status(500).json({ 
+      reply: "Erreur lors du traitement WhatsApp.",
+      error: error.message
+    });
+  }
+});
+
+// ==================== ROUTE EMAIL CHAT ====================
+app.post("/api/email/chat", strictLimiter, authenticateUser, async (req, res) => {
+  try {
+    console.log("Payload reçu :", JSON.stringify(req.body).slice(0, 500));
+    
+    const { userId, to, subject, body } = req.body;
+    
+    // Validation explicite
+    if (!userId) {
+      return res.status(400).json({ error: "userId manquant dans la requête" });
+    }
+    if (!to) {
+      return res.status(400).json({ error: "destinataire (to) manquant dans la requête" });
+    }
+    if (!subject) {
+      return res.status(400).json({ error: "sujet (subject) manquant dans la requête" });
+    }
+    if (!body) {
+      return res.status(400).json({ error: "contenu (body) manquant dans la requête" });
+    }
+    
+    console.log(`📧 Email Chat: ${userId} → ${to}`);
+    
+    const emailResult = await sendEmail(to, subject, body, userId);
+    
+    return res.status(200).json({ 
+      reply: `✅ Email envoyé avec succès à ${to}`,
+      messageId: emailResult.messageId
+    });
+    
+  } catch (error) {
+    console.error("❌ Erreur /api/email/chat:", error.message);
+    return res.status(500).json({ 
+      reply: "Erreur lors de l'envoi de l'email.",
+      error: error.message
+    });
+  }
+});
+
+// ==================== ROUTE ENVOI WHATSAPP ====================
+app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res) => {
+  try {
+    console.log("Payload reçu :", JSON.stringify(req.body).slice(0, 500));
+    
+    const { userId, to, message } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: "userId manquant dans la requête" });
+    }
+    if (!to) {
+      return res.status(400).json({ error: "destinataire (to) manquant dans la requête" });
+    }
+    if (!message) {
+      return res.status(400).json({ error: "message manquant dans la requête" });
+    }
+    
+    const result = await whatsappManager.sendMessage(userId, to, message);
+    
+    return res.status(200).json({ 
+      reply: `✅ Message WhatsApp envoyé à ${to}`,
+      ...result
+    });
+    
+  } catch (error) {
+    console.error("❌ Erreur /api/whatsapp/send:", error.message);
+    
+    if (error.code === "WHATSAPP_NOT_CONNECTED") {
+      return res.status(400).json({ 
+        error: "WhatsApp non connecté",
+        reply: "Veuillez d'abord scanner le QR Code pour connecter WhatsApp."
+      });
+    }
+    
+    return res.status(500).json({ 
+      reply: "Erreur lors de l'envoi WhatsApp.",
+      error: error.message
+    });
+  }
+});
+
+// ==================== ROUTE QR CODE WHATSAPP ====================
+app.post("/api/whatsapp/qr", strictLimiter, authenticateUser, async (req, res) => {
+  try {
+    console.log("Payload reçu :", JSON.stringify(req.body).slice(0, 200));
+    
+    const userId = req.body.userId || req.user.id;
+    
+    if (!userId) {
+      return res.status(400).json({ error: "userId manquant dans la requête" });
+    }
+    
+    await whatsappManager.initClient(userId);
+    
+    let qr = null;
+    const startTime = Date.now();
+    while (!qr && Date.now() - startTime < 30000) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      qr = whatsappManager.getQRCode(userId);
+    }
+    
+    if (qr) {
+      return res.status(200).json({ 
+        reply: "QR Code généré. Scannez pour connecter WhatsApp.",
+        qrBase64: qr
+      });
+    } else {
+      return res.status(408).json({ 
+        reply: "Délai dépassé pour la génération du QR Code."
+      });
+    }
+    
+  } catch (error) {
+    console.error("❌ Erreur /api/whatsapp/qr:", error.message);
+    return res.status(500).json({ 
+      reply: "Erreur lors de la génération du QR Code.",
+      error: error.message
+    });
   }
 });
 
 // ==================== GESTION DES ERREURS 404 ====================
 app.use((req, res) => {
   res.status(404).json({ 
-    reply: "Route non trouvée.",
-    path: req.url
+    error: "Route non trouvée",
+    reply: "Cette route n'existe pas."
   });
 });
 
@@ -1128,10 +856,13 @@ app.use((err, req, res, next) => {
   console.error("❌ Erreur Express:", err.message);
   
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
-    return res.status(400).json({ reply: "JSON invalide dans la requête." });
+    return res.status(400).json({ error: "JSON invalide dans la requête" });
   }
   
-  res.status(500).json({ reply: "Erreur interne du serveur." });
+  res.status(500).json({ 
+    error: "Erreur interne du serveur",
+    reply: "Une erreur est survenue."
+  });
 });
 
 // ==================== DÉMARRAGE ====================
@@ -1140,16 +871,12 @@ const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log("========================================");
   console.log(`🚀 Serveur MILO actif sur le port ${PORT}`);
-  console.log(`📅 Démarrage : ${new Date().toISOString()}`);
-  console.log(`💾 Base de données : SQLite (WAL mode)`);
   console.log(`🤖 LLM Principal : Groq (${LLM_PROVIDERS.GROQ.model})`);
   console.log(`🔄 LLM Fallback : OpenRouter (${LLM_PROVIDERS.OPENROUTER.model})`);
-  console.log(`📧 Email : ${emailTransporter ? "configuré" : "désactivé"}`);
-  console.log(`💬 WhatsApp : disponible`);
+  console.log(`🖼️ Illustration automatique : ACTIVÉE`);
   console.log("========================================");
 });
 
-// Timeouts
 server.timeout = 60000;
 server.keepAliveTimeout = 60000;
 server.headersTimeout = 65000;
@@ -1160,30 +887,19 @@ async function gracefulShutdown(signal) {
   
   for (const [userId, session] of whatsappManager.clients) {
     if (session.client) {
-      try {
-        await session.client.destroy();
-      } catch (error) {
-        console.error("❌ Erreur fermeture session:", error.message);
-      }
+      try { await session.client.destroy(); } catch (e) {}
     }
   }
   
-  if (emailTransporter) {
-    emailTransporter.close();
-  }
+  if (emailTransporter) emailTransporter.close();
   
   db.close((err) => {
-    if (err) console.error("❌ Erreur fermeture DB:", err.message);
-    
     server.close(() => {
       console.log("✅ Arrêt terminé");
       process.exit(0);
     });
     
-    setTimeout(() => {
-      console.error("⚠️ Arrêt forcé");
-      process.exit(1);
-    }, 10000);
+    setTimeout(() => process.exit(1), 10000);
   });
 }
 
@@ -1191,7 +907,7 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 process.on("uncaughtException", (error) => {
-  console.error("❌ Erreur non capturée:", error);
+  console.error("❌ Erreur non capturée:", error.message);
 });
 
 process.on("unhandledRejection", (reason) => {
