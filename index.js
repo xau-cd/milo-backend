@@ -583,7 +583,37 @@ async function sendEmailViaGmail(accessToken, recipient, subject, body) {
   return { success: true, provider: "gmail", messageId: response.data?.id || null };
 }
 
-// Fallback SMTP (Nodemailer), utilisé si aucun token Google n'est fourni.
+// Fallback transactionnel à grande échelle (Resend), utilisé quand aucun token Google
+// n'est fourni. Conçu pour des volumes de production (contrairement au SMTP perso).
+async function sendEmailViaResend(recipient, subject, body) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return { success: false, error: "RESEND_API_KEY non configurée" };
+
+  try {
+    const response = await axios.post(
+      "https://api.resend.com/emails",
+      {
+        from: process.env.RESEND_FROM || "Luba <onboarding@resend.dev>",
+        to: recipient,
+        subject: subject || "(sans sujet)",
+        html: `<div style="font-family: Arial; padding: 20px;">${String(body || "").replace(/\n/g, "<br>")}</div>`
+      },
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        timeout: 15000
+      }
+    );
+
+    return { success: true, provider: "resend", messageId: response.data?.id || null };
+  } catch (error) {
+    const apiError = error.response?.data?.message || error.message;
+    console.error("❌ Erreur envoi email via Resend:", apiError);
+    return { success: false, error: `Resend: ${apiError}` };
+  }
+}
+
+// Dernier recours (dev/test local), utilisé seulement si ni Google OAuth ni Resend
+// ne sont disponibles. Non recommandé en production à grande échelle.
 async function sendEmailViaSMTP(to, subject, body) {
   if (!emailTransporter) return { success: false, error: "SMTP non configuré" };
 
@@ -603,8 +633,10 @@ async function sendEmailViaSMTP(to, subject, body) {
   }
 }
 
-// Point d'entrée unique pour le Function Calling send_email : bascule automatiquement
-// entre Gmail API (si un token OAuth est présent) et SMTP (sinon).
+// Point d'entrée unique pour le Function Calling send_email. Ordre de priorité :
+// 1) Gmail API avec le token OAuth de l'utilisateur (envoi "en son nom propre")
+// 2) Resend (service transactionnel à grande échelle, pour les emails système/HIKLON)
+// 3) SMTP (dernier recours, dev/test local uniquement)
 async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!recipient || !emailRegex.test(String(recipient).trim())) {
@@ -620,6 +652,8 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }
       console.error("❌ Erreur envoi email via Gmail API:", apiError);
       result = { success: false, error: `Gmail API: ${apiError}` };
     }
+  } else if (process.env.RESEND_API_KEY) {
+    result = await sendEmailViaResend(recipient, subject, body);
   } else {
     result = await sendEmailViaSMTP(recipient, subject, body);
   }
@@ -852,6 +886,11 @@ class WhatsAppManager {
       authStrategy: new LocalAuth({ clientId: userId, dataPath: CONFIG.SESSIONS_PATH }),
       puppeteer: {
         headless: true,
+        // Sur Render (environnement natif Node), Chromium doit souvent être installé
+        // via Docker + variable PUPPETEER_EXECUTABLE_PATH pointant vers un Chromium
+        // système, car le Chromium bundlé par Puppeteer manque fréquemment de
+        // librairies partagées (libnss3, libatk, etc.) dans ce type d'environnement.
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -905,6 +944,9 @@ class WhatsAppManager {
       await client.initialize();
       return { connected: false, qrCode: null };
     } catch (error) {
+      console.error(`❌ Puppeteer/WhatsApp init error (tentative ${retryCount + 1}) pour ${userId}:`, error.message);
+      if (error.stack) console.error(error.stack);
+
       if (retryCount < CONFIG.WHATSAPP_MAX_RETRIES) {
         this.clients.delete(userId);
         await new Promise((resolve) => setTimeout(resolve, CONFIG.WHATSAPP_RETRY_DELAY));
@@ -1287,10 +1329,70 @@ app.get(
           openrouter: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey)
         },
         email: {
-          smtp: Boolean(emailTransporter),
-          gmailOAuth: "à la demande (token transmis par requête)"
+          gmailOAuth: "à la demande (token transmis par requête)",
+          resend: Boolean(process.env.RESEND_API_KEY),
+          smtp: Boolean(emailTransporter)
         }
       }
+    });
+  })
+);
+
+// ==================== ROUTE LISTE DES CONVERSATIONS D'UN UTILISATEUR ====================
+app.get(
+  "/api/conversations",
+  apiLimiter,
+  authenticateUser,
+  asyncHandler(async (req, res) => {
+    const rows = await dbAll(
+      "SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50",
+      [req.userId]
+    );
+
+    const conversations = await Promise.all(
+      rows.map(async (row) => {
+        const lastMessage = await dbGet(
+          "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+          [row.session_id]
+        );
+        return {
+          conversationId: row.session_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+          lastMessageRole: lastMessage?.role || null,
+          lastMessagePreview: lastMessage?.content ? lastMessage.content.slice(0, 140) : null
+        };
+      })
+    );
+
+    return res.status(200).json({ reply: "Conversations récupérées.", error: false, conversations });
+  })
+);
+
+// ==================== ROUTE HISTORIQUE D'UNE CONVERSATION PRÉCISE ====================
+app.get(
+  "/api/conversations/:conversationId/messages",
+  apiLimiter,
+  authenticateUser,
+  asyncHandler(async (req, res) => {
+    const { conversationId } = req.params;
+
+    try {
+      await assertConversationOwnership(conversationId, req.userId);
+    } catch (error) {
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true, messages: [] });
+    }
+
+    const rows = await dbAll(
+      "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 200",
+      [conversationId]
+    );
+
+    return res.status(200).json({
+      reply: "Historique récupéré.",
+      error: false,
+      conversationId,
+      messages: rows.map((r) => ({ role: r.role, content: r.content, createdAt: r.created_at }))
     });
   })
 );
@@ -1596,6 +1698,8 @@ app.use((req, res) => {
     availableRoutes: [
       "GET /",
       "GET /api/health",
+      "GET /api/conversations",
+      "GET /api/conversations/:conversationId/messages",
       "POST /api/chat",
       "GET /api/whatsapp/qr",
       "GET /api/whatsapp/status",
@@ -1636,7 +1740,9 @@ const server = app.listen(PORT, () => {
   console.log(`🔌 Port : ${PORT}`);
   console.log(`🧠 Mémoire : SQLite, isolée par conversation_id`);
   console.log(`🔄 Boucle ReAct : Activée`);
-  console.log(`📧 Email : Gmail API (OAuth) + fallback SMTP (${emailTransporter ? "configuré" : "non configuré"})`);
+  console.log(
+    `📧 Email : Gmail API (OAuth par utilisateur) + Resend (${process.env.RESEND_API_KEY ? "configuré" : "non configuré"}) + SMTP (${emailTransporter ? "configuré" : "non configuré"})`
+  );
   console.log(`📱 WhatsApp gateway (Evolution API) : ${whatsappGateway.configured() ? "configurée" : "NON configurée"}`);
   console.log(`📱 WhatsApp legacy (whatsapp-web.js) : conservée pour compatibilité`);
   console.log(`📬 File d'attente WhatsApp : ${useRedisQueue ? "BullMQ + Redis" : "en mémoire (repli)"}`);
