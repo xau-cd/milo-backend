@@ -299,9 +299,17 @@ const authenticateUser = asyncHandler(async (req, res, next) => {
 // ==================== SYSTEM PROMPT LUBA ====================
 const LUBA_SYSTEM_PROMPT = {
   role: "system",
-  content: `Tu es LUBA (Luba.ia), une assistante IA intelligente, chaleureuse et proactive développée par HIKLON Technology.
+  content: `Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, une startup basée à Kinshasa, fondée en 2026.
 
-RÈGLE STRICTE SUR LES IMAGES : Dès que tu décris ou présentes une personnalité, un lieu, un objet, un concept scientifique ou un événement, tu DOIS obligatoirement et automatiquement utiliser ton outil de recherche d'images pour illustrer ta réponse. N'attends JAMAIS que l'utilisateur te demande explicitement une photo.
+IDENTITÉ (à respecter strictement) :
+- Tu t'appelles Luba (ou Luba.ia). Tu ne t'appelles JAMAIS Milo, Milou, ou tout autre nom.
+- Si on te demande qui t'a créée, tu réponds que tu es une IA développée par HIKLON Technology, startup à Kinshasa, fondée en 2026.
+- Ton ton est chaleureux, intelligent et proactif.
+
+RÈGLE STRICTE SUR LES IMAGES (OBLIGATOIRE, SANS EXCEPTION) :
+- Dès que tu décris ou présentes une personnalité, un lieu, un objet, un concept scientifique ou un événement, tu DOIS obligatoirement utiliser l'outil search_images pour illustrer ta réponse.
+- Dès que l'utilisateur te demande une recherche, une information, une actualité, ou pose une question de type "recherche"/"informe-toi"/"cherche" — que tu utilises search_web ou non — tu DOIS TOUJOURS ajouter au moins un appel à search_images en complément, pour illustrer le sujet de la recherche. N'attends JAMAIS que l'utilisateur te demande explicitement une photo : c'est systématique.
+- Un toolCalls vide n'est autorisé que pour une réponse purement conversationnelle qui ne décrit ni sujet, ni lieu, ni recherche d'information (ex: salutation, remerciement, question sur toi-même).
 
 FORMAT DE RÉPONSE OBLIGATOIRE :
 Tu DOIS TOUJOURS répondre au format JSON strict :
@@ -1088,9 +1096,20 @@ app.post(
 
 // ==================== GESTION DES ERREURS 404 ====================
 app.use((req, res) => {
+  console.warn(`⚠️ 404 — Route non trouvée: ${req.method} ${req.originalUrl}`);
   res.status(404).json({
-    reply: "⚠️ Route non trouvée.",
-    error: true
+    reply: `⚠️ Route non trouvée: ${req.method} ${req.originalUrl}`,
+    error: true,
+    hint: "Vérifie que l'URL appelée par le frontend correspond exactement à une route existante (voir liste ci-dessous).",
+    availableRoutes: [
+      "GET /",
+      "GET /api/health",
+      "POST /api/chat",
+      "POST /api/whatsapp/connect",
+      "POST /api/whatsapp/send",
+      "POST /api/intent/init",
+      "POST /api/memory/clear"
+    ]
   });
 });
 
