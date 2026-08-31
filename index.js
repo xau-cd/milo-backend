@@ -1,8 +1,27 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
 // Architecture : Backend (Cerveau) → Frontend (Corps)
-// Technologies : Express, SQLite, whatsapp-web.js, qrcode, axios, Groq (Principal), OpenRouter (Fallback), Nodemailer
+// Technologies : Express, SQLite, whatsapp-web.js (legacy), Evolution API (gateway WhatsApp),
+//                BullMQ/Redis (file d'attente, optionnel), axios, Groq (Principal),
+//                OpenRouter (Fallback), Nodemailer (fallback email), Gmail API (email OAuth)
 // Format de réponse standardisé : { reply, images (optionnel), qrCode (optionnel), error }
-// Version : 6.1.0 - Production Ready avec Mémoire, ReAct Loop et durcissement (Luba.ia)
+// Version : 7.0.0 - Contexte par conversation_id, Function Calling email/WhatsApp réels,
+//                    passerelle WhatsApp open-source, file d'attente résiliente
+//
+// ⚠️ NOTES DE MIGRATION IMPORTANTES :
+// - Les routes historiques /api/whatsapp/connect et /api/whatsapp/send (whatsapp-web.js /
+//   Puppeteer) sont CONSERVÉES pour compatibilité, mais sont désormais considérées "legacy".
+// - Le nouveau chemin recommandé pour la prod est la passerelle REST (Evolution API ou
+//   équivalent) pilotée via WHATSAPP_GATEWAY_URL / WHATSAPP_GATEWAY_API_KEY, avec les routes
+//   /api/whatsapp/qr, /api/whatsapp/status et /api/whatsapp/webhook.
+// - Les chemins REST de whatsappGateway suivent la convention Evolution API
+//   (https://github.com/EvolutionAPI/evolution-api). Si tu utilises une autre passerelle,
+//   adapte uniquement le bloc `whatsappGateway` ci-dessous.
+// - Pour le Function Calling email, envoie le token OAuth Google dans le header
+//   `Authorization: Bearer <access_token>` (ou `X-Google-Access-Token`) depuis le frontend.
+//   Sans ce token, l'envoi retombe automatiquement sur le SMTP (Nodemailer) déjà configuré.
+// - Pour la file d'attente WhatsApp résiliente, configure REDIS_URL et installe
+//   les paquets `bullmq` et `ioredis` (npm install bullmq ioredis). Sans Redis, une file en
+//   mémoire avec retry/backoff est utilisée automatiquement (non persistante entre redéploiements).
 
 require("dotenv").config();
 
@@ -23,7 +42,7 @@ const crypto = require("crypto");
 const CONFIG = {
   PORT: process.env.PORT || 3000,
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "6.1.0",
+  VERSION: "7.0.0",
   AGENT_NAME: "Luba",
   MAX_MESSAGE_LENGTH: 2000,
   MAX_HISTORY_LENGTH: 15,
@@ -45,6 +64,16 @@ if (missingEnvVars.length > 0) {
   missingEnvVars.forEach((varName) => console.error(`   - ${varName}`));
   console.error("=".repeat(60));
   console.error("⚠️ Le service d'IA ne fonctionnera pas sans ces clés.");
+}
+
+if (!process.env.WHATSAPP_GATEWAY_URL) {
+  console.warn("⚠️ WHATSAPP_GATEWAY_URL non configurée — la passerelle WhatsApp open-source (Evolution API) est désactivée.");
+}
+if (!process.env.WHATSAPP_WEBHOOK_SECRET) {
+  console.warn("⚠️ WHATSAPP_WEBHOOK_SECRET non configuré — le webhook WhatsApp acceptera des requêtes NON authentifiées. À définir avant la mise en prod.");
+}
+if (!process.env.REDIS_URL) {
+  console.warn("⚠️ REDIS_URL non configurée — file d'attente WhatsApp en mémoire (non persistante entre redémarrages).");
 }
 
 // ==================== CRÉATION DES DOSSIERS ====================
@@ -73,6 +102,10 @@ db.run("PRAGMA busy_timeout = 5000;");
 db.run("PRAGMA temp_store = MEMORY;");
 db.run("PRAGMA foreign_keys = ON;");
 
+// NOTE SCHÉMA : la colonne `session_id` de `sessions` et `messages` est désormais
+// utilisée comme `conversation_id` au niveau de l'API. Aucune migration de schéma
+// n'est nécessaire : c'est la même colonne, juste une sémantique plus précise
+// (une ligne = une conversation isolée, identifiée par conversation_id).
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -136,7 +169,7 @@ db.serialize(() => {
 
 console.log("✅ Base de données SQLite initialisée");
 
-// ==================== CONFIGURATION NODEMAILER ====================
+// ==================== CONFIGURATION NODEMAILER (fallback SMTP) ====================
 let emailTransporter = null;
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   emailTransporter = nodemailer.createTransport({
@@ -155,10 +188,10 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
 
   emailTransporter.verify((err) => {
     if (err) console.error("⚠️ SMTP non joignable:", err.message);
-    else console.log("✅ SMTP prêt à envoyer des emails");
+    else console.log("✅ SMTP prêt (fallback email)");
   });
 } else {
-  console.warn("⚠️ SMTP non configuré — l'envoi d'email sera désactivé.");
+  console.warn("⚠️ SMTP non configuré — le fallback email sera désactivé (Gmail API OAuth reste possible).");
 }
 
 // ==================== INITIALISATION EXPRESS ====================
@@ -190,14 +223,24 @@ app.use(
       }
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id", "X-Google-Access-Token"],
     credentials: true,
     maxAge: 86400
   })
 );
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }));
-app.use(express.json({ limit: "10mb" }));
+
+// `verify` conserve le corps brut de la requête : indispensable pour valider la
+// signature HMAC des webhooks WhatsApp (voir verifyWhatsappWebhookSignature).
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    }
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ==================== RATE LIMITER ====================
@@ -227,6 +270,16 @@ const strictLimiter = rateLimit({
   }
 });
 
+// Limiteur dédié au webhook WhatsApp entrant (trafic potentiellement élevé, mais
+// on ne veut pas bloquer la passerelle si elle retente un envoi).
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: true, reply: "Trop de requêtes webhook." })
+});
+
 // ==================== MIDDLEWARE DE LOGGING ====================
 app.use((req, res, next) => {
   const requestId = crypto.randomUUID();
@@ -246,16 +299,20 @@ app.use((req, res, next) => {
 });
 
 // ==================== WRAPPER ASYNC POUR LES ROUTES ====================
-// Garantit qu'aucune promesse rejetée dans une route ne peut faire planter
-// le process ni rester sans réponse envoyée au client.
 const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
-// ==================== MIDDLEWARE D'AUTHENTIFICATION ====================
+// ==================== HELPERS SQLITE PROMISIFIÉS ====================
 function dbGet(query, params) {
   return new Promise((resolve, reject) => {
     db.get(query, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+
+function dbAll(query, params) {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => (err ? reject(err) : resolve(rows)));
   });
 }
 
@@ -268,6 +325,7 @@ function dbRun(query, params) {
   });
 }
 
+// ==================== MIDDLEWARE D'AUTHENTIFICATION ====================
 const authenticateUser = asyncHandler(async (req, res, next) => {
   const userId = req.body.userId || req.query.userId || req.headers["x-user-id"];
 
@@ -295,6 +353,19 @@ const authenticateUser = asyncHandler(async (req, res, next) => {
     return res.status(200).json({ reply: "⚠️ Erreur interne.", error: true });
   }
 });
+
+// Extrait un token d'accès OAuth Google depuis l'en-tête Authorization (Bearer)
+// ou depuis X-Google-Access-Token. Utilisé uniquement pour le Function Calling email.
+function extractGoogleAccessToken(req) {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7).trim();
+  }
+  if (req.headers["x-google-access-token"]) {
+    return String(req.headers["x-google-access-token"]).trim();
+  }
+  return null;
+}
 
 // ==================== SYSTEM PROMPT LUBA ====================
 const LUBA_SYSTEM_PROMPT = {
@@ -328,8 +399,8 @@ Si aucun outil n'est nécessaire, utilise "toolCalls": [].
 OUTILS DISPONIBLES :
 - search_images : Rechercher des images (arguments: { query })
 - search_web : Rechercher sur le web (arguments: { query })
-- send_email : Envoyer un email (arguments: { to, subject, body })
-- send_whatsapp : Envoyer un WhatsApp (arguments: { to, message })`
+- send_email : Envoyer un email réel (arguments: { recipient, subject, body })
+- send_whatsapp_message : Envoyer un message WhatsApp réel (arguments: { phone_number, message })`
 };
 
 // ==================== CONFIGURATION LLM ====================
@@ -354,47 +425,45 @@ const LLM_PROVIDERS = {
   }
 };
 
-// ==================== FONCTIONS DE MÉMOIRE ====================
-async function getSession(sessionId, userId) {
-  const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [sessionId]);
+// ==================== GESTION DU CONTEXTE PAR CONVERSATION_ID ====================
+// Chaque conversation (web, WhatsApp, etc.) est isolée par conversation_id. Le
+// contexte chargé pour le LLM ne provient JAMAIS d'une autre conversation.
+
+async function getSession(conversationId, userId) {
+  const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
 
   if (session) {
-    await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [sessionId]);
+    await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
     return session;
   }
 
-  await dbRun("INSERT INTO sessions (session_id, user_id) VALUES (?, ?)", [sessionId, userId]);
-  return { session_id: sessionId, user_id: userId, active_intent: null, intent_data: null };
+  await dbRun("INSERT INTO sessions (session_id, user_id) VALUES (?, ?)", [conversationId, userId]);
+  return { session_id: conversationId, user_id: userId, active_intent: null, intent_data: null };
 }
 
-async function getHistory(sessionId, limit = CONFIG.MAX_HISTORY_LENGTH) {
-  return new Promise((resolve, reject) => {
-    db.all(
-      "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-      [sessionId, limit],
-      (err, rows) => {
-        if (err) return reject(err);
-        resolve(rows.reverse().map((row) => ({ role: row.role, content: row.content })));
-      }
-    );
-  });
+async function getHistory(conversationId, limit = CONFIG.MAX_HISTORY_LENGTH) {
+  const rows = await dbAll(
+    "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+    [conversationId, limit]
+  );
+  return rows.reverse().map((row) => ({ role: row.role, content: row.content }));
 }
 
-async function saveMessage(sessionId, role, content) {
-  await dbRun("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", [sessionId, role, content]);
-  await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [sessionId]);
+async function saveMessage(conversationId, role, content) {
+  await dbRun("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", [conversationId, role, content]);
+  await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
 }
 
-async function setActiveIntent(sessionId, intentType, intentData = {}) {
+async function setActiveIntent(conversationId, intentType, intentData = {}) {
   await dbRun("UPDATE sessions SET active_intent = ?, intent_data = ? WHERE session_id = ?", [
     intentType,
     JSON.stringify(intentData),
-    sessionId
+    conversationId
   ]);
 }
 
-async function getActiveIntent(sessionId) {
-  const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [sessionId]);
+async function getActiveIntent(conversationId) {
+  const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [conversationId]);
   if (!row || !row.active_intent) return null;
 
   try {
@@ -405,11 +474,22 @@ async function getActiveIntent(sessionId) {
   }
 }
 
-async function clearActiveIntent(sessionId) {
-  await dbRun("UPDATE sessions SET active_intent = NULL, intent_data = NULL WHERE session_id = ?", [sessionId]);
+async function clearActiveIntent(conversationId) {
+  await dbRun("UPDATE sessions SET active_intent = NULL, intent_data = NULL WHERE session_id = ?", [conversationId]);
 }
 
-// ==================== OUTILS ====================
+// Vérifie qu'une conversation appartient bien à l'utilisateur authentifié
+// (empêche un utilisateur de lire/écrire le contexte d'une conversation d'un autre).
+async function assertConversationOwnership(conversationId, userId) {
+  const existing = await dbGet("SELECT user_id FROM sessions WHERE session_id = ?", [conversationId]);
+  if (existing && existing.user_id && existing.user_id !== userId) {
+    const err = new Error("Cette conversation n'appartient pas à cet utilisateur.");
+    err.code = "CONVERSATION_OWNERSHIP";
+    throw err;
+  }
+}
+
+// ==================== OUTILS DE RECHERCHE ====================
 async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
 
@@ -469,13 +549,43 @@ async function searchWeb(query) {
   }
 }
 
-async function sendEmail(to, subject, body) {
-  if (!emailTransporter) return { success: false, error: "SMTP non configuré" };
+// ==================== ENVOI D'EMAIL : GMAIL API (OAuth) + FALLBACK SMTP ====================
 
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!to || !emailRegex.test(String(to).trim())) {
-    return { success: false, error: "Adresse email destinataire invalide" };
-  }
+// Envoi réel via l'API Gmail, en utilisant le token OAuth Bearer transmis par le frontend.
+async function sendEmailViaGmail(accessToken, recipient, subject, body) {
+  const messageLines = [
+    `To: ${recipient}`,
+    `Subject: =?utf-8?B?${Buffer.from(subject || "(sans sujet)").toString("base64")}?=`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    body || ""
+  ];
+  const rawMessage = messageLines.join("\r\n");
+  const encodedMessage = Buffer.from(rawMessage)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+
+  const response = await axios.post(
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+    { raw: encodedMessage },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 15000
+    }
+  );
+
+  return { success: true, provider: "gmail", messageId: response.data?.id || null };
+}
+
+// Fallback SMTP (Nodemailer), utilisé si aucun token Google n'est fourni.
+async function sendEmailViaSMTP(to, subject, body) {
+  if (!emailTransporter) return { success: false, error: "SMTP non configuré" };
 
   try {
     const info = await emailTransporter.sendMail({
@@ -486,14 +596,247 @@ async function sendEmail(to, subject, body) {
       text: body || ""
     });
 
-    return { success: true, messageId: info.messageId };
+    return { success: true, provider: "smtp", messageId: info.messageId };
   } catch (error) {
-    console.error("❌ Erreur envoi email:", error.message);
+    console.error("❌ Erreur envoi email SMTP:", error.message);
     return { success: false, error: error.message };
   }
 }
 
-// ==================== GESTION WHATSAPP ====================
+// Point d'entrée unique pour le Function Calling send_email : bascule automatiquement
+// entre Gmail API (si un token OAuth est présent) et SMTP (sinon).
+async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!recipient || !emailRegex.test(String(recipient).trim())) {
+    return { success: false, error: "Adresse email destinataire invalide" };
+  }
+
+  let result;
+  if (googleAccessToken) {
+    try {
+      result = await sendEmailViaGmail(googleAccessToken, recipient, subject, body);
+    } catch (error) {
+      const apiError = error.response?.data?.error?.message || error.message;
+      console.error("❌ Erreur envoi email via Gmail API:", apiError);
+      result = { success: false, error: `Gmail API: ${apiError}` };
+    }
+  } else {
+    result = await sendEmailViaSMTP(recipient, subject, body);
+  }
+
+  try {
+    await dbRun("INSERT INTO email_logs (to_email, subject, status) VALUES (?, ?, ?)", [
+      recipient,
+      subject || null,
+      result.success ? "sent" : "failed"
+    ]);
+  } catch (logErr) {
+    console.error("⚠️ Impossible de journaliser l'email:", logErr.message);
+  }
+
+  return result;
+}
+
+// ==================== PASSERELLE WHATSAPP OPEN-SOURCE (Evolution API) ====================
+// Client REST vers une instance Evolution API (ou compatible) auto-hébergée, ex. via Docker.
+// ⚠️ Adapte les chemins ci-dessous si tu utilises une autre passerelle (Baileys-api, etc.).
+const WHATSAPP_GATEWAY = {
+  baseURL: (process.env.WHATSAPP_GATEWAY_URL || "").replace(/\/+$/, ""),
+  apiKey: process.env.WHATSAPP_GATEWAY_API_KEY || "",
+  instance: process.env.WHATSAPP_INSTANCE_NAME || "luba"
+};
+
+const whatsappGateway = {
+  configured() {
+    return Boolean(WHATSAPP_GATEWAY.baseURL && WHATSAPP_GATEWAY.apiKey);
+  },
+
+  async getQRCode() {
+    if (!this.configured()) {
+      throw new Error("Passerelle WhatsApp non configurée (WHATSAPP_GATEWAY_URL / WHATSAPP_GATEWAY_API_KEY manquants)");
+    }
+    const response = await axios.get(
+      `${WHATSAPP_GATEWAY.baseURL}/instance/connect/${WHATSAPP_GATEWAY.instance}`,
+      { headers: { apikey: WHATSAPP_GATEWAY.apiKey }, timeout: 15000 }
+    );
+    return response.data;
+  },
+
+  async getStatus() {
+    if (!this.configured()) throw new Error("Passerelle WhatsApp non configurée");
+    const response = await axios.get(
+      `${WHATSAPP_GATEWAY.baseURL}/instance/connectionState/${WHATSAPP_GATEWAY.instance}`,
+      { headers: { apikey: WHATSAPP_GATEWAY.apiKey }, timeout: 10000 }
+    );
+    return response.data;
+  },
+
+  async sendMessage(phoneNumber, message) {
+    if (!this.configured()) throw new Error("Passerelle WhatsApp non configurée");
+
+    const cleanNumber = String(phoneNumber).replace(/[^\d]/g, "");
+    if (!cleanNumber) throw new Error("Numéro de téléphone invalide");
+
+    const response = await axios.post(
+      `${WHATSAPP_GATEWAY.baseURL}/message/sendText/${WHATSAPP_GATEWAY.instance}`,
+      { number: cleanNumber, text: message },
+      { headers: { apikey: WHATSAPP_GATEWAY.apiKey, "Content-Type": "application/json" }, timeout: 15000 }
+    );
+    return response.data;
+  }
+};
+
+// ==================== FILE D'ATTENTE RÉSILIENTE (BullMQ+Redis, ou repli mémoire) ====================
+let BullMQ = null;
+let IORedis = null;
+try {
+  // eslint-disable-next-line global-require
+  BullMQ = require("bullmq");
+  // eslint-disable-next-line global-require
+  IORedis = require("ioredis");
+} catch (e) {
+  BullMQ = null;
+  IORedis = null;
+}
+
+const useRedisQueue = Boolean(process.env.REDIS_URL) && Boolean(BullMQ) && Boolean(IORedis);
+let whatsappQueue = null;
+let whatsappWorker = null;
+
+// File de repli en mémoire, avec concurrence limitée et retry en backoff exponentiel.
+// Utilisée automatiquement si Redis/BullMQ ne sont pas disponibles.
+class InMemoryRetryQueue {
+  constructor(processFn, { concurrency = 2, maxAttempts = 5, baseDelayMs = 2000 } = {}) {
+    this.processFn = processFn;
+    this.concurrency = concurrency;
+    this.maxAttempts = maxAttempts;
+    this.baseDelayMs = baseDelayMs;
+    this.pending = [];
+    this.active = 0;
+  }
+
+  push(data) {
+    this.pending.push({ data, attempts: 0 });
+    this._drain();
+  }
+
+  _drain() {
+    while (this.active < this.concurrency && this.pending.length > 0) {
+      const job = this.pending.shift();
+      this.active++;
+      this._process(job).finally(() => {
+        this.active--;
+        this._drain();
+      });
+    }
+  }
+
+  async _process(job) {
+    try {
+      await this.processFn(job.data);
+    } catch (err) {
+      job.attempts++;
+      console.error(`⚠️ Échec job WhatsApp (tentative ${job.attempts}/${this.maxAttempts}):`, err.message);
+      if (job.attempts < this.maxAttempts) {
+        const delay = this.baseDelayMs * Math.pow(2, job.attempts - 1);
+        setTimeout(() => {
+          this.pending.push(job);
+          this._drain();
+        }, delay);
+      } else {
+        console.error(`❌ Abandon définitif du job WhatsApp après ${this.maxAttempts} tentatives:`, JSON.stringify(job.data));
+      }
+    }
+  }
+}
+
+let inMemoryWhatsappQueue = null;
+
+if (useRedisQueue) {
+  const connection = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
+
+  whatsappQueue = new BullMQ.Queue("whatsapp-outbound", { connection });
+  whatsappWorker = new BullMQ.Worker(
+    "whatsapp-outbound",
+    async (job) => {
+      const { phoneNumber, message } = job.data;
+      await whatsappGateway.sendMessage(phoneNumber, message);
+    },
+    {
+      connection,
+      concurrency: 3,
+      limiter: { max: 10, duration: 1000 } // limite de débit : 10 messages/seconde max
+    }
+  );
+
+  whatsappWorker.on("failed", (job, err) => {
+    console.error(`❌ Job WhatsApp BullMQ échoué (${job?.id}):`, err.message);
+  });
+  whatsappWorker.on("completed", (job) => {
+    console.log(`✅ Job WhatsApp BullMQ envoyé (${job.id})`);
+  });
+
+  console.log("✅ File d'attente WhatsApp : BullMQ + Redis (persistante, avec retry)");
+} else {
+  inMemoryWhatsappQueue = new InMemoryRetryQueue(
+    async ({ phoneNumber, message }) => {
+      await whatsappGateway.sendMessage(phoneNumber, message);
+    },
+    { concurrency: 2, maxAttempts: 5, baseDelayMs: 2000 }
+  );
+  console.log("⚠️ File d'attente WhatsApp : en mémoire (repli, non persistante — configure REDIS_URL + bullmq/ioredis pour la version production complète)");
+}
+
+// Point d'entrée unique pour empiler un envoi WhatsApp sortant, quelle que soit la file utilisée.
+async function enqueueWhatsAppSend(phoneNumber, message) {
+  if (useRedisQueue) {
+    await whatsappQueue.add(
+      "send",
+      { phoneNumber, message },
+      { attempts: 5, backoff: { type: "exponential", delay: 2000 }, removeOnComplete: 100, removeOnFail: 500 }
+    );
+  } else {
+    inMemoryWhatsappQueue.push({ phoneNumber, message });
+  }
+}
+
+// Envoi WhatsApp "intelligent" : utilise la nouvelle passerelle (avec file d'attente)
+// si elle est configurée, sinon retombe sur l'ancien whatsapp-web.js (legacy, direct, sans retry).
+async function sendWhatsAppSmart(userId, phoneNumber, message) {
+  if (whatsappGateway.configured()) {
+    await enqueueWhatsAppSend(phoneNumber, message);
+    return { success: true, queued: true, provider: "gateway" };
+  }
+  const result = await whatsappManager.sendMessage(userId, phoneNumber, message);
+  return { ...result, provider: "legacy-whatsapp-web.js" };
+}
+
+// Validation de la signature du webhook WhatsApp entrant.
+// Accepte soit une clé partagée dans le header `apikey`, soit une signature HMAC-SHA256
+// (header `x-webhook-signature` ou `x-hub-signature-256`) calculée sur le corps brut.
+function verifyWhatsappWebhookSignature(req) {
+  const secret = process.env.WHATSAPP_WEBHOOK_SECRET;
+  if (!secret) return true; // pas de secret configuré = validation désactivée (à éviter en prod)
+
+  const providedApiKey = req.headers["apikey"];
+  if (providedApiKey && providedApiKey === secret) return true;
+
+  const signatureHeader = req.headers["x-webhook-signature"] || req.headers["x-hub-signature-256"];
+  if (signatureHeader && req.rawBody) {
+    const expected = crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
+    const provided = String(signatureHeader).replace(/^sha256=/, "");
+    try {
+      return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(provided, "hex"));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+// ==================== GESTION WHATSAPP LEGACY (whatsapp-web.js / Puppeteer) ====================
+// Conservée pour compatibilité ascendante avec /api/whatsapp/connect et /api/whatsapp/send.
 class WhatsAppManager {
   constructor() {
     this.clients = new Map();
@@ -533,9 +876,9 @@ class WhatsAppManager {
           color: { dark: "#000000", light: "#FFFFFF" }
         });
         sessionData.qrCode = qrDataUrl;
-        console.log(`📱 QR Code généré pour ${userId}`);
+        console.log(`📱 QR Code (legacy) généré pour ${userId}`);
       } catch (error) {
-        console.error("❌ Erreur génération QR:", error.message);
+        console.error("❌ Erreur génération QR (legacy):", error.message);
       }
     });
 
@@ -543,18 +886,18 @@ class WhatsAppManager {
       sessionData.ready = true;
       sessionData.qrCode = null;
       db.run("UPDATE users SET whatsapp_connected = 1 WHERE id = ?", [userId]);
-      console.log(`✅ WhatsApp connecté pour ${userId}`);
+      console.log(`✅ WhatsApp (legacy) connecté pour ${userId}`);
     });
 
     client.on("auth_failure", (msg) => {
-      console.error(`❌ Échec d'authentification WhatsApp pour ${userId}:`, msg);
+      console.error(`❌ Échec d'authentification WhatsApp (legacy) pour ${userId}:`, msg);
       sessionData.ready = false;
     });
 
     client.on("disconnected", (reason) => {
       sessionData.ready = false;
       db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
-      console.warn(`⚠️ WhatsApp déconnecté pour ${userId}: ${reason}`);
+      console.warn(`⚠️ WhatsApp (legacy) déconnecté pour ${userId}: ${reason}`);
       this.clients.delete(userId);
     });
 
@@ -575,7 +918,7 @@ class WhatsAppManager {
   async sendMessage(userId, to, message) {
     const session = this.clients.get(userId);
     if (!session || !session.ready) {
-      const error = new Error("WhatsApp non connecté");
+      const error = new Error("WhatsApp (legacy) non connecté");
       error.code = "WHATSAPP_NOT_CONNECTED";
       throw error;
     }
@@ -605,7 +948,7 @@ class WhatsAppManager {
         try {
           await session.client.destroy();
         } catch (e) {
-          console.error(`⚠️ Erreur fermeture client WhatsApp (${userId}):`, e.message);
+          console.error(`⚠️ Erreur fermeture client WhatsApp legacy (${userId}):`, e.message);
         }
       }
     }
@@ -651,7 +994,6 @@ async function callLLM(messages) {
     }
   }
 
-  // Fallback OpenRouter
   const fallback = LLM_PROVIDERS.OPENROUTER;
   if (!fallback.apiKey) throw new Error("OPENROUTER_API_KEY non configurée pour le fallback");
 
@@ -682,23 +1024,19 @@ async function callLLM(messages) {
 }
 
 // ==================== BOUCLE REACT ====================
-async function handleChat(userId, userMessage) {
-  const sessionId = `user_${userId}`;
-  await getSession(sessionId, userId);
+// context : { conversationId, userId, message, googleAccessToken, channel }
+async function handleChat({ conversationId, userId, message, googleAccessToken = null, channel = "web" }) {
+  await getSession(conversationId, userId);
 
-  // Vérifier l'intention active
-  const activeIntent = await getActiveIntent(sessionId);
+  const activeIntent = await getActiveIntent(conversationId);
   if (activeIntent) {
-    return await handleActiveIntent(sessionId, activeIntent, userMessage);
+    return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken });
   }
 
-  // Récupérer l'historique
-  const history = await getHistory(sessionId);
+  const history = await getHistory(conversationId);
+  await saveMessage(conversationId, "user", message);
 
-  // Sauvegarder le message utilisateur
-  await saveMessage(sessionId, "user", userMessage);
-
-  const messages = [...history, { role: "user", content: userMessage }];
+  const messages = [...history, { role: "user", content: message }];
 
   let keepRunning = true;
   let maxLoops = 5;
@@ -726,32 +1064,39 @@ async function handleChat(userId, userMessage) {
             case "search_images":
               toolResult = await searchWikimediaImages(toolCall.arguments?.query);
               if (toolResult.images) {
-                imageUrls = toolResult.images.map((img) => img.url);
+                imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
               }
               break;
+
             case "search_web":
               toolResult = await searchWeb(toolCall.arguments?.query);
               break;
+
             case "send_email":
-              toolResult = await sendEmail(
-                toolCall.arguments?.to,
-                toolCall.arguments?.subject,
-                toolCall.arguments?.body
-              );
+              toolResult = await dispatchSendEmail({
+                googleAccessToken,
+                recipient: toolCall.arguments?.recipient || toolCall.arguments?.to,
+                subject: toolCall.arguments?.subject,
+                body: toolCall.arguments?.body
+              });
               break;
+
+            // "send_whatsapp" conservé en alias pour compatibilité avec d'anciens prompts/clients.
+            case "send_whatsapp_message":
             case "send_whatsapp":
-              toolResult = await whatsappManager.sendMessage(
+              toolResult = await sendWhatsAppSmart(
                 userId,
-                toolCall.arguments?.to,
+                toolCall.arguments?.phone_number || toolCall.arguments?.to,
                 toolCall.arguments?.message
               );
               break;
+
             default:
               toolResult = { error: "Outil inconnu" };
           }
         } catch (toolError) {
           console.error(`❌ Erreur outil ${toolCall.name}:`, toolError.message);
-          toolResult = { error: toolError.message };
+          toolResult = { success: false, error: toolError.message };
         }
 
         messages.push({
@@ -760,7 +1105,6 @@ async function handleChat(userId, userMessage) {
         });
       }
 
-      // Demander au LLM de formuler la réponse finale avec les résultats
       messages.push({
         role: "user",
         content: "Formule maintenant ta réponse finale complète avec les résultats des outils."
@@ -777,14 +1121,12 @@ async function handleChat(userId, userMessage) {
     finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
   }
 
-  // Ajouter les images en Markdown
   if (imageUrls.length > 0) {
     const imageMarkdown = imageUrls.map((url, index) => `![Image ${index + 1}](${url})`).join("\n\n");
     finalResponse += `\n\n---\n\n📷 **Illustrations :**\n\n${imageMarkdown}`;
   }
 
-  // Sauvegarder la réponse
-  await saveMessage(sessionId, "assistant", finalResponse);
+  await saveMessage(conversationId, "assistant", finalResponse);
 
   return {
     reply: finalResponse,
@@ -793,8 +1135,10 @@ async function handleChat(userId, userMessage) {
   };
 }
 
-// ==================== GESTION DES INTENTIONS ====================
-async function handleActiveIntent(sessionId, activeIntent, userMessage) {
+// ==================== GESTION DES INTENTIONS GUIDÉES (multi-tour) ====================
+async function handleActiveIntent(conversationId, activeIntent, userMessage, context = {}) {
+  const { userId, googleAccessToken } = context;
+
   switch (activeIntent.type) {
     case "WHATSAPP": {
       const data = activeIntent.data;
@@ -802,12 +1146,12 @@ async function handleActiveIntent(sessionId, activeIntent, userMessage) {
       if (data.step === "NEED_NUMBER") {
         const phoneRegex = /^(\+?\d{1,3}[-.\s]?)?\d{9,15}$/;
         if (phoneRegex.test(userMessage.trim())) {
-          await setActiveIntent(sessionId, "WHATSAPP", {
+          await setActiveIntent(conversationId, "WHATSAPP", {
             step: "NEED_MESSAGE",
             recipient: userMessage.trim()
           });
-          await saveMessage(sessionId, "user", userMessage);
-          await saveMessage(sessionId, "assistant", `✅ Numéro enregistré. Quel message voulez-vous envoyer ?`);
+          await saveMessage(conversationId, "user", userMessage);
+          await saveMessage(conversationId, "assistant", `✅ Numéro enregistré. Quel message voulez-vous envoyer ?`);
 
           return {
             reply: `✅ Numéro enregistré. Quel message voulez-vous envoyer à ${userMessage.trim()} ?`,
@@ -823,13 +1167,19 @@ async function handleActiveIntent(sessionId, activeIntent, userMessage) {
 
       if (data.step === "NEED_MESSAGE") {
         try {
-          await whatsappManager.sendMessage(sessionId.replace("user_", ""), data.recipient, userMessage);
-          await clearActiveIntent(sessionId);
-          await saveMessage(sessionId, "user", userMessage);
-          await saveMessage(sessionId, "assistant", `✅ Message envoyé à ${data.recipient}`);
+          const result = await sendWhatsAppSmart(userId, data.recipient, userMessage);
+          await clearActiveIntent(conversationId);
+          await saveMessage(conversationId, "user", userMessage);
+          await saveMessage(
+            conversationId,
+            "assistant",
+            result.queued ? `✅ Message mis en file d'envoi vers ${data.recipient}` : `✅ Message envoyé à ${data.recipient}`
+          );
 
           return {
-            reply: `✅ Message WhatsApp envoyé avec succès à ${data.recipient} !`,
+            reply: result.queued
+              ? `✅ Message WhatsApp mis en file d'envoi vers ${data.recipient} !`
+              : `✅ Message WhatsApp envoyé avec succès à ${data.recipient} !`,
             error: false
           };
         } catch (error) {
@@ -848,7 +1198,7 @@ async function handleActiveIntent(sessionId, activeIntent, userMessage) {
       if (data.step === "NEED_RECIPIENT") {
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (emailRegex.test(userMessage.trim())) {
-          await setActiveIntent(sessionId, "EMAIL", {
+          await setActiveIntent(conversationId, "EMAIL", {
             step: "NEED_SUBJECT",
             recipient: userMessage.trim()
           });
@@ -864,7 +1214,7 @@ async function handleActiveIntent(sessionId, activeIntent, userMessage) {
       }
 
       if (data.step === "NEED_SUBJECT") {
-        await setActiveIntent(sessionId, "EMAIL", {
+        await setActiveIntent(conversationId, "EMAIL", {
           step: "NEED_BODY",
           recipient: data.recipient,
           subject: userMessage
@@ -876,12 +1226,17 @@ async function handleActiveIntent(sessionId, activeIntent, userMessage) {
       }
 
       if (data.step === "NEED_BODY") {
-        const result = await sendEmail(data.recipient, data.subject, userMessage);
-        await clearActiveIntent(sessionId);
+        const result = await dispatchSendEmail({
+          googleAccessToken,
+          recipient: data.recipient,
+          subject: data.subject,
+          body: userMessage
+        });
+        await clearActiveIntent(conversationId);
 
         if (result.success) {
           return {
-            reply: `✅ Email envoyé à ${data.recipient} !`,
+            reply: `✅ Email envoyé à ${data.recipient} (via ${result.provider}) !`,
             error: false
           };
         }
@@ -894,7 +1249,7 @@ async function handleActiveIntent(sessionId, activeIntent, userMessage) {
     }
   }
 
-  await clearActiveIntent(sessionId);
+  await clearActiveIntent(conversationId);
   return { reply: "Je ne comprends plus l'action. Recommençons.", error: true };
 }
 
@@ -922,24 +1277,33 @@ app.get(
         uptime: process.uptime(),
         memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
         database: dbOk ? "ok" : "erreur",
-        whatsappSessionsActives: whatsappManager.clients.size,
+        whatsapp: {
+          gatewayConfigured: whatsappGateway.configured(),
+          legacySessionsActives: whatsappManager.clients.size,
+          queue: useRedisQueue ? "bullmq+redis" : "memoire (repli)"
+        },
         llmProviders: {
           groq: Boolean(LLM_PROVIDERS.GROQ.apiKey),
           openrouter: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey)
         },
-        smtp: Boolean(emailTransporter)
+        email: {
+          smtp: Boolean(emailTransporter),
+          gmailOAuth: "à la demande (token transmis par requête)"
+        }
       }
     });
   })
 );
 
-// ==================== ROUTE CHAT PRINCIPALE ====================
+// ==================== ROUTE CHAT PRINCIPALE (isolée par conversation_id) ====================
 app.post(
   "/api/chat",
   apiLimiter,
   authenticateUser,
   asyncHandler(async (req, res) => {
     const message = req.body.message;
+    let conversationId = req.body.conversationId || req.body.conversation_id;
+    let isNewConversation = false;
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
       return res.status(200).json({
@@ -955,20 +1319,128 @@ app.post(
       });
     }
 
+    // conversation_id requis : si absent, on en génère un nouveau et on le renvoie au
+    // frontend, qui doit le persister (localStorage, etc.) pour les tours suivants.
+    if (!conversationId || typeof conversationId !== "string") {
+      conversationId = `conv_${crypto.randomUUID()}`;
+      isNewConversation = true;
+    }
+
     try {
-      const result = await handleChat(req.userId, message.trim());
-      return res.status(200).json(result);
+      await assertConversationOwnership(conversationId, req.userId);
+    } catch (error) {
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
+    }
+
+    const googleAccessToken = extractGoogleAccessToken(req);
+
+    try {
+      const result = await handleChat({
+        conversationId,
+        userId: req.userId,
+        message: message.trim(),
+        googleAccessToken,
+        channel: "web"
+      });
+      return res.status(200).json({ ...result, conversationId, isNewConversation });
     } catch (error) {
       console.error("❌ Erreur /api/chat:", error.message);
       return res.status(200).json({
         reply: "⚠️ Une erreur est survenue. Veuillez réessayer.",
-        error: true
+        error: true,
+        conversationId
       });
     }
   })
 );
 
-// ==================== ROUTE CONNEXION WHATSAPP ====================
+// ==================== ROUTES WHATSAPP — NOUVELLE PASSERELLE (Evolution API) ====================
+
+// Pairing : génère/retourne le QR code de connexion de l'instance WhatsApp.
+// Protégée par ADMIN_API_KEY si définie (opération d'infrastructure, pas liée à un chat précis).
+app.get(
+  "/api/whatsapp/qr",
+  strictLimiter,
+  asyncHandler(async (req, res) => {
+    if (process.env.ADMIN_API_KEY && req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
+      return res.status(401).json({ error: true, reply: "⚠️ Non autorisé." });
+    }
+
+    try {
+      const data = await whatsappGateway.getQRCode();
+      return res.status(200).json({ reply: "📱 QR Code généré.", error: false, data });
+    } catch (error) {
+      console.error("❌ Erreur QR WhatsApp (gateway):", error.message);
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
+    }
+  })
+);
+
+// Statut de connexion de l'instance WhatsApp (connecté / déconnecté / en attente).
+app.get(
+  "/api/whatsapp/status",
+  strictLimiter,
+  asyncHandler(async (req, res) => {
+    try {
+      const data = await whatsappGateway.getStatus();
+      return res.status(200).json({ reply: "Statut récupéré.", error: false, data });
+    } catch (error) {
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
+    }
+  })
+);
+
+// Webhook de réception des messages WhatsApp entrants depuis la passerelle.
+// Le numéro de téléphone de l'expéditeur sert de conversation_id pour ce canal.
+app.post(
+  "/api/whatsapp/webhook",
+  webhookLimiter,
+  asyncHandler(async (req, res) => {
+    if (!verifyWhatsappWebhookSignature(req)) {
+      console.warn("⚠️ Webhook WhatsApp: signature invalide ou manquante");
+      return res.status(401).json({ error: true, reply: "Signature invalide." });
+    }
+
+    // Réponse immédiate : la plupart des passerelles WhatsApp attendent un 200 rapide
+    // et retentent l'envoi du webhook si la réponse tarde trop.
+    res.status(200).json({ received: true });
+
+    try {
+      const payload = req.body;
+      // Convention Evolution API : payload.data.key.remoteJid / payload.data.message.conversation
+      const remoteJid = payload?.data?.key?.remoteJid || payload?.data?.from;
+      const fromMe = payload?.data?.key?.fromMe;
+      const text =
+        payload?.data?.message?.conversation ||
+        payload?.data?.message?.extendedTextMessage?.text ||
+        payload?.data?.body;
+
+      if (!remoteJid || fromMe || !text) return; // ignore les messages sortants ou événements sans texte
+
+      const phoneNumber = String(remoteJid).replace(/@.*$/, "");
+      const conversationId = `whatsapp_${phoneNumber}`;
+
+      const result = await handleChat({
+        conversationId,
+        userId: conversationId, // sur ce canal, le numéro de téléphone fait office d'identité
+        message: String(text).slice(0, CONFIG.MAX_MESSAGE_LENGTH),
+        channel: "whatsapp"
+      });
+
+      if (result?.reply) {
+        // On retire le markdown d'images avant l'envoi WhatsApp (pas de rendu markdown côté WhatsApp).
+        const plainReply = result.reply.replace(/!\[.*?\]\(.*?\)/g, "").trim();
+        await enqueueWhatsAppSend(phoneNumber, plainReply || "🙂");
+      }
+    } catch (error) {
+      console.error("❌ Erreur traitement webhook WhatsApp:", error.message);
+    }
+  })
+);
+
+// ==================== ROUTES WHATSAPP — LEGACY (whatsapp-web.js) ====================
+// Conservées telles quelles pour compatibilité ascendante avec le frontend existant.
+
 app.post(
   "/api/whatsapp/connect",
   strictLimiter,
@@ -984,7 +1456,6 @@ app.post(
         });
       }
 
-      // Attendre le QR code
       let qrCode = null;
       const startTime = Date.now();
 
@@ -1006,7 +1477,7 @@ app.post(
         error: true
       });
     } catch (error) {
-      console.error("❌ Erreur WhatsApp connect:", error.message);
+      console.error("❌ Erreur WhatsApp connect (legacy):", error.message);
       return res.status(200).json({
         reply: "⚠️ Erreur lors de la connexion WhatsApp.",
         error: true
@@ -1015,7 +1486,6 @@ app.post(
   })
 );
 
-// ==================== ROUTE ENVOI WHATSAPP ====================
 app.post(
   "/api/whatsapp/send",
   strictLimiter,
@@ -1045,17 +1515,29 @@ app.post(
   })
 );
 
-// ==================== ROUTE INITIALISATION D'INTENTION ====================
+// ==================== ROUTE INITIALISATION D'INTENTION (multi-tour, requiert conversationId) ====================
 app.post(
   "/api/intent/init",
   apiLimiter,
   authenticateUser,
   asyncHandler(async (req, res) => {
-    const { intentType } = req.body;
-    const sessionId = `user_${req.userId}`;
+    const { intentType, conversationId, conversation_id: conversationIdSnake } = req.body;
+    const convId = conversationId || conversationIdSnake;
+
+    if (!convId || typeof convId !== "string") {
+      return res.status(200).json({ reply: "⚠️ Le paramètre 'conversationId' est obligatoire.", error: true });
+    }
+
+    try {
+      await assertConversationOwnership(convId, req.userId);
+    } catch (error) {
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
+    }
+
+    await getSession(convId, req.userId);
 
     if (intentType === "WHATSAPP") {
-      await setActiveIntent(sessionId, "WHATSAPP", { step: "NEED_NUMBER" });
+      await setActiveIntent(convId, "WHATSAPP", { step: "NEED_NUMBER" });
       return res.status(200).json({
         reply: "📱 Envoi WhatsApp initié. Quel est le numéro du destinataire ?",
         error: false
@@ -1063,7 +1545,7 @@ app.post(
     }
 
     if (intentType === "EMAIL") {
-      await setActiveIntent(sessionId, "EMAIL", { step: "NEED_RECIPIENT" });
+      await setActiveIntent(convId, "EMAIL", { step: "NEED_RECIPIENT" });
       return res.status(200).json({
         reply: "📧 Envoi d'email initié. Quelle est l'adresse du destinataire ?",
         error: false
@@ -1077,18 +1559,28 @@ app.post(
   })
 );
 
-// ==================== ROUTE EFFACER MÉMOIRE ====================
+// ==================== ROUTE EFFACER MÉMOIRE (par conversation_id) ====================
 app.post(
   "/api/memory/clear",
   authenticateUser,
   asyncHandler(async (req, res) => {
-    const sessionId = `user_${req.userId}`;
+    const conversationId = req.body.conversationId || req.body.conversation_id;
 
-    await dbRun("DELETE FROM messages WHERE session_id = ?", [sessionId]);
-    await clearActiveIntent(sessionId);
+    if (!conversationId || typeof conversationId !== "string") {
+      return res.status(200).json({ reply: "⚠️ Le paramètre 'conversationId' est obligatoire.", error: true });
+    }
+
+    try {
+      await assertConversationOwnership(conversationId, req.userId);
+    } catch (error) {
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
+    }
+
+    await dbRun("DELETE FROM messages WHERE session_id = ?", [conversationId]);
+    await clearActiveIntent(conversationId);
 
     return res.status(200).json({
-      reply: "✅ Mémoire effacée.",
+      reply: "✅ Mémoire de cette conversation effacée.",
       error: false
     });
   })
@@ -1105,8 +1597,11 @@ app.use((req, res) => {
       "GET /",
       "GET /api/health",
       "POST /api/chat",
-      "POST /api/whatsapp/connect",
-      "POST /api/whatsapp/send",
+      "GET /api/whatsapp/qr",
+      "GET /api/whatsapp/status",
+      "POST /api/whatsapp/webhook",
+      "POST /api/whatsapp/connect (legacy)",
+      "POST /api/whatsapp/send (legacy)",
       "POST /api/intent/init",
       "POST /api/memory/clear"
     ]
@@ -1114,9 +1609,6 @@ app.use((req, res) => {
 });
 
 // ==================== GESTIONNAIRE D'ERREURS GLOBAL ====================
-// Filet de sécurité final : capture les erreurs de parsing JSON (body-parser),
-// les erreurs CORS, et toute exception non gérée remontée par asyncHandler,
-// pour ne jamais laisser une requête sans réponse ni faire planter le process.
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed") {
     return res.status(200).json({ reply: "⚠️ Corps de requête JSON invalide.", error: true });
@@ -1142,11 +1634,12 @@ const server = app.listen(PORT, () => {
   console.log("=".repeat(60));
   console.log(`🔢 Version : ${CONFIG.VERSION}`);
   console.log(`🔌 Port : ${PORT}`);
-  console.log(`🧠 Mémoire : SQLite (persistante)`);
+  console.log(`🧠 Mémoire : SQLite, isolée par conversation_id`);
   console.log(`🔄 Boucle ReAct : Activée`);
-  console.log(`🎯 Machine à états : Activée`);
-  console.log(`🖼️ Images Wikimedia : Activé`);
-  console.log(`📱 WhatsApp QR Code : Activé`);
+  console.log(`📧 Email : Gmail API (OAuth) + fallback SMTP (${emailTransporter ? "configuré" : "non configuré"})`);
+  console.log(`📱 WhatsApp gateway (Evolution API) : ${whatsappGateway.configured() ? "configurée" : "NON configurée"}`);
+  console.log(`📱 WhatsApp legacy (whatsapp-web.js) : conservée pour compatibilité`);
+  console.log(`📬 File d'attente WhatsApp : ${useRedisQueue ? "BullMQ + Redis" : "en mémoire (repli)"}`);
   console.log(`🌐 Origines CORS autorisées : ${ALLOWED_ORIGINS.join(", ")}`);
   console.log("=".repeat(60) + "\n");
 });
@@ -1171,6 +1664,8 @@ async function gracefulShutdown(signal) {
 
   try {
     await whatsappManager.destroyAll();
+    if (whatsappWorker) await whatsappWorker.close();
+    if (whatsappQueue) await whatsappQueue.close();
     if (emailTransporter) emailTransporter.close();
 
     await new Promise((resolve) => {
