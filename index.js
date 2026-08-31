@@ -1,27 +1,23 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
 // Architecture : Backend (Cerveau) → Frontend (Corps)
-// Technologies : Express, SQLite, whatsapp-web.js (legacy), Evolution API (gateway WhatsApp),
-//                BullMQ/Redis (file d'attente, optionnel), axios, Groq (Principal),
-//                OpenRouter (Fallback), Nodemailer (fallback email), Gmail API (email OAuth)
-// Format de réponse standardisé : { reply, images (optionnel), qrCode (optionnel), error }
-// Version : 7.0.0 - Contexte par conversation_id, Function Calling email/WhatsApp réels,
-//                    passerelle WhatsApp open-source, file d'attente résiliente
+// Technologies : Express, SQLite, @whiskeysockets/baileys (WhatsApp, WebSocket natif,
+//                AUCUN Chrome requis), axios, Groq + OpenRouter (routage multi-tier),
+//                BullMQ/Redis (file d'attente, optionnel), Nodemailer/Resend/Gmail API (email)
+// Format de réponse standardisé : { reply, images (optionnel), qrCode (optionnel), error, providerUsed }
+// Version : 8.0.0 - Routage multi-tier v100/v250, fix Wikimedia 403, WhatsApp via Baileys
 //
 // ⚠️ NOTES DE MIGRATION IMPORTANTES :
-// - Les routes historiques /api/whatsapp/connect et /api/whatsapp/send (whatsapp-web.js /
-//   Puppeteer) sont CONSERVÉES pour compatibilité, mais sont désormais considérées "legacy".
-// - Le nouveau chemin recommandé pour la prod est la passerelle REST (Evolution API ou
-//   équivalent) pilotée via WHATSAPP_GATEWAY_URL / WHATSAPP_GATEWAY_API_KEY, avec les routes
-//   /api/whatsapp/qr, /api/whatsapp/status et /api/whatsapp/webhook.
-// - Les chemins REST de whatsappGateway suivent la convention Evolution API
-//   (https://github.com/EvolutionAPI/evolution-api). Si tu utilises une autre passerelle,
-//   adapte uniquement le bloc `whatsappGateway` ci-dessous.
-// - Pour le Function Calling email, envoie le token OAuth Google dans le header
-//   `Authorization: Bearer <access_token>` (ou `X-Google-Access-Token`) depuis le frontend.
-//   Sans ce token, l'envoi retombe automatiquement sur le SMTP (Nodemailer) déjà configuré.
-// - Pour la file d'attente WhatsApp résiliente, configure REDIS_URL et installe
-//   les paquets `bullmq` et `ioredis` (npm install bullmq ioredis). Sans Redis, une file en
-//   mémoire avec retry/backoff est utilisée automatiquement (non persistante entre redéploiements).
+// - whatsapp-web.js / Puppeteer / Chrome ont été ENTIÈREMENT RETIRÉS. Plus besoin de
+//   Dockerfile avec Chromium : ce backend tourne maintenant nativement sur Render en
+//   environnement Node standard (aucune dépendance système supplémentaire).
+// - Les routes /api/whatsapp/connect et /api/whatsapp/send gardent la MÊME interface
+//   qu'avant, mais sont maintenant servies par Baileys (WebSocket direct) en interne.
+// - La passerelle externe (Evolution API : /api/whatsapp/qr, /api/whatsapp/status,
+//   /api/whatsapp/webhook) reste disponible en option pour qui veut un microservice
+//   WhatsApp séparé, mais n'est plus nécessaire pour un usage simple : Baileys suffit.
+// - Nouveau paramètre `modelTier` sur POST /api/chat : "v100" (rapide, Groq + fallback
+//   OpenRouter) ou "v250" (raisonnement DeepSeek-R1 puis génération de code, 2 appels
+//   séquentiels OpenRouter/Groq). La réponse inclut toujours `providerUsed`.
 
 require("dotenv").config();
 
@@ -32,24 +28,32 @@ const rateLimit = require("express-rate-limit");
 const axios = require("axios");
 const qrcode = require("qrcode");
 const nodemailer = require("nodemailer");
-const { Client, LocalAuth } = require("whatsapp-web.js");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const pino = require("pino");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} = require("@whiskeysockets/baileys");
 
 // ==================== CONFIGURATION GLOBALE ====================
 const CONFIG = {
   PORT: process.env.PORT || 3000,
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "7.0.0",
+  VERSION: "8.0.0",
   AGENT_NAME: "Luba",
   MAX_MESSAGE_LENGTH: 2000,
   MAX_HISTORY_LENGTH: 15,
   IMAGE_SEARCH_LIMIT: 6,
+  WIKIMEDIA_USER_AGENT: process.env.WIKIMEDIA_USER_AGENT || "LubaAI-App/1.0 (contact@luba.ia)",
   WHATSAPP_QR_TIMEOUT: 30000,
   WHATSAPP_RETRY_DELAY: 3000,
-  WHATSAPP_MAX_RETRIES: 2,
+  V250_STEP_TIMEOUT: 40000,
+  V250_ROUTE_TIMEOUT: 90000,
   DB_PATH: path.join(__dirname, "data", "luba.db"),
   SESSIONS_PATH: path.join(__dirname, "sessions")
 };
@@ -66,11 +70,8 @@ if (missingEnvVars.length > 0) {
   console.error("⚠️ Le service d'IA ne fonctionnera pas sans ces clés.");
 }
 
-if (!process.env.WHATSAPP_GATEWAY_URL) {
-  console.warn("⚠️ WHATSAPP_GATEWAY_URL non configurée — la passerelle WhatsApp open-source (Evolution API) est désactivée.");
-}
 if (!process.env.WHATSAPP_WEBHOOK_SECRET) {
-  console.warn("⚠️ WHATSAPP_WEBHOOK_SECRET non configuré — le webhook WhatsApp acceptera des requêtes NON authentifiées. À définir avant la mise en prod.");
+  console.warn("⚠️ WHATSAPP_WEBHOOK_SECRET non configuré — le webhook WhatsApp (Evolution API, optionnel) accepterait des requêtes NON authentifiées.");
 }
 if (!process.env.REDIS_URL) {
   console.warn("⚠️ REDIS_URL non configurée — file d'attente WhatsApp en mémoire (non persistante entre redémarrages).");
@@ -102,10 +103,6 @@ db.run("PRAGMA busy_timeout = 5000;");
 db.run("PRAGMA temp_store = MEMORY;");
 db.run("PRAGMA foreign_keys = ON;");
 
-// NOTE SCHÉMA : la colonne `session_id` de `sessions` et `messages` est désormais
-// utilisée comme `conversation_id` au niveau de l'API. Aucune migration de schéma
-// n'est nécessaire : c'est la même colonne, juste une sémantique plus précise
-// (une ligne = une conversation isolée, identifiée par conversation_id).
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -169,17 +166,14 @@ db.serialize(() => {
 
 console.log("✅ Base de données SQLite initialisée");
 
-// ==================== CONFIGURATION NODEMAILER (fallback SMTP) ====================
+// ==================== CONFIGURATION NODEMAILER (dernier recours) ====================
 let emailTransporter = null;
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   emailTransporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT || "587", 10),
     secure: process.env.SMTP_PORT === "465",
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    },
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     tls: { rejectUnauthorized: false },
     pool: true,
     maxConnections: 3,
@@ -188,17 +182,13 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
 
   emailTransporter.verify((err) => {
     if (err) console.error("⚠️ SMTP non joignable:", err.message);
-    else console.log("✅ SMTP prêt (fallback email)");
+    else console.log("✅ SMTP prêt (dernier recours email)");
   });
-} else {
-  console.warn("⚠️ SMTP non configuré — le fallback email sera désactivé (Gmail API OAuth reste possible).");
 }
 
 // ==================== INITIALISATION EXPRESS ====================
 const app = express();
 
-// Nécessaire derrière le proxy inverse de Render pour que express-rate-limit
-// et req.ip identifient correctement l'IP réelle du client.
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
@@ -206,7 +196,7 @@ app.disable("x-powered-by");
 const ALLOWED_ORIGINS = [
   "https://luba-ia.web.app",
   "https://luba-ia.firebaseapp.com",
-  "https://milo-ead21.web.app", // legacy, conservé pour compatibilité
+  "https://milo-ead21.web.app",
   "http://localhost:3000",
   "http://localhost:8080",
   "http://localhost:5173"
@@ -215,9 +205,8 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-        callback(null, true);
-      } else {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) callback(null, true);
+      else {
         console.warn(`⚠️ Origine CORS refusée: ${origin}`);
         callback(new Error("Origine non autorisée"));
       }
@@ -230,9 +219,6 @@ app.use(
 );
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }));
-
-// `verify` conserve le corps brut de la requête : indispensable pour valider la
-// signature HMAC des webhooks WhatsApp (voir verifyWhatsappWebhookSignature).
 app.use(
   express.json({
     limit: "10mb",
@@ -243,18 +229,13 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// ==================== RATE LIMITER ====================
+// ==================== RATE LIMITERS ====================
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
-  handler: (req, res) => {
-    return res.status(200).json({
-      reply: "⚠️ Trop de requêtes. Veuillez réessayer dans 15 minutes.",
-      error: true
-    });
-  }
+  handler: (req, res) => res.status(200).json({ reply: "⚠️ Trop de requêtes. Veuillez réessayer dans 15 minutes.", error: true })
 });
 
 const strictLimiter = rateLimit({
@@ -262,16 +243,9 @@ const strictLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  handler: (req, res) => {
-    return res.status(200).json({
-      reply: "⚠️ Limite de requêtes atteinte.",
-      error: true
-    });
-  }
+  handler: (req, res) => res.status(200).json({ reply: "⚠️ Limite de requêtes atteinte.", error: true })
 });
 
-// Limiteur dédié au webhook WhatsApp entrant (trafic potentiellement élevé, mais
-// on ne veut pas bloquer la passerelle si elle retente un envoi).
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 120,
@@ -309,13 +283,11 @@ function dbGet(query, params) {
     db.get(query, params, (err, row) => (err ? reject(err) : resolve(row)));
   });
 }
-
 function dbAll(query, params) {
   return new Promise((resolve, reject) => {
     db.all(query, params, (err, rows) => (err ? reject(err) : resolve(rows)));
   });
 }
-
 function dbRun(query, params) {
   return new Promise((resolve, reject) => {
     db.run(query, params, function (err) {
@@ -330,23 +302,18 @@ const authenticateUser = asyncHandler(async (req, res, next) => {
   const userId = req.body.userId || req.query.userId || req.headers["x-user-id"];
 
   if (!userId || typeof userId !== "string" || userId.trim().length === 0) {
-    return res.status(200).json({
-      reply: "⚠️ Authentification requise. Veuillez fournir un userId.",
-      error: true
-    });
+    return res.status(200).json({ reply: "⚠️ Authentification requise. Veuillez fournir un userId.", error: true });
   }
 
   req.userId = userId.trim();
 
   try {
     const user = await dbGet("SELECT * FROM users WHERE id = ?", [req.userId]);
-
     if (!user) {
       const safeDisplayName =
         typeof req.body.displayName === "string" ? req.body.displayName.slice(0, 120) : req.userId;
       await dbRun("INSERT INTO users (id, display_name) VALUES (?, ?)", [req.userId, safeDisplayName]);
     }
-
     next();
   } catch (err) {
     console.error("❌ Erreur authentification:", err.message);
@@ -354,16 +321,10 @@ const authenticateUser = asyncHandler(async (req, res, next) => {
   }
 });
 
-// Extrait un token d'accès OAuth Google depuis l'en-tête Authorization (Bearer)
-// ou depuis X-Google-Access-Token. Utilisé uniquement pour le Function Calling email.
 function extractGoogleAccessToken(req) {
   const authHeader = req.headers.authorization || req.headers.Authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.slice(7).trim();
-  }
-  if (req.headers["x-google-access-token"]) {
-    return String(req.headers["x-google-access-token"]).trim();
-  }
+  if (authHeader && authHeader.startsWith("Bearer ")) return authHeader.slice(7).trim();
+  if (req.headers["x-google-access-token"]) return String(req.headers["x-google-access-token"]).trim();
   return null;
 }
 
@@ -379,7 +340,7 @@ IDENTITÉ (à respecter strictement) :
 
 RÈGLE STRICTE SUR LES IMAGES (OBLIGATOIRE, SANS EXCEPTION) :
 - Dès que tu décris ou présentes une personnalité, un lieu, un objet, un concept scientifique ou un événement, tu DOIS obligatoirement utiliser l'outil search_images pour illustrer ta réponse.
-- Dès que l'utilisateur te demande une recherche, une information, une actualité, ou pose une question de type "recherche"/"informe-toi"/"cherche" — que tu utilises search_web ou non — tu DOIS TOUJOURS ajouter au moins un appel à search_images en complément, pour illustrer le sujet de la recherche. N'attends JAMAIS que l'utilisateur te demande explicitement une photo : c'est systématique.
+- Dès que l'utilisateur te demande une recherche, une information, une actualité, ou pose une question de type "recherche"/"informe-toi"/"cherche" — que tu utilises search_web ou non — tu DOIS TOUJOURS ajouter au moins un appel à search_images en complément. N'attends JAMAIS que l'utilisateur te demande explicitement une photo : c'est systématique.
 - Un toolCalls vide n'est autorisé que pour une réponse purement conversationnelle qui ne décrit ni sujet, ni lieu, ni recherche d'information (ex: salutation, remerciement, question sur toi-même).
 
 FORMAT DE RÉPONSE OBLIGATOIRE :
@@ -387,10 +348,7 @@ Tu DOIS TOUJOURS répondre au format JSON strict :
 {
   "replyText": "Ta réponse complète en Markdown",
   "toolCalls": [
-    {
-      "name": "search_images",
-      "arguments": { "query": "sujet à illustrer" }
-    }
+    { "name": "search_images", "arguments": { "query": "sujet à illustrer" } }
   ]
 }
 
@@ -403,21 +361,17 @@ OUTILS DISPONIBLES :
 - send_whatsapp_message : Envoyer un message WhatsApp réel (arguments: { phone_number, message })`
 };
 
-// ==================== CONFIGURATION LLM ====================
+// ==================== CONFIGURATION LLM & ROUTAGE MULTI-TIER ====================
 const LLM_PROVIDERS = {
   GROQ: {
-    name: "groq",
     baseURL: "https://api.groq.com/openai/v1",
-    model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
     apiKey: process.env.GROQ_API_KEY,
     timeout: 30000,
     maxTokens: 1500,
     temperature: 0.7
   },
   OPENROUTER: {
-    name: "openrouter",
     baseURL: "https://openrouter.ai/api/v1",
-    model: process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat",
     apiKey: process.env.OPENROUTER_API_KEY,
     timeout: 45000,
     maxTokens: 1500,
@@ -425,18 +379,178 @@ const LLM_PROVIDERS = {
   }
 };
 
-// ==================== GESTION DU CONTEXTE PAR CONVERSATION_ID ====================
-// Chaque conversation (web, WhatsApp, etc.) est isolée par conversation_id. Le
-// contexte chargé pour le LLM ne provient JAMAIS d'une autre conversation.
+// ⚠️ Vérifie ces identifiants de modèles sur les catalogues Groq / OpenRouter au moment
+// du déploiement : ils évoluent fréquemment. Tous surchargeables par variable d'env.
+const MODEL_TIERS = {
+  v100: {
+    primaryProvider: "groq",
+    primaryModel: process.env.GROQ_MODEL_V100 || "openai/gpt-oss-120b",
+    fallbackProvider: "openrouter",
+    fallbackModel: process.env.OPENROUTER_MODEL_V100_FALLBACK || "qwen/qwen-2.5-coder-32b-instruct:free"
+  },
+  v250: {
+    reasoningProvider: "openrouter",
+    reasoningModel: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1",
+    codeProvider: "openrouter",
+    codeModel: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct",
+    codeFallbackProvider: "groq",
+    codeFallbackModel: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "openai/gpt-oss-120b",
+    codeMaxTokens: 4096
+  }
+};
 
+// Appel générique à un fournisseur (Groq ou OpenRouter), au format OpenAI-compatible.
+async function callProviderRaw({ provider, model, messages, jsonMode = false, timeout, maxTokens }) {
+  const cfg = provider === "groq" ? LLM_PROVIDERS.GROQ : LLM_PROVIDERS.OPENROUTER;
+  if (!cfg.apiKey) {
+    const err = new Error(`Clé API manquante pour le fournisseur ${provider}`);
+    err.code = "MISSING_API_KEY";
+    throw err;
+  }
+
+  const payload = {
+    model,
+    messages,
+    temperature: cfg.temperature,
+    max_tokens: maxTokens || cfg.maxTokens
+  };
+  if (jsonMode) payload.response_format = { type: "json_object" };
+
+  const headers = { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" };
+  if (provider === "openrouter") {
+    headers["HTTP-Referer"] = "https://luba-ia.web.app";
+    headers["X-Title"] = "Luba.ia Assistant";
+  }
+
+  const response = await axios.post(`${cfg.baseURL}/chat/completions`, payload, {
+    headers,
+    timeout: timeout || cfg.timeout
+  });
+
+  const content = response.data?.choices?.[0]?.message?.content;
+  if (!content) throw new Error(`Réponse ${provider} vide`);
+
+  return jsonMode ? JSON.parse(content) : content;
+}
+
+// Détermine si une erreur justifie un basculement transparent vers le fournisseur de secours.
+function isFailoverWorthy(error) {
+  const status = error.response?.status;
+  const isTimeout = error.code === "ECONNABORTED" || /timeout/i.test(error.message || "");
+  return status === 429 || status === 500 || status === 503 || isTimeout;
+}
+
+// ---- Tier v100 : rapide & économe, avec bascule transparente Groq → OpenRouter ----
+async function callLLM_v100(messages) {
+  const tier = MODEL_TIERS.v100;
+  const fullMessages = [LUBA_SYSTEM_PROMPT, ...messages];
+
+  try {
+    const result = await callProviderRaw({
+      provider: tier.primaryProvider,
+      model: tier.primaryModel,
+      messages: fullMessages,
+      jsonMode: true
+    });
+    return { ...result, providerUsed: "groq" };
+  } catch (error) {
+    const status = error.response?.status;
+    console.error(`❌ Erreur ${tier.primaryProvider} (v100)${status ? ` [HTTP ${status}]` : ""}:`, error.message);
+    if (!isFailoverWorthy(error)) {
+      console.warn("⚠️ Erreur non standard (ni 429/500/503/timeout) — bascule OpenRouter tentée quand même par prudence.");
+    }
+
+    try {
+      const result = await callProviderRaw({
+        provider: tier.fallbackProvider,
+        model: tier.fallbackModel,
+        messages: fullMessages,
+        jsonMode: true
+      });
+      return { ...result, providerUsed: "openrouter_fallback" };
+    } catch (fallbackError) {
+      console.error(`❌ Erreur ${tier.fallbackProvider} (fallback v100):`, fallbackError.message);
+      throw new Error("Groq et OpenRouter indisponibles (v100)");
+    }
+  }
+}
+
+// ---- Tier v250 : raisonnement (DeepSeek-R1) puis génération de code senior (prompt chaining) ----
+async function callLLM_v250(messages, userMessage) {
+  const tier = MODEL_TIERS.v250;
+
+  const step1Messages = [
+    {
+      role: "system",
+      content:
+        "Analyse ce problème complexe. Effectue les démonstrations mathématiques nécessaires, isole les edge cases et rédige le pseudo-code/l'architecture."
+    },
+    ...messages
+  ];
+
+  let analysis;
+  try {
+    analysis = await callProviderRaw({
+      provider: tier.reasoningProvider,
+      model: tier.reasoningModel,
+      messages: step1Messages,
+      jsonMode: false,
+      timeout: CONFIG.V250_STEP_TIMEOUT
+    });
+  } catch (error) {
+    console.error("❌ Erreur étape 1 (raisonnement, v250):", error.message);
+    throw new Error(`Échec de l'étape de raisonnement (v250): ${error.message}`);
+  }
+
+  const step2Messages = [
+    {
+      role: "system",
+      content: `Génère le code de production complet, typé, sécurisé et documenté en te basant strictement sur le plan ci-dessous.
+
+PLAN / ANALYSE (étape 1 — raisonnement) :
+${analysis}
+
+Tu DOIS répondre au format JSON strict : { "replyText": "réponse complète en Markdown avec le code", "toolCalls": [] }.`
+    },
+    { role: "user", content: userMessage }
+  ];
+
+  try {
+    const result = await callProviderRaw({
+      provider: tier.codeProvider,
+      model: tier.codeModel,
+      messages: step2Messages,
+      jsonMode: true,
+      timeout: CONFIG.V250_STEP_TIMEOUT,
+      maxTokens: tier.codeMaxTokens
+    });
+    return { ...result, providerUsed: "pipeline_v250" };
+  } catch (error) {
+    console.error("❌ Erreur étape 2 (génération de code, v250), tentative de repli:", error.message);
+    try {
+      const result = await callProviderRaw({
+        provider: tier.codeFallbackProvider,
+        model: tier.codeFallbackModel,
+        messages: step2Messages,
+        jsonMode: true,
+        timeout: CONFIG.V250_STEP_TIMEOUT,
+        maxTokens: tier.codeMaxTokens
+      });
+      return { ...result, providerUsed: "pipeline_v250" };
+    } catch (fallbackError) {
+      console.error("❌ Erreur étape 2 de repli (v250):", fallbackError.message);
+      throw new Error(`Échec de l'étape de génération de code (v250): ${fallbackError.message}`);
+    }
+  }
+}
+
+// ==================== GESTION DU CONTEXTE PAR CONVERSATION_ID ====================
 async function getSession(conversationId, userId) {
   const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
-
   if (session) {
     await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
     return session;
   }
-
   await dbRun("INSERT INTO sessions (session_id, user_id) VALUES (?, ?)", [conversationId, userId]);
   return { session_id: conversationId, user_id: userId, active_intent: null, intent_data: null };
 }
@@ -465,7 +579,6 @@ async function setActiveIntent(conversationId, intentType, intentData = {}) {
 async function getActiveIntent(conversationId) {
   const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [conversationId]);
   if (!row || !row.active_intent) return null;
-
   try {
     return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") };
   } catch (e) {
@@ -478,8 +591,6 @@ async function clearActiveIntent(conversationId) {
   await dbRun("UPDATE sessions SET active_intent = NULL, intent_data = NULL WHERE session_id = ?", [conversationId]);
 }
 
-// Vérifie qu'une conversation appartient bien à l'utilisateur authentifié
-// (empêche un utilisateur de lire/écrire le contexte d'une conversation d'un autre).
 async function assertConversationOwnership(conversationId, userId) {
   const existing = await dbGet("SELECT user_id FROM sessions WHERE session_id = ?", [conversationId]);
   if (existing && existing.user_id && existing.user_id !== userId) {
@@ -500,7 +611,11 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
       query
     )}&gsrlimit=${limit}&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=1200&format=json&origin=*`;
 
-    const response = await axios.get(url, { timeout: 15000 });
+    // Fix 403 : Wikimedia bloque les requêtes sans User-Agent identifiable.
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: { "User-Agent": CONFIG.WIKIMEDIA_USER_AGENT }
+    });
     const pages = response.data?.query?.pages;
 
     if (!pages) return { images: [] };
@@ -521,7 +636,8 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
     console.log(`   ${images.length} image(s) trouvée(s)`);
     return { images };
   } catch (error) {
-    console.error("❌ Erreur recherche images:", error.message);
+    const status = error.response?.status;
+    console.error(`❌ Erreur recherche images${status ? ` [HTTP ${status}]` : ""}:`, error.message);
     return { images: [], error: error.message };
   }
 }
@@ -531,7 +647,10 @@ async function searchWeb(query) {
 
   try {
     const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`;
-    const response = await axios.get(ddgUrl, { timeout: 10000 });
+    const response = await axios.get(ddgUrl, {
+      timeout: 10000,
+      headers: { "User-Agent": CONFIG.WIKIMEDIA_USER_AGENT }
+    });
 
     const results = [];
     if (response.data?.AbstractText) {
@@ -541,7 +660,6 @@ async function searchWeb(query) {
         url: response.data.AbstractURL || null
       });
     }
-
     return { results };
   } catch (error) {
     console.error("❌ Erreur recherche web:", error.message);
@@ -549,9 +667,7 @@ async function searchWeb(query) {
   }
 }
 
-// ==================== ENVOI D'EMAIL : GMAIL API (OAuth) + FALLBACK SMTP ====================
-
-// Envoi réel via l'API Gmail, en utilisant le token OAuth Bearer transmis par le frontend.
+// ==================== ENVOI D'EMAIL : GMAIL API (OAuth) → RESEND → SMTP ====================
 async function sendEmailViaGmail(accessToken, recipient, subject, body) {
   const messageLines = [
     `To: ${recipient}`,
@@ -571,20 +687,12 @@ async function sendEmailViaGmail(accessToken, recipient, subject, body) {
   const response = await axios.post(
     "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
     { raw: encodedMessage },
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      timeout: 15000
-    }
+    { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" }, timeout: 15000 }
   );
 
   return { success: true, provider: "gmail", messageId: response.data?.id || null };
 }
 
-// Fallback transactionnel à grande échelle (Resend), utilisé quand aucun token Google
-// n'est fourni. Conçu pour des volumes de production (contrairement au SMTP perso).
 async function sendEmailViaResend(recipient, subject, body) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return { success: false, error: "RESEND_API_KEY non configurée" };
@@ -598,12 +706,8 @@ async function sendEmailViaResend(recipient, subject, body) {
         subject: subject || "(sans sujet)",
         html: `<div style="font-family: Arial; padding: 20px;">${String(body || "").replace(/\n/g, "<br>")}</div>`
       },
-      {
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        timeout: 15000
-      }
+      { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, timeout: 15000 }
     );
-
     return { success: true, provider: "resend", messageId: response.data?.id || null };
   } catch (error) {
     const apiError = error.response?.data?.message || error.message;
@@ -612,8 +716,6 @@ async function sendEmailViaResend(recipient, subject, body) {
   }
 }
 
-// Dernier recours (dev/test local), utilisé seulement si ni Google OAuth ni Resend
-// ne sont disponibles. Non recommandé en production à grande échelle.
 async function sendEmailViaSMTP(to, subject, body) {
   if (!emailTransporter) return { success: false, error: "SMTP non configuré" };
 
@@ -625,7 +727,6 @@ async function sendEmailViaSMTP(to, subject, body) {
       html: `<div style="font-family: Arial; padding: 20px;">${String(body || "").replace(/\n/g, "<br>")}</div>`,
       text: body || ""
     });
-
     return { success: true, provider: "smtp", messageId: info.messageId };
   } catch (error) {
     console.error("❌ Erreur envoi email SMTP:", error.message);
@@ -633,10 +734,6 @@ async function sendEmailViaSMTP(to, subject, body) {
   }
 }
 
-// Point d'entrée unique pour le Function Calling send_email. Ordre de priorité :
-// 1) Gmail API avec le token OAuth de l'utilisateur (envoi "en son nom propre")
-// 2) Resend (service transactionnel à grande échelle, pour les emails système/HIKLON)
-// 3) SMTP (dernier recours, dev/test local uniquement)
 async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!recipient || !emailRegex.test(String(recipient).trim())) {
@@ -671,9 +768,9 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }
   return result;
 }
 
-// ==================== PASSERELLE WHATSAPP OPEN-SOURCE (Evolution API) ====================
-// Client REST vers une instance Evolution API (ou compatible) auto-hébergée, ex. via Docker.
-// ⚠️ Adapte les chemins ci-dessous si tu utilises une autre passerelle (Baileys-api, etc.).
+// ==================== PASSERELLE WHATSAPP OPTIONNELLE (Evolution API externe) ====================
+// Conservée pour qui veut un microservice WhatsApp séparé/scalable horizontalement.
+// Pour un usage simple, Baileys (ci-dessous) suffit et ne nécessite aucune infra en plus.
 const WHATSAPP_GATEWAY = {
   baseURL: (process.env.WHATSAPP_GATEWAY_URL || "").replace(/\/+$/, ""),
   apiKey: process.env.WHATSAPP_GATEWAY_API_KEY || "",
@@ -684,33 +781,26 @@ const whatsappGateway = {
   configured() {
     return Boolean(WHATSAPP_GATEWAY.baseURL && WHATSAPP_GATEWAY.apiKey);
   },
-
   async getQRCode() {
-    if (!this.configured()) {
-      throw new Error("Passerelle WhatsApp non configurée (WHATSAPP_GATEWAY_URL / WHATSAPP_GATEWAY_API_KEY manquants)");
-    }
-    const response = await axios.get(
-      `${WHATSAPP_GATEWAY.baseURL}/instance/connect/${WHATSAPP_GATEWAY.instance}`,
-      { headers: { apikey: WHATSAPP_GATEWAY.apiKey }, timeout: 15000 }
-    );
+    if (!this.configured()) throw new Error("Passerelle WhatsApp externe non configurée");
+    const response = await axios.get(`${WHATSAPP_GATEWAY.baseURL}/instance/connect/${WHATSAPP_GATEWAY.instance}`, {
+      headers: { apikey: WHATSAPP_GATEWAY.apiKey },
+      timeout: 15000
+    });
     return response.data;
   },
-
   async getStatus() {
-    if (!this.configured()) throw new Error("Passerelle WhatsApp non configurée");
+    if (!this.configured()) throw new Error("Passerelle WhatsApp externe non configurée");
     const response = await axios.get(
       `${WHATSAPP_GATEWAY.baseURL}/instance/connectionState/${WHATSAPP_GATEWAY.instance}`,
       { headers: { apikey: WHATSAPP_GATEWAY.apiKey }, timeout: 10000 }
     );
     return response.data;
   },
-
   async sendMessage(phoneNumber, message) {
-    if (!this.configured()) throw new Error("Passerelle WhatsApp non configurée");
-
+    if (!this.configured()) throw new Error("Passerelle WhatsApp externe non configurée");
     const cleanNumber = String(phoneNumber).replace(/[^\d]/g, "");
     if (!cleanNumber) throw new Error("Numéro de téléphone invalide");
-
     const response = await axios.post(
       `${WHATSAPP_GATEWAY.baseURL}/message/sendText/${WHATSAPP_GATEWAY.instance}`,
       { number: cleanNumber, text: message },
@@ -720,13 +810,31 @@ const whatsappGateway = {
   }
 };
 
+function verifyWhatsappWebhookSignature(req) {
+  const secret = process.env.WHATSAPP_WEBHOOK_SECRET;
+  if (!secret) return true;
+
+  const providedApiKey = req.headers["apikey"];
+  if (providedApiKey && providedApiKey === secret) return true;
+
+  const signatureHeader = req.headers["x-webhook-signature"] || req.headers["x-hub-signature-256"];
+  if (signatureHeader && req.rawBody) {
+    const expected = crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
+    const provided = String(signatureHeader).replace(/^sha256=/, "");
+    try {
+      return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(provided, "hex"));
+    } catch (e) {
+      return false;
+    }
+  }
+  return false;
+}
+
 // ==================== FILE D'ATTENTE RÉSILIENTE (BullMQ+Redis, ou repli mémoire) ====================
 let BullMQ = null;
 let IORedis = null;
 try {
-  // eslint-disable-next-line global-require
   BullMQ = require("bullmq");
-  // eslint-disable-next-line global-require
   IORedis = require("ioredis");
 } catch (e) {
   BullMQ = null;
@@ -737,8 +845,6 @@ const useRedisQueue = Boolean(process.env.REDIS_URL) && Boolean(BullMQ) && Boole
 let whatsappQueue = null;
 let whatsappWorker = null;
 
-// File de repli en mémoire, avec concurrence limitée et retry en backoff exponentiel.
-// Utilisée automatiquement si Redis/BullMQ ne sont pas disponibles.
 class InMemoryRetryQueue {
   constructor(processFn, { concurrency = 2, maxAttempts = 5, baseDelayMs = 2000 } = {}) {
     this.processFn = processFn;
@@ -748,12 +854,10 @@ class InMemoryRetryQueue {
     this.pending = [];
     this.active = 0;
   }
-
   push(data) {
     this.pending.push({ data, attempts: 0 });
     this._drain();
   }
-
   _drain() {
     while (this.active < this.concurrency && this.pending.length > 0) {
       const job = this.pending.shift();
@@ -764,7 +868,6 @@ class InMemoryRetryQueue {
       });
     }
   }
-
   async _process(job) {
     try {
       await this.processFn(job.data);
@@ -786,288 +889,203 @@ class InMemoryRetryQueue {
 
 let inMemoryWhatsappQueue = null;
 
-if (useRedisQueue) {
-  const connection = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
-
-  whatsappQueue = new BullMQ.Queue("whatsapp-outbound", { connection });
-  whatsappWorker = new BullMQ.Worker(
-    "whatsapp-outbound",
-    async (job) => {
-      const { phoneNumber, message } = job.data;
-      await whatsappGateway.sendMessage(phoneNumber, message);
-    },
-    {
-      connection,
-      concurrency: 3,
-      limiter: { max: 10, duration: 1000 } // limite de débit : 10 messages/seconde max
-    }
-  );
-
-  whatsappWorker.on("failed", (job, err) => {
-    console.error(`❌ Job WhatsApp BullMQ échoué (${job?.id}):`, err.message);
-  });
-  whatsappWorker.on("completed", (job) => {
-    console.log(`✅ Job WhatsApp BullMQ envoyé (${job.id})`);
-  });
-
-  console.log("✅ File d'attente WhatsApp : BullMQ + Redis (persistante, avec retry)");
-} else {
-  inMemoryWhatsappQueue = new InMemoryRetryQueue(
-    async ({ phoneNumber, message }) => {
-      await whatsappGateway.sendMessage(phoneNumber, message);
-    },
-    { concurrency: 2, maxAttempts: 5, baseDelayMs: 2000 }
-  );
-  console.log("⚠️ File d'attente WhatsApp : en mémoire (repli, non persistante — configure REDIS_URL + bullmq/ioredis pour la version production complète)");
+// Le job d'envoi utilise whatsappManager (Baileys) en priorité, sinon la passerelle externe.
+async function processWhatsAppSendJob({ userId, phoneNumber, message }) {
+  if (whatsappManager.sessions.get(userId)?.ready) {
+    await whatsappManager.sendMessage(userId, phoneNumber, message);
+  } else if (whatsappGateway.configured()) {
+    await whatsappGateway.sendMessage(phoneNumber, message);
+  } else {
+    throw new Error("Aucun canal WhatsApp disponible pour l'envoi");
+  }
 }
 
-// Point d'entrée unique pour empiler un envoi WhatsApp sortant, quelle que soit la file utilisée.
-async function enqueueWhatsAppSend(phoneNumber, message) {
+if (useRedisQueue) {
+  const connection = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
+  whatsappQueue = new BullMQ.Queue("whatsapp-outbound", { connection });
+  whatsappWorker = new BullMQ.Worker("whatsapp-outbound", async (job) => processWhatsAppSendJob(job.data), {
+    connection,
+    concurrency: 3,
+    limiter: { max: 10, duration: 1000 }
+  });
+  whatsappWorker.on("failed", (job, err) => console.error(`❌ Job WhatsApp BullMQ échoué (${job?.id}):`, err.message));
+  console.log("✅ File d'attente WhatsApp : BullMQ + Redis (persistante, avec retry)");
+} else {
+  inMemoryWhatsappQueue = new InMemoryRetryQueue(processWhatsAppSendJob, {
+    concurrency: 2,
+    maxAttempts: 5,
+    baseDelayMs: 2000
+  });
+  console.log("⚠️ File d'attente WhatsApp : en mémoire (repli, non persistante)");
+}
+
+async function enqueueWhatsAppSend(userId, phoneNumber, message) {
   if (useRedisQueue) {
     await whatsappQueue.add(
       "send",
-      { phoneNumber, message },
+      { userId, phoneNumber, message },
       { attempts: 5, backoff: { type: "exponential", delay: 2000 }, removeOnComplete: 100, removeOnFail: 500 }
     );
   } else {
-    inMemoryWhatsappQueue.push({ phoneNumber, message });
+    inMemoryWhatsappQueue.push({ userId, phoneNumber, message });
   }
 }
 
-// Envoi WhatsApp "intelligent" : utilise la nouvelle passerelle (avec file d'attente)
-// si elle est configurée, sinon retombe sur l'ancien whatsapp-web.js (legacy, direct, sans retry).
 async function sendWhatsAppSmart(userId, phoneNumber, message) {
-  if (whatsappGateway.configured()) {
-    await enqueueWhatsAppSend(phoneNumber, message);
-    return { success: true, queued: true, provider: "gateway" };
-  }
-  const result = await whatsappManager.sendMessage(userId, phoneNumber, message);
-  return { ...result, provider: "legacy-whatsapp-web.js" };
+  await enqueueWhatsAppSend(userId, phoneNumber, message);
+  return { success: true, queued: true, provider: "queue" };
 }
 
-// Validation de la signature du webhook WhatsApp entrant.
-// Accepte soit une clé partagée dans le header `apikey`, soit une signature HMAC-SHA256
-// (header `x-webhook-signature` ou `x-hub-signature-256`) calculée sur le corps brut.
-function verifyWhatsappWebhookSignature(req) {
-  const secret = process.env.WHATSAPP_WEBHOOK_SECRET;
-  if (!secret) return true; // pas de secret configuré = validation désactivée (à éviter en prod)
-
-  const providedApiKey = req.headers["apikey"];
-  if (providedApiKey && providedApiKey === secret) return true;
-
-  const signatureHeader = req.headers["x-webhook-signature"] || req.headers["x-hub-signature-256"];
-  if (signatureHeader && req.rawBody) {
-    const expected = crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
-    const provided = String(signatureHeader).replace(/^sha256=/, "");
-    try {
-      return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(provided, "hex"));
-    } catch (e) {
-      return false;
-    }
-  }
-
-  return false;
-}
-
-// ==================== GESTION WHATSAPP LEGACY (whatsapp-web.js / Puppeteer) ====================
-// Conservée pour compatibilité ascendante avec /api/whatsapp/connect et /api/whatsapp/send.
-class WhatsAppManager {
+// ==================== GESTION WHATSAPP — BAILEYS (WebSocket natif, sans Chrome) ====================
+class BaileysManager {
   constructor() {
-    this.clients = new Map();
+    this.sessions = new Map(); // userId -> { sock, qrCode, ready }
   }
 
-  async initClient(userId, retryCount = 0) {
-    if (this.clients.has(userId)) {
-      const existing = this.clients.get(userId);
-      if (existing.ready) return { connected: true, qrCode: null };
-    }
+  async initClient(userId) {
+    const existing = this.sessions.get(userId);
+    if (existing?.ready) return { connected: true, qrCode: null };
+    if (existing?.qrCode) return { connected: false, qrCode: existing.qrCode };
 
-    const client = new Client({
-      authStrategy: new LocalAuth({ clientId: userId, dataPath: CONFIG.SESSIONS_PATH }),
-      puppeteer: {
-        headless: true,
-        // Sur Render (environnement natif Node), Chromium doit souvent être installé
-        // via Docker + variable PUPPETEER_EXECUTABLE_PATH pointant vers un Chromium
-        // système, car le Chromium bundlé par Puppeteer manque fréquemment de
-        // librairies partagées (libnss3, libatk, etc.) dans ce type d'environnement.
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--no-first-run",
-          "--no-zygote",
-          "--single-process",
-          "--disable-gpu"
-        ]
-      }
-    });
+    const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
+    if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
-    const sessionData = { client, qrCode: null, ready: false };
-    this.clients.set(userId, sessionData);
-
-    client.on("qr", async (qr) => {
-      try {
-        const qrDataUrl = await qrcode.toDataURL(qr, {
-          width: 600,
-          margin: 2,
-          color: { dark: "#000000", light: "#FFFFFF" }
-        });
-        sessionData.qrCode = qrDataUrl;
-        console.log(`📱 QR Code (legacy) généré pour ${userId}`);
-      } catch (error) {
-        console.error("❌ Erreur génération QR (legacy):", error.message);
-      }
-    });
-
-    client.on("ready", () => {
-      sessionData.ready = true;
-      sessionData.qrCode = null;
-      db.run("UPDATE users SET whatsapp_connected = 1 WHERE id = ?", [userId]);
-      console.log(`✅ WhatsApp (legacy) connecté pour ${userId}`);
-    });
-
-    client.on("auth_failure", (msg) => {
-      console.error(`❌ Échec d'authentification WhatsApp (legacy) pour ${userId}:`, msg);
-      sessionData.ready = false;
-    });
-
-    client.on("disconnected", (reason) => {
-      sessionData.ready = false;
-      db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
-      console.warn(`⚠️ WhatsApp (legacy) déconnecté pour ${userId}: ${reason}`);
-      this.clients.delete(userId);
-    });
-
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    let version;
     try {
-      await client.initialize();
-      return { connected: false, qrCode: null };
-    } catch (error) {
-      console.error(`❌ Puppeteer/WhatsApp init error (tentative ${retryCount + 1}) pour ${userId}:`, error.message);
-      if (error.stack) console.error(error.stack);
-
-      if (retryCount < CONFIG.WHATSAPP_MAX_RETRIES) {
-        this.clients.delete(userId);
-        await new Promise((resolve) => setTimeout(resolve, CONFIG.WHATSAPP_RETRY_DELAY));
-        return this.initClient(userId, retryCount + 1);
-      }
-      this.clients.delete(userId);
-      throw error;
+      version = (await fetchLatestBaileysVersion()).version;
+    } catch (e) {
+      version = undefined; // Baileys utilisera sa version embarquée par défaut
     }
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+      browser: ["Luba.ia", "Chrome", "1.0.0"]
+    });
+
+    const sessionData = { sock, qrCode: null, ready: false };
+    this.sessions.set(userId, sessionData);
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        try {
+          sessionData.qrCode = await qrcode.toDataURL(qr, { width: 600, margin: 2 });
+          console.log(`📱 QR Code (Baileys) généré pour ${userId}`);
+        } catch (e) {
+          console.error("❌ Erreur génération QR (Baileys):", e.message);
+        }
+      }
+
+      if (connection === "open") {
+        sessionData.ready = true;
+        sessionData.qrCode = null;
+        db.run("UPDATE users SET whatsapp_connected = 1 WHERE id = ?", [userId]);
+        console.log(`✅ WhatsApp (Baileys) connecté pour ${userId}`);
+      }
+
+      if (connection === "close") {
+        sessionData.ready = false;
+        db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.warn(`⚠️ WhatsApp (Baileys) déconnecté pour ${userId} (code ${statusCode}). Reconnexion auto: ${shouldReconnect}`);
+
+        this.sessions.delete(userId);
+        if (shouldReconnect) {
+          setTimeout(() => {
+            this.initClient(userId).catch((e) => console.error("❌ Reconnexion Baileys échouée:", e.message));
+          }, CONFIG.WHATSAPP_RETRY_DELAY);
+        }
+      }
+    });
+
+    // Auto-réponse : chaque message WhatsApp entrant est transmis au pipeline LLM (v100).
+    sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
+      if (type !== "notify") return;
+
+      for (const msg of msgs) {
+        try {
+          if (!msg.message || msg.key.fromMe) continue;
+          const remoteJid = msg.key.remoteJid;
+          if (!remoteJid || remoteJid.endsWith("@g.us")) continue; // ignore les groupes
+
+          const text =
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            msg.message.imageMessage?.caption ||
+            null;
+          if (!text) continue;
+
+          const phoneNumber = remoteJid.replace(/@.*$/, "");
+          const conversationId = `whatsapp_${phoneNumber}`;
+
+          const result = await handleChat({
+            conversationId,
+            userId: conversationId,
+            message: text.slice(0, CONFIG.MAX_MESSAGE_LENGTH),
+            channel: "whatsapp",
+            modelTier: "v100"
+          });
+
+          if (result?.reply) {
+            const plainReply = result.reply.replace(/!\[.*?\]\(.*?\)/g, "").trim();
+            await sock.sendMessage(remoteJid, { text: plainReply || "🙂" });
+          }
+        } catch (err) {
+          console.error("❌ Erreur traitement message entrant WhatsApp (Baileys):", err.message);
+        }
+      }
+    });
+
+    return { connected: false, qrCode: null };
   }
 
   async sendMessage(userId, to, message) {
-    const session = this.clients.get(userId);
+    const session = this.sessions.get(userId);
     if (!session || !session.ready) {
-      const error = new Error("WhatsApp (legacy) non connecté");
+      const error = new Error("WhatsApp (Baileys) non connecté");
       error.code = "WHATSAPP_NOT_CONNECTED";
       throw error;
     }
 
-    let formattedTo = String(to).replace(/[^\d]/g, "");
-    if (!formattedTo) {
+    const cleanNumber = String(to).replace(/[^\d]/g, "");
+    if (!cleanNumber) {
       const error = new Error("Numéro de destinataire invalide");
       error.code = "INVALID_RECIPIENT";
       throw error;
     }
-    if (!formattedTo.startsWith("55")) formattedTo = "55" + formattedTo;
-    formattedTo += "@c.us";
 
-    const chat = await session.client.getChatById(formattedTo);
-    await session.client.sendMessage(chat.id._serialized, message);
-
-    return { success: true, to };
+    const jid = `${cleanNumber}@s.whatsapp.net`;
+    await session.sock.sendMessage(jid, { text: message });
+    return { success: true, to: cleanNumber };
   }
 
   getQRCode(userId) {
-    return this.clients.get(userId)?.qrCode || null;
+    return this.sessions.get(userId)?.qrCode || null;
   }
 
   async destroyAll() {
-    for (const [userId, session] of this.clients) {
-      if (session.client) {
-        try {
-          await session.client.destroy();
-        } catch (e) {
-          console.error(`⚠️ Erreur fermeture client WhatsApp legacy (${userId}):`, e.message);
-        }
+    for (const [userId, session] of this.sessions) {
+      try {
+        session.sock.end(undefined);
+      } catch (e) {
+        console.error(`⚠️ Erreur fermeture socket WhatsApp (${userId}):`, e.message);
       }
     }
   }
 }
 
-const whatsappManager = new WhatsAppManager();
+const whatsappManager = new BaileysManager();
 
-// ==================== APPEL LLM ====================
-async function callLLM(messages) {
-  const provider = LLM_PROVIDERS.GROQ;
-
-  if (!provider.apiKey && !LLM_PROVIDERS.OPENROUTER.apiKey) {
-    throw new Error("Aucune clé API LLM configurée (GROQ_API_KEY / OPENROUTER_API_KEY)");
-  }
-
-  if (provider.apiKey) {
-    try {
-      const response = await axios.post(
-        `${provider.baseURL}/chat/completions`,
-        {
-          model: provider.model,
-          messages: [LUBA_SYSTEM_PROMPT, ...messages],
-          temperature: provider.temperature,
-          max_tokens: provider.maxTokens,
-          response_format: { type: "json_object" }
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${provider.apiKey}`,
-            "Content-Type": "application/json"
-          },
-          timeout: provider.timeout
-        }
-      );
-
-      const content = response.data?.choices?.[0]?.message?.content;
-      if (!content) throw new Error("Réponse Groq vide");
-
-      return JSON.parse(content);
-    } catch (error) {
-      console.error("❌ Erreur Groq:", error.message);
-    }
-  }
-
-  const fallback = LLM_PROVIDERS.OPENROUTER;
-  if (!fallback.apiKey) throw new Error("OPENROUTER_API_KEY non configurée pour le fallback");
-
-  const response = await axios.post(
-    `${fallback.baseURL}/chat/completions`,
-    {
-      model: fallback.model,
-      messages: [LUBA_SYSTEM_PROMPT, ...messages],
-      temperature: fallback.temperature,
-      max_tokens: fallback.maxTokens,
-      response_format: { type: "json_object" }
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${fallback.apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://luba-ia.web.app",
-        "X-Title": "Luba.ia Assistant"
-      },
-      timeout: fallback.timeout
-    }
-  );
-
-  const content = response.data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error("Réponse OpenRouter vide");
-
-  return JSON.parse(content);
-}
-
-// ==================== BOUCLE REACT ====================
-// context : { conversationId, userId, message, googleAccessToken, channel }
-async function handleChat({ conversationId, userId, message, googleAccessToken = null, channel = "web" }) {
+// ==================== BOUCLE REACT (Tier v100) / PIPELINE (Tier v250) ====================
+async function handleChat({ conversationId, userId, message, googleAccessToken = null, channel = "web", modelTier = "v100" }) {
   await getSession(conversationId, userId);
 
   const activeIntent = await getActiveIntent(conversationId);
@@ -1080,87 +1098,90 @@ async function handleChat({ conversationId, userId, message, googleAccessToken =
 
   const messages = [...history, { role: "user", content: message }];
 
-  let keepRunning = true;
-  let maxLoops = 5;
   let finalResponse = null;
   let imageUrls = [];
+  let providerUsed = "unknown";
 
-  while (keepRunning && maxLoops > 0) {
-    maxLoops--;
-
-    let llmResponse;
+  if (modelTier === "v250") {
     try {
-      llmResponse = await callLLM(messages);
+      const result = await callLLM_v250(messages, message);
+      finalResponse = result.replyText || "Je n'ai pas pu générer une réponse.";
+      providerUsed = result.providerUsed || "pipeline_v250";
     } catch (error) {
-      console.error("❌ Erreur LLM (Groq + OpenRouter):", error.message);
-      finalResponse = "⚠️ Le service d'IA est momentanément indisponible. Veuillez réessayer dans un instant.";
-      break;
+      console.error("❌ Erreur pipeline Luba v.250:", error.message);
+      finalResponse =
+        "⚠️ Luba v.250 (raisonnement + génération de code) est momentanément indisponible. Réessaie dans un instant, ou repasse en v.100.";
+      providerUsed = "error_v250";
     }
+  } else {
+    let keepRunning = true;
+    let maxLoops = 5;
 
-    if (llmResponse.toolCalls && llmResponse.toolCalls.length > 0) {
-      for (const toolCall of llmResponse.toolCalls) {
-        let toolResult;
+    while (keepRunning && maxLoops > 0) {
+      maxLoops--;
 
-        try {
-          switch (toolCall.name) {
-            case "search_images":
-              toolResult = await searchWikimediaImages(toolCall.arguments?.query);
-              if (toolResult.images) {
-                imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
-              }
-              break;
-
-            case "search_web":
-              toolResult = await searchWeb(toolCall.arguments?.query);
-              break;
-
-            case "send_email":
-              toolResult = await dispatchSendEmail({
-                googleAccessToken,
-                recipient: toolCall.arguments?.recipient || toolCall.arguments?.to,
-                subject: toolCall.arguments?.subject,
-                body: toolCall.arguments?.body
-              });
-              break;
-
-            // "send_whatsapp" conservé en alias pour compatibilité avec d'anciens prompts/clients.
-            case "send_whatsapp_message":
-            case "send_whatsapp":
-              toolResult = await sendWhatsAppSmart(
-                userId,
-                toolCall.arguments?.phone_number || toolCall.arguments?.to,
-                toolCall.arguments?.message
-              );
-              break;
-
-            default:
-              toolResult = { error: "Outil inconnu" };
-          }
-        } catch (toolError) {
-          console.error(`❌ Erreur outil ${toolCall.name}:`, toolError.message);
-          toolResult = { success: false, error: toolError.message };
-        }
-
-        messages.push({
-          role: "assistant",
-          content: `Résultat de l'outil ${toolCall.name}: ${JSON.stringify(toolResult)}`
-        });
+      let llmResponse;
+      try {
+        llmResponse = await callLLM_v100(messages);
+        providerUsed = llmResponse.providerUsed;
+      } catch (error) {
+        console.error("❌ Erreur LLM v100 (Groq + OpenRouter):", error.message);
+        finalResponse = "⚠️ Le service d'IA est momentanément indisponible. Veuillez réessayer dans un instant.";
+        providerUsed = "error_v100";
+        break;
       }
 
-      messages.push({
-        role: "user",
-        content: "Formule maintenant ta réponse finale complète avec les résultats des outils."
-      });
+      if (llmResponse.toolCalls && llmResponse.toolCalls.length > 0) {
+        for (const toolCall of llmResponse.toolCalls) {
+          let toolResult;
+          try {
+            switch (toolCall.name) {
+              case "search_images":
+                toolResult = await searchWikimediaImages(toolCall.arguments?.query);
+                if (toolResult.images) imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
+                break;
+              case "search_web":
+                toolResult = await searchWeb(toolCall.arguments?.query);
+                break;
+              case "send_email":
+                toolResult = await dispatchSendEmail({
+                  googleAccessToken,
+                  recipient: toolCall.arguments?.recipient || toolCall.arguments?.to,
+                  subject: toolCall.arguments?.subject,
+                  body: toolCall.arguments?.body
+                });
+                break;
+              case "send_whatsapp_message":
+              case "send_whatsapp":
+                toolResult = await sendWhatsAppSmart(
+                  userId,
+                  toolCall.arguments?.phone_number || toolCall.arguments?.to,
+                  toolCall.arguments?.message
+                );
+                break;
+              default:
+                toolResult = { error: "Outil inconnu" };
+            }
+          } catch (toolError) {
+            console.error(`❌ Erreur outil ${toolCall.name}:`, toolError.message);
+            toolResult = { success: false, error: toolError.message };
+          }
 
-      keepRunning = true;
-    } else {
-      finalResponse = llmResponse.replyText || "Je n'ai pas pu générer une réponse.";
-      keepRunning = false;
+          messages.push({
+            role: "assistant",
+            content: `Résultat de l'outil ${toolCall.name}: ${JSON.stringify(toolResult)}`
+          });
+        }
+
+        messages.push({ role: "user", content: "Formule maintenant ta réponse finale complète avec les résultats des outils." });
+        keepRunning = true;
+      } else {
+        finalResponse = llmResponse.replyText || "Je n'ai pas pu générer une réponse.";
+        keepRunning = false;
+      }
     }
-  }
 
-  if (!finalResponse) {
-    finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
+    if (!finalResponse) finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
   }
 
   if (imageUrls.length > 0) {
@@ -1173,7 +1194,9 @@ async function handleChat({ conversationId, userId, message, googleAccessToken =
   return {
     reply: finalResponse,
     images: imageUrls,
-    error: false
+    error: providerUsed.startsWith("error"),
+    providerUsed,
+    modelTier
   };
 }
 
@@ -1188,23 +1211,12 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
       if (data.step === "NEED_NUMBER") {
         const phoneRegex = /^(\+?\d{1,3}[-.\s]?)?\d{9,15}$/;
         if (phoneRegex.test(userMessage.trim())) {
-          await setActiveIntent(conversationId, "WHATSAPP", {
-            step: "NEED_MESSAGE",
-            recipient: userMessage.trim()
-          });
+          await setActiveIntent(conversationId, "WHATSAPP", { step: "NEED_MESSAGE", recipient: userMessage.trim() });
           await saveMessage(conversationId, "user", userMessage);
           await saveMessage(conversationId, "assistant", `✅ Numéro enregistré. Quel message voulez-vous envoyer ?`);
-
-          return {
-            reply: `✅ Numéro enregistré. Quel message voulez-vous envoyer à ${userMessage.trim()} ?`,
-            error: false
-          };
+          return { reply: `✅ Numéro enregistré. Quel message voulez-vous envoyer à ${userMessage.trim()} ?`, error: false };
         }
-
-        return {
-          reply: "⚠️ Numéro invalide. Veuillez fournir un numéro valide (ex: +33612345678).",
-          error: true
-        };
+        return { reply: "⚠️ Numéro invalide. Veuillez fournir un numéro valide (ex: +33612345678).", error: true };
       }
 
       if (data.step === "NEED_MESSAGE") {
@@ -1212,23 +1224,10 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
           const result = await sendWhatsAppSmart(userId, data.recipient, userMessage);
           await clearActiveIntent(conversationId);
           await saveMessage(conversationId, "user", userMessage);
-          await saveMessage(
-            conversationId,
-            "assistant",
-            result.queued ? `✅ Message mis en file d'envoi vers ${data.recipient}` : `✅ Message envoyé à ${data.recipient}`
-          );
-
-          return {
-            reply: result.queued
-              ? `✅ Message WhatsApp mis en file d'envoi vers ${data.recipient} !`
-              : `✅ Message WhatsApp envoyé avec succès à ${data.recipient} !`,
-            error: false
-          };
+          await saveMessage(conversationId, "assistant", `✅ Message mis en file d'envoi vers ${data.recipient}`);
+          return { reply: `✅ Message WhatsApp mis en file d'envoi vers ${data.recipient} !`, error: false };
         } catch (error) {
-          return {
-            reply: `⚠️ Erreur d'envoi: ${error.message}`,
-            error: true
-          };
+          return { reply: `⚠️ Erreur d'envoi: ${error.message}`, error: true };
         }
       }
       break;
@@ -1240,52 +1239,22 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
       if (data.step === "NEED_RECIPIENT") {
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (emailRegex.test(userMessage.trim())) {
-          await setActiveIntent(conversationId, "EMAIL", {
-            step: "NEED_SUBJECT",
-            recipient: userMessage.trim()
-          });
-          return {
-            reply: "✅ Destinataire enregistré. Quel est le sujet de l'email ?",
-            error: false
-          };
+          await setActiveIntent(conversationId, "EMAIL", { step: "NEED_SUBJECT", recipient: userMessage.trim() });
+          return { reply: "✅ Destinataire enregistré. Quel est le sujet de l'email ?", error: false };
         }
-        return {
-          reply: "⚠️ Adresse email invalide.",
-          error: true
-        };
+        return { reply: "⚠️ Adresse email invalide.", error: true };
       }
 
       if (data.step === "NEED_SUBJECT") {
-        await setActiveIntent(conversationId, "EMAIL", {
-          step: "NEED_BODY",
-          recipient: data.recipient,
-          subject: userMessage
-        });
-        return {
-          reply: "✅ Sujet enregistré. Quel est le contenu de l'email ?",
-          error: false
-        };
+        await setActiveIntent(conversationId, "EMAIL", { step: "NEED_BODY", recipient: data.recipient, subject: userMessage });
+        return { reply: "✅ Sujet enregistré. Quel est le contenu de l'email ?", error: false };
       }
 
       if (data.step === "NEED_BODY") {
-        const result = await dispatchSendEmail({
-          googleAccessToken,
-          recipient: data.recipient,
-          subject: data.subject,
-          body: userMessage
-        });
+        const result = await dispatchSendEmail({ googleAccessToken, recipient: data.recipient, subject: data.subject, body: userMessage });
         await clearActiveIntent(conversationId);
-
-        if (result.success) {
-          return {
-            reply: `✅ Email envoyé à ${data.recipient} (via ${result.provider}) !`,
-            error: false
-          };
-        }
-        return {
-          reply: `⚠️ Erreur: ${result.error}`,
-          error: true
-        };
+        if (result.success) return { reply: `✅ Email envoyé à ${data.recipient} (via ${result.provider}) !`, error: false };
+        return { reply: `⚠️ Erreur: ${result.error}`, error: true };
       }
       break;
     }
@@ -1320,25 +1289,22 @@ app.get(
         memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
         database: dbOk ? "ok" : "erreur",
         whatsapp: {
-          gatewayConfigured: whatsappGateway.configured(),
-          legacySessionsActives: whatsappManager.clients.size,
+          baileysSessionsActives: whatsappManager.sessions.size,
+          gatewayExterneConfiguree: whatsappGateway.configured(),
           queue: useRedisQueue ? "bullmq+redis" : "memoire (repli)"
         },
-        llmProviders: {
-          groq: Boolean(LLM_PROVIDERS.GROQ.apiKey),
-          openrouter: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey)
+        llmTiers: {
+          v100: { primary: MODEL_TIERS.v100.primaryModel, fallback: MODEL_TIERS.v100.fallbackModel },
+          v250: { reasoning: MODEL_TIERS.v250.reasoningModel, code: MODEL_TIERS.v250.codeModel }
         },
-        email: {
-          gmailOAuth: "à la demande (token transmis par requête)",
-          resend: Boolean(process.env.RESEND_API_KEY),
-          smtp: Boolean(emailTransporter)
-        }
+        llmProviders: { groq: Boolean(LLM_PROVIDERS.GROQ.apiKey), openrouter: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey) },
+        email: { gmailOAuth: "à la demande", resend: Boolean(process.env.RESEND_API_KEY), smtp: Boolean(emailTransporter) }
       }
     });
   })
 );
 
-// ==================== ROUTE LISTE DES CONVERSATIONS D'UN UTILISATEUR ====================
+// ==================== ROUTE LISTE DES CONVERSATIONS ====================
 app.get(
   "/api/conversations",
   apiLimiter,
@@ -1348,7 +1314,6 @@ app.get(
       "SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50",
       [req.userId]
     );
-
     const conversations = await Promise.all(
       rows.map(async (row) => {
         const lastMessage = await dbGet(
@@ -1364,19 +1329,16 @@ app.get(
         };
       })
     );
-
     return res.status(200).json({ reply: "Conversations récupérées.", error: false, conversations });
   })
 );
 
-// ==================== ROUTE HISTORIQUE D'UNE CONVERSATION PRÉCISE ====================
 app.get(
   "/api/conversations/:conversationId/messages",
   apiLimiter,
   authenticateUser,
   asyncHandler(async (req, res) => {
     const { conversationId } = req.params;
-
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
@@ -1397,7 +1359,7 @@ app.get(
   })
 );
 
-// ==================== ROUTE CHAT PRINCIPALE (isolée par conversation_id) ====================
+// ==================== ROUTE CHAT PRINCIPALE (conversation_id + routage multi-tier) ====================
 app.post(
   "/api/chat",
   apiLimiter,
@@ -1406,23 +1368,15 @@ app.post(
     const message = req.body.message;
     let conversationId = req.body.conversationId || req.body.conversation_id;
     let isNewConversation = false;
+    const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(200).json({
-        reply: "⚠️ Le paramètre 'message' est obligatoire.",
-        error: true
-      });
+      return res.status(200).json({ reply: "⚠️ Le paramètre 'message' est obligatoire.", error: true });
     }
-
     if (message.length > CONFIG.MAX_MESSAGE_LENGTH) {
-      return res.status(200).json({
-        reply: `⚠️ Message trop long (max ${CONFIG.MAX_MESSAGE_LENGTH} caractères).`,
-        error: true
-      });
+      return res.status(200).json({ reply: `⚠️ Message trop long (max ${CONFIG.MAX_MESSAGE_LENGTH} caractères).`, error: true });
     }
 
-    // conversation_id requis : si absent, on en génère un nouveau et on le renvoie au
-    // frontend, qui doit le persister (localStorage, etc.) pour les tours suivants.
     if (!conversationId || typeof conversationId !== "string") {
       conversationId = `conv_${crypto.randomUUID()}`;
       isNewConversation = true;
@@ -1434,6 +1388,13 @@ app.post(
       return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
 
+    // Le pipeline v250 enchaîne 2 appels LLM séquentiels : on étend le délai de la
+    // requête au-delà des 60s par défaut pour éviter un 504 côté Render.
+    if (modelTier === "v250") {
+      req.setTimeout(CONFIG.V250_ROUTE_TIMEOUT);
+      res.setTimeout(CONFIG.V250_ROUTE_TIMEOUT);
+    }
+
     const googleAccessToken = extractGoogleAccessToken(req);
 
     try {
@@ -1442,45 +1403,85 @@ app.post(
         userId: req.userId,
         message: message.trim(),
         googleAccessToken,
-        channel: "web"
+        channel: "web",
+        modelTier
       });
       return res.status(200).json({ ...result, conversationId, isNewConversation });
     } catch (error) {
       console.error("❌ Erreur /api/chat:", error.message);
-      return res.status(200).json({
-        reply: "⚠️ Une erreur est survenue. Veuillez réessayer.",
-        error: true,
-        conversationId
-      });
+      return res.status(200).json({ reply: "⚠️ Une erreur est survenue. Veuillez réessayer.", error: true, conversationId, modelTier });
     }
   })
 );
 
-// ==================== ROUTES WHATSAPP — NOUVELLE PASSERELLE (Evolution API) ====================
+// ==================== ROUTES WHATSAPP — BAILEYS (recommandé, sans Chrome) ====================
+app.post(
+  "/api/whatsapp/connect",
+  strictLimiter,
+  authenticateUser,
+  asyncHandler(async (req, res) => {
+    try {
+      const result = await whatsappManager.initClient(req.userId);
 
-// Pairing : génère/retourne le QR code de connexion de l'instance WhatsApp.
-// Protégée par ADMIN_API_KEY si définie (opération d'infrastructure, pas liée à un chat précis).
+      if (result.connected) {
+        return res.status(200).json({ reply: "✅ WhatsApp est déjà connecté.", error: false });
+      }
+
+      let qrCode = null;
+      const startTime = Date.now();
+      while (!qrCode && Date.now() - startTime < CONFIG.WHATSAPP_QR_TIMEOUT) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        qrCode = whatsappManager.getQRCode(req.userId);
+      }
+
+      if (qrCode) {
+        return res.status(200).json({ reply: "📱 Scannez ce QR Code avec WhatsApp :", qrCode, error: false });
+      }
+
+      return res.status(200).json({ reply: "⚠️ Délai dépassé en attendant le QR Code. Veuillez réessayer.", error: true });
+    } catch (error) {
+      console.error("❌ Erreur WhatsApp connect (Baileys):", error.message);
+      return res.status(200).json({ reply: "⚠️ Erreur lors de la connexion WhatsApp.", error: true });
+    }
+  })
+);
+
+app.post(
+  "/api/whatsapp/send",
+  strictLimiter,
+  authenticateUser,
+  asyncHandler(async (req, res) => {
+    if (!req.body.to || !req.body.message) {
+      return res.status(200).json({ reply: "⚠️ Les paramètres 'to' et 'message' sont obligatoires.", error: true });
+    }
+    try {
+      const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
+      return res.status(200).json({ reply: `✅ Message envoyé à ${req.body.to}`, error: false, data: result });
+    } catch (error) {
+      return res.status(200).json({ reply: `⚠️ Erreur: ${error.message}`, error: true });
+    }
+  })
+);
+
+// ==================== ROUTES WHATSAPP — PASSERELLE EXTERNE (optionnelle, Evolution API) ====================
 app.get(
-  "/api/whatsapp/qr",
+  "/api/whatsapp/gateway/qr",
   strictLimiter,
   asyncHandler(async (req, res) => {
     if (process.env.ADMIN_API_KEY && req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
       return res.status(401).json({ error: true, reply: "⚠️ Non autorisé." });
     }
-
     try {
       const data = await whatsappGateway.getQRCode();
       return res.status(200).json({ reply: "📱 QR Code généré.", error: false, data });
     } catch (error) {
-      console.error("❌ Erreur QR WhatsApp (gateway):", error.message);
       return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
   })
 );
 
-// Statut de connexion de l'instance WhatsApp (connecté / déconnecté / en attente).
 app.get(
-  "/api/whatsapp/status",
+  "/api/whatsapp/gateway/status",
   strictLimiter,
   asyncHandler(async (req, res) => {
     try {
@@ -1492,8 +1493,6 @@ app.get(
   })
 );
 
-// Webhook de réception des messages WhatsApp entrants depuis la passerelle.
-// Le numéro de téléphone de l'expéditeur sert de conversation_id pour ce canal.
 app.post(
   "/api/whatsapp/webhook",
   webhookLimiter,
@@ -1503,13 +1502,10 @@ app.post(
       return res.status(401).json({ error: true, reply: "Signature invalide." });
     }
 
-    // Réponse immédiate : la plupart des passerelles WhatsApp attendent un 200 rapide
-    // et retentent l'envoi du webhook si la réponse tarde trop.
     res.status(200).json({ received: true });
 
     try {
       const payload = req.body;
-      // Convention Evolution API : payload.data.key.remoteJid / payload.data.message.conversation
       const remoteJid = payload?.data?.key?.remoteJid || payload?.data?.from;
       const fromMe = payload?.data?.key?.fromMe;
       const text =
@@ -1517,107 +1513,30 @@ app.post(
         payload?.data?.message?.extendedTextMessage?.text ||
         payload?.data?.body;
 
-      if (!remoteJid || fromMe || !text) return; // ignore les messages sortants ou événements sans texte
+      if (!remoteJid || fromMe || !text) return;
 
       const phoneNumber = String(remoteJid).replace(/@.*$/, "");
       const conversationId = `whatsapp_${phoneNumber}`;
 
       const result = await handleChat({
         conversationId,
-        userId: conversationId, // sur ce canal, le numéro de téléphone fait office d'identité
+        userId: conversationId,
         message: String(text).slice(0, CONFIG.MAX_MESSAGE_LENGTH),
-        channel: "whatsapp"
+        channel: "whatsapp",
+        modelTier: "v100"
       });
 
       if (result?.reply) {
-        // On retire le markdown d'images avant l'envoi WhatsApp (pas de rendu markdown côté WhatsApp).
         const plainReply = result.reply.replace(/!\[.*?\]\(.*?\)/g, "").trim();
-        await enqueueWhatsAppSend(phoneNumber, plainReply || "🙂");
+        await whatsappGateway.sendMessage(phoneNumber, plainReply || "🙂");
       }
     } catch (error) {
-      console.error("❌ Erreur traitement webhook WhatsApp:", error.message);
+      console.error("❌ Erreur traitement webhook WhatsApp (gateway externe):", error.message);
     }
   })
 );
 
-// ==================== ROUTES WHATSAPP — LEGACY (whatsapp-web.js) ====================
-// Conservées telles quelles pour compatibilité ascendante avec le frontend existant.
-
-app.post(
-  "/api/whatsapp/connect",
-  strictLimiter,
-  authenticateUser,
-  asyncHandler(async (req, res) => {
-    try {
-      const result = await whatsappManager.initClient(req.userId);
-
-      if (result.connected) {
-        return res.status(200).json({
-          reply: "✅ WhatsApp est déjà connecté.",
-          error: false
-        });
-      }
-
-      let qrCode = null;
-      const startTime = Date.now();
-
-      while (!qrCode && Date.now() - startTime < CONFIG.WHATSAPP_QR_TIMEOUT) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        qrCode = whatsappManager.getQRCode(req.userId);
-      }
-
-      if (qrCode) {
-        return res.status(200).json({
-          reply: "📱 Scannez ce QR Code avec WhatsApp :",
-          qrCode: qrCode,
-          error: false
-        });
-      }
-
-      return res.status(200).json({
-        reply: "⚠️ Délai dépassé. Veuillez réessayer.",
-        error: true
-      });
-    } catch (error) {
-      console.error("❌ Erreur WhatsApp connect (legacy):", error.message);
-      return res.status(200).json({
-        reply: "⚠️ Erreur lors de la connexion WhatsApp.",
-        error: true
-      });
-    }
-  })
-);
-
-app.post(
-  "/api/whatsapp/send",
-  strictLimiter,
-  authenticateUser,
-  asyncHandler(async (req, res) => {
-    if (!req.body.to || !req.body.message) {
-      return res.status(200).json({
-        reply: "⚠️ Les paramètres 'to' et 'message' sont obligatoires.",
-        error: true
-      });
-    }
-
-    try {
-      const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
-
-      return res.status(200).json({
-        reply: `✅ Message envoyé à ${req.body.to}`,
-        error: false,
-        data: result
-      });
-    } catch (error) {
-      return res.status(200).json({
-        reply: `⚠️ Erreur: ${error.message}`,
-        error: true
-      });
-    }
-  })
-);
-
-// ==================== ROUTE INITIALISATION D'INTENTION (multi-tour, requiert conversationId) ====================
+// ==================== ROUTE INITIALISATION D'INTENTION ====================
 app.post(
   "/api/intent/init",
   apiLimiter,
@@ -1640,51 +1559,33 @@ app.post(
 
     if (intentType === "WHATSAPP") {
       await setActiveIntent(convId, "WHATSAPP", { step: "NEED_NUMBER" });
-      return res.status(200).json({
-        reply: "📱 Envoi WhatsApp initié. Quel est le numéro du destinataire ?",
-        error: false
-      });
+      return res.status(200).json({ reply: "📱 Envoi WhatsApp initié. Quel est le numéro du destinataire ?", error: false });
     }
-
     if (intentType === "EMAIL") {
       await setActiveIntent(convId, "EMAIL", { step: "NEED_RECIPIENT" });
-      return res.status(200).json({
-        reply: "📧 Envoi d'email initié. Quelle est l'adresse du destinataire ?",
-        error: false
-      });
+      return res.status(200).json({ reply: "📧 Envoi d'email initié. Quelle est l'adresse du destinataire ?", error: false });
     }
-
-    return res.status(200).json({
-      reply: "⚠️ Type d'intention inconnu.",
-      error: true
-    });
+    return res.status(200).json({ reply: "⚠️ Type d'intention inconnu.", error: true });
   })
 );
 
-// ==================== ROUTE EFFACER MÉMOIRE (par conversation_id) ====================
+// ==================== ROUTE EFFACER MÉMOIRE ====================
 app.post(
   "/api/memory/clear",
   authenticateUser,
   asyncHandler(async (req, res) => {
     const conversationId = req.body.conversationId || req.body.conversation_id;
-
     if (!conversationId || typeof conversationId !== "string") {
       return res.status(200).json({ reply: "⚠️ Le paramètre 'conversationId' est obligatoire.", error: true });
     }
-
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
       return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
-
     await dbRun("DELETE FROM messages WHERE session_id = ?", [conversationId]);
     await clearActiveIntent(conversationId);
-
-    return res.status(200).json({
-      reply: "✅ Mémoire de cette conversation effacée.",
-      error: false
-    });
+    return res.status(200).json({ reply: "✅ Mémoire de cette conversation effacée.", error: false });
   })
 );
 
@@ -1694,18 +1595,17 @@ app.use((req, res) => {
   res.status(404).json({
     reply: `⚠️ Route non trouvée: ${req.method} ${req.originalUrl}`,
     error: true,
-    hint: "Vérifie que l'URL appelée par le frontend correspond exactement à une route existante (voir liste ci-dessous).",
     availableRoutes: [
       "GET /",
       "GET /api/health",
       "GET /api/conversations",
       "GET /api/conversations/:conversationId/messages",
       "POST /api/chat",
-      "GET /api/whatsapp/qr",
-      "GET /api/whatsapp/status",
-      "POST /api/whatsapp/webhook",
-      "POST /api/whatsapp/connect (legacy)",
-      "POST /api/whatsapp/send (legacy)",
+      "POST /api/whatsapp/connect",
+      "POST /api/whatsapp/send",
+      "GET /api/whatsapp/gateway/qr (optionnel, Evolution API)",
+      "GET /api/whatsapp/gateway/status (optionnel)",
+      "POST /api/whatsapp/webhook (optionnel)",
       "POST /api/intent/init",
       "POST /api/memory/clear"
     ]
@@ -1717,16 +1617,11 @@ app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed") {
     return res.status(200).json({ reply: "⚠️ Corps de requête JSON invalide.", error: true });
   }
-
   if (err?.message === "Origine non autorisée") {
     return res.status(200).json({ reply: "⚠️ Origine non autorisée.", error: true });
   }
-
   console.error(`❌ [${req.requestId || "unknown"}] Erreur non gérée:`, err?.message || err);
-  return res.status(200).json({
-    reply: "⚠️ Une erreur interne est survenue. Veuillez réessayer.",
-    error: true
-  });
+  return res.status(200).json({ reply: "⚠️ Une erreur interne est survenue. Veuillez réessayer.", error: true });
 });
 
 // ==================== DÉMARRAGE ====================
@@ -1739,12 +1634,9 @@ const server = app.listen(PORT, () => {
   console.log(`🔢 Version : ${CONFIG.VERSION}`);
   console.log(`🔌 Port : ${PORT}`);
   console.log(`🧠 Mémoire : SQLite, isolée par conversation_id`);
-  console.log(`🔄 Boucle ReAct : Activée`);
-  console.log(
-    `📧 Email : Gmail API (OAuth par utilisateur) + Resend (${process.env.RESEND_API_KEY ? "configuré" : "non configuré"}) + SMTP (${emailTransporter ? "configuré" : "non configuré"})`
-  );
-  console.log(`📱 WhatsApp gateway (Evolution API) : ${whatsappGateway.configured() ? "configurée" : "NON configurée"}`);
-  console.log(`📱 WhatsApp legacy (whatsapp-web.js) : conservée pour compatibilité`);
+  console.log(`🎚️ Tiers LLM : v100 (${MODEL_TIERS.v100.primaryModel} → ${MODEL_TIERS.v100.fallbackModel}) | v250 (${MODEL_TIERS.v250.reasoningModel} → ${MODEL_TIERS.v250.codeModel})`);
+  console.log(`📧 Email : Gmail OAuth + Resend (${process.env.RESEND_API_KEY ? "configuré" : "non configuré"}) + SMTP (${emailTransporter ? "configuré" : "non configuré"})`);
+  console.log(`📱 WhatsApp : Baileys (WebSocket natif, sans Chrome) — aucune dépendance système supplémentaire`);
   console.log(`📬 File d'attente WhatsApp : ${useRedisQueue ? "BullMQ + Redis" : "en mémoire (repli)"}`);
   console.log(`🌐 Origines CORS autorisées : ${ALLOWED_ORIGINS.join(", ")}`);
   console.log("=".repeat(60) + "\n");
@@ -1762,7 +1654,6 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
 
   console.log(`\n🛑 Arrêt gracieux (${signal})...`);
-
   const forceExitTimer = setTimeout(() => {
     console.error("⏱️ Arrêt forcé après délai dépassé");
     process.exit(1);
@@ -1795,11 +1686,7 @@ async function gracefulShutdown(signal) {
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-process.on("uncaughtException", (error) => {
-  console.error("❌ Erreur non capturée:", error.message);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("❌ Promesse rejetée non gérée:", reason);
-});
+process.on("uncaughtException", (error) => console.error("❌ Erreur non capturée:", error.message));
+process.on("unhandledRejection", (reason) => console.error("❌ Promesse rejetée non gérée:", reason));
 
 module.exports = app;
