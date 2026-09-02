@@ -1,4 +1,3 @@
-
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
 // Version : 9.0.0
 // Technologies : Express, SQLite, @whiskeysockets/baileys (WhatsApp, sans Chrome),
@@ -7,14 +6,14 @@
 //                sources ouvertes sans clé API (actualités, sport, science, social, météo),
 //                BullMQ/Redis (file d'attente, optionnel), Gmail API/Resend/SMTP (email)
 //
-// ⚠ CHANGEMENTS IMPORTANTS DE CETTE VERSION :
+// ⚠️ CHANGEMENTS IMPORTANTS DE CETTE VERSION :
 // 1) v250 : budgets de tokens et timeouts augmentés (le raisonnement DeepSeek-R1 consomme
 //    beaucoup de tokens ; un budget trop court produisait une réponse vide/tronquée).
 // 2) SÉCURITÉ UTILISATEUR : userId n'était vérifié par AUCUN mécanisme cryptographique —
 //    n'importe qui pouvait se faire passer pour n'importe quel utilisateur en changeant
 //    juste la valeur envoyée. Ajout d'une vérification optionnelle mais recommandée via
 //    Firebase Admin (token Firebase envoyé dans `Authorization: Bearer <id_token>`).
-//    ⚠ CE HEADER CHANGE DE RÔLE : Authorization est maintenant réservé au token Firebase.
+//    ⚠️ CE HEADER CHANGE DE RÔLE : Authorization est maintenant réservé au token Firebase.
 //    Le token Gmail OAuth voyage EXCLUSIVEMENT via `X-Google-Access-Token` désormais.
 // 3) Plus aucune donnée "simulée" : search_web (qui retournait presque toujours du vide
 //    via DuckDuckGo Instant Answer) est remplacé par une vraie agrégation Wikipédia +
@@ -79,15 +78,15 @@ if (missingEnvVars.length > 0) {
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   console.warn(
-    "⚠ SÉCURITÉ : FIREBASE_SERVICE_ACCOUNT_JSON non configurée — les userId ne sont PAS vérifiés cryptographiquement. " +
+    "⚠️ SÉCURITÉ : FIREBASE_SERVICE_ACCOUNT_JSON non configurée — les userId ne sont PAS vérifiés cryptographiquement. " +
       "N'importe qui peut actuellement se faire passer pour n'importe quel utilisateur. À configurer avant une vraie mise en production."
   );
 }
 if (!process.env.WHATSAPP_WEBHOOK_SECRET) {
-  console.warn("⚠ WHATSAPP_WEBHOOK_SECRET non configuré (passerelle externe optionnelle uniquement).");
+  console.warn("⚠️ WHATSAPP_WEBHOOK_SECRET non configuré (passerelle externe optionnelle uniquement).");
 }
 if (!process.env.REDIS_URL) {
-  console.warn("⚠ REDIS_URL non configurée — file d'attente WhatsApp en mémoire (non persistante).");
+  console.warn("⚠️ REDIS_URL non configurée — file d'attente WhatsApp en mémoire (non persistante).");
 }
 
 // ==================== CRÉATION DES DOSSIERS ====================
@@ -130,7 +129,7 @@ db.serialize(() => {
   // Migration douce pour les bases déjà déployées avant l'ajout de last_seen_at.
   db.run(`ALTER TABLE users ADD COLUMN last_seen_at DATETIME`, (err) => {
     if (err && !/duplicate column/i.test(err.message)) {
-      console.error("⚠ Erreur migration last_seen_at:", err.message);
+      console.error("⚠️ Erreur migration last_seen_at:", err.message);
     }
   });
 
@@ -214,7 +213,7 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     maxMessages: 50
   });
   emailTransporter.verify((err) => {
-    if (err) console.error("⚠ SMTP non joignable:", err.message);
+    if (err) console.error("⚠️ SMTP non joignable:", err.message);
     else console.log("✅ SMTP prêt (dernier recours email)");
   });
 }
@@ -238,7 +237,7 @@ app.use(
     origin: function (origin, callback) {
       if (!origin || ALLOWED_ORIGINS.includes(origin)) callback(null, true);
       else {
-        console.warn(`⚠ Origine CORS refusée: ${origin}`);
+        console.warn(`⚠️ Origine CORS refusée: ${origin}`);
         callback(new Error("Origine non autorisée"));
       }
     },
@@ -266,14 +265,14 @@ const apiLimiter = rateLimit({
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
-  handler: (req, res) => res.status(200).json({ reply: "⚠ Trop de requêtes. Réessaie dans 15 minutes.", error: true })
+  handler: (req, res) => res.status(200).json({ reply: "⚠️ Trop de requêtes. Réessaie dans 15 minutes.", error: true })
 });
 const strictLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  handler: (req, res) => res.status(200).json({ reply: "⚠ Limite de requêtes atteinte.", error: true })
+  handler: (req, res) => res.status(200).json({ reply: "⚠️ Limite de requêtes atteinte.", error: true })
 });
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -313,7 +312,7 @@ function dbRun(query, params) {
 }
 
 // ==================== AUTHENTIFICATION (avec vérification Firebase optionnelle) ====================
-// ⚠ Authorization: Bearer <token> est réservé au token d'identité Firebase.
+// ⚠️ Authorization: Bearer <token> est réservé au token d'identité Firebase.
 // Le token Gmail OAuth voyage exclusivement via X-Google-Access-Token (voir plus bas).
 const authenticateUser = asyncHandler(async (req, res, next) => {
   const providedUserId = req.body.userId || req.query.userId || req.headers["x-user-id"];
@@ -331,19 +330,19 @@ const authenticateUser = asyncHandler(async (req, res, next) => {
       verifiedEmail = decoded.email || null;
       verifiedName = decoded.name || null;
     } catch (error) {
-      console.warn("⚠ Token Firebase invalide/expiré:", error.message);
-      return res.status(200).json({ reply: "⚠ Session invalide ou expirée. Reconnecte-toi.", error: true, code: "INVALID_TOKEN" });
+      console.warn("⚠️ Token Firebase invalide/expiré:", error.message);
+      return res.status(200).json({ reply: "⚠️ Session invalide ou expirée. Reconnecte-toi.", error: true, code: "INVALID_TOKEN" });
     }
   }
 
   const userId = verifiedUserId || (typeof providedUserId === "string" ? providedUserId.trim() : null);
 
   if (!userId) {
-    return res.status(200).json({ reply: "⚠ Authentification requise. Fournis un userId ou un token valide.", error: true });
+    return res.status(200).json({ reply: "⚠️ Authentification requise. Fournis un userId ou un token valide.", error: true });
   }
 
   if (firebaseApp && !verifiedUserId) {
-    console.warn(`⚠ Requête NON vérifiée cryptographiquement pour userId=${userId} (Firebase configuré mais aucun Bearer token fourni)`);
+    console.warn(`⚠️ Requête NON vérifiée cryptographiquement pour userId=${userId} (Firebase configuré mais aucun Bearer token fourni)`);
   }
 
   req.userId = userId;
@@ -369,7 +368,7 @@ const authenticateUser = asyncHandler(async (req, res, next) => {
     next();
   } catch (err) {
     console.error("❌ Erreur authentification:", err.message);
-    return res.status(200).json({ reply: "⚠ Erreur interne.", error: true });
+    return res.status(200).json({ reply: "⚠️ Erreur interne.", error: true });
   }
 });
 
@@ -406,7 +405,7 @@ function decodeXmlEntities(str) {
 async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
   try {
-    console.log(`🖼 Recherche d'images: "${query}"`);
+    console.log(`🖼️ Recherche d'images: "${query}"`);
     const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
       query
     )}&gsrlimit=${limit}&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=1200&format=json&origin=*`;
@@ -662,7 +661,7 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }
       result.success ? "sent" : "failed"
     ]);
   } catch (logErr) {
-    console.error("⚠ Impossible de journaliser l'email:", logErr.message);
+    console.error("⚠️ Impossible de journaliser l'email:", logErr.message);
   }
 
   return result;
@@ -769,7 +768,7 @@ class InMemoryRetryQueue {
       await this.processFn(job.data);
     } catch (err) {
       job.attempts++;
-      console.error(`⚠ Échec job WhatsApp (tentative ${job.attempts}/${this.maxAttempts}):`, err.message);
+      console.error(`⚠️ Échec job WhatsApp (tentative ${job.attempts}/${this.maxAttempts}):`, err.message);
       if (job.attempts < this.maxAttempts) {
         const delay = this.baseDelayMs * Math.pow(2, job.attempts - 1);
         setTimeout(() => {
@@ -807,7 +806,7 @@ if (useRedisQueue) {
   console.log("✅ File d'attente WhatsApp : BullMQ + Redis");
 } else {
   inMemoryWhatsappQueue = new InMemoryRetryQueue(processWhatsAppSendJob, { concurrency: 2, maxAttempts: 5, baseDelayMs: 2000 });
-  console.log("⚠ File d'attente WhatsApp : en mémoire (repli)");
+  console.log("⚠️ File d'attente WhatsApp : en mémoire (repli)");
 }
 
 async function enqueueWhatsAppSend(userId, phoneNumber, message) {
@@ -895,7 +894,7 @@ class BaileysManager {
         db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.warn(`⚠ WhatsApp (Baileys) déconnecté pour ${userId} (code ${statusCode}). Reconnexion auto: ${shouldReconnect}`);
+        console.warn(`⚠️ WhatsApp (Baileys) déconnecté pour ${userId} (code ${statusCode}). Reconnexion auto: ${shouldReconnect}`);
         this.sessions.delete(userId);
         if (shouldReconnect) {
           setTimeout(() => {
@@ -967,7 +966,7 @@ class BaileysManager {
       try {
         session.sock.end(undefined);
       } catch (e) {
-        console.error(`⚠ Erreur fermeture socket WhatsApp (${userId}):`, e.message);
+        console.error(`⚠️ Erreur fermeture socket WhatsApp (${userId}):`, e.message);
       }
     }
   }
@@ -1023,7 +1022,7 @@ const LLM_PROVIDERS = {
   OPENROUTER: { baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY, timeout: 45000, maxTokens: 1500, temperature: 0.7 }
 };
 
-// ⚠ Vérifie ces identifiants de modèles sur les catalogues Groq / OpenRouter au déploiement.
+// ⚠️ Vérifie ces identifiants de modèles sur les catalogues Groq / OpenRouter au déploiement.
 const MODEL_TIERS = {
   v100: {
     primaryProvider: "groq",
@@ -1033,12 +1032,12 @@ const MODEL_TIERS = {
   },
   v250: {
     reasoningProvider: "openrouter",
-    reasoningModel: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1",
+    reasoningModel: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free",
     // Le raisonnement (chain-of-thought) de DeepSeek-R1 consomme énormément de tokens :
     // un budget trop court coupe la réponse avant qu'elle ne soit produite ("renvoie rien").
     reasoningMaxTokens: parseInt(process.env.OPENROUTER_V250_REASONING_MAX_TOKENS || "8000", 10),
     codeProvider: "openrouter",
-    codeModel: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct",
+    codeModel: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free",
     codeFallbackProvider: "groq",
     codeFallbackModel: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "openai/gpt-oss-120b",
     codeMaxTokens: parseInt(process.env.OPENROUTER_V250_CODE_MAX_TOKENS || "8000", 10)
@@ -1067,7 +1066,7 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
   const content = choice?.message?.content;
 
   if (choice?.finish_reason === "length") {
-    console.warn(`⚠ Réponse ${provider}/${model} tronquée par max_tokens (finish_reason=length) — augmente le budget de tokens si le contenu semble incomplet.`);
+    console.warn(`⚠️ Réponse ${provider}/${model} tronquée par max_tokens (finish_reason=length) — augmente le budget de tokens si le contenu semble incomplet.`);
   }
   if (!content) throw new Error(`Réponse ${provider} vide`);
 
@@ -1077,7 +1076,9 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
 function isFailoverWorthy(error) {
   const status = error.response?.status;
   const isTimeout = error.code === "ECONNABORTED" || /timeout/i.test(error.message || "");
-  return status === 429 || status === 500 || status === 503 || isTimeout;
+  // 402 = crédits OpenRouter épuisés sur un modèle payant (le modèle demandé n'a pas
+  // le tag :free, ou le compte n'a pas de crédits) — doit basculer comme une panne.
+  return status === 402 || status === 429 || status === 500 || status === 503 || isTimeout;
 }
 
 async function callLLM_v100(messages) {
@@ -1090,7 +1091,7 @@ async function callLLM_v100(messages) {
   } catch (error) {
     const status = error.response?.status;
     console.error(`❌ Erreur ${tier.primaryProvider} (v100)${status ? ` [HTTP ${status}]` : ""}:`, error.message);
-    if (!isFailoverWorthy(error)) console.warn("⚠ Erreur non standard — bascule OpenRouter tentée quand même par prudence.");
+    if (!isFailoverWorthy(error)) console.warn("⚠️ Erreur non standard — bascule OpenRouter tentée quand même par prudence.");
 
     try {
       const result = await callProviderRaw({ provider: tier.fallbackProvider, model: tier.fallbackModel, messages: fullMessages, jsonMode: true });
@@ -1131,8 +1132,9 @@ async function callLLM_v250(messages, userMessage) {
       );
     }
   } catch (error) {
-    console.error("❌ Erreur étape 1 (raisonnement, v250):", error.message);
-    throw new Error(`Échec de l'étape de raisonnement (v250): ${error.message}`);
+    const status = error.response?.status;
+    console.error(`❌ Erreur étape 1 (raisonnement, v250)${status ? ` [HTTP ${status}]` : ""}:`, error.message);
+    throw new Error(`Échec de l'étape de raisonnement (v250)${status ? ` [HTTP ${status}]` : ""}: ${error.message}`);
   }
 
   const step2Messages = [
@@ -1159,7 +1161,8 @@ Tu DOIS répondre au format JSON strict : { "replyText": "réponse complète en 
     });
     return { ...result, providerUsed: "pipeline_v250" };
   } catch (error) {
-    console.error("❌ Erreur étape 2 (génération de code, v250), tentative de repli:", error.message);
+    const status = error.response?.status;
+    console.error(`❌ Erreur étape 2 (génération de code, v250)${status ? ` [HTTP ${status}]` : ""}, tentative de repli:`, error.message);
     try {
       const result = await callProviderRaw({
         provider: tier.codeFallbackProvider,
@@ -1171,8 +1174,9 @@ Tu DOIS répondre au format JSON strict : { "replyText": "réponse complète en 
       });
       return { ...result, providerUsed: "pipeline_v250" };
     } catch (fallbackError) {
-      console.error("❌ Erreur étape 2 de repli (v250):", fallbackError.message);
-      throw new Error(`Échec de l'étape de génération de code (v250): ${fallbackError.message}`);
+      const fallbackStatus = fallbackError.response?.status;
+      console.error(`❌ Erreur étape 2 de repli (v250)${fallbackStatus ? ` [HTTP ${fallbackStatus}]` : ""}:`, fallbackError.message);
+      throw new Error(`Échec de l'étape de génération de code (v250)${fallbackStatus ? ` [HTTP ${fallbackStatus}]` : ""}: ${fallbackError.message}`);
     }
   }
 }
@@ -1308,9 +1312,21 @@ async function handleChat({ conversationId, userId, message, googleAccessToken =
       suggestions = Array.isArray(result.suggestions) ? result.suggestions.slice(0, 4) : [];
       providerUsed = result.providerUsed || "pipeline_v250";
     } catch (error) {
-      console.error("❌ Erreur pipeline Luba v.250:", error.message);
-      finalResponse = `⚠ Luba v.250 est momentanément indisponible : ${error.message}`;
-      providerUsed = "error_v250";
+      // 402 (crédits OpenRouter épuisés), timeout, ou toute autre panne du pipeline
+      // v250 : on ne renvoie JAMAIS une erreur brute à l'utilisateur — on bascule
+      // silencieusement sur le tier v100 (Groq + fallback OpenRouter) pour garantir
+      // une vraie réponse.
+      console.error("❌ Erreur pipeline Luba v.250, bascule automatique vers v.100:", error.message);
+      try {
+        const fallbackResult = await callLLM_v100(messages);
+        finalResponse = fallbackResult.replyText || "Je n'ai pas pu générer une réponse.";
+        suggestions = Array.isArray(fallbackResult.suggestions) ? fallbackResult.suggestions.slice(0, 4) : [];
+        providerUsed = `v250_fallback_${fallbackResult.providerUsed}`;
+      } catch (fallbackError) {
+        console.error("❌ Échec total v250 + repli v100:", fallbackError.message);
+        finalResponse = "⚠️ Luba est momentanément indisponible sur tous les modèles. Réessaie dans un instant.";
+        providerUsed = "error_total";
+      }
     }
   } else {
     let keepRunning = true;
@@ -1324,7 +1340,7 @@ async function handleChat({ conversationId, userId, message, googleAccessToken =
         providerUsed = llmResponse.providerUsed;
       } catch (error) {
         console.error("❌ Erreur LLM v100 (Groq + OpenRouter):", error.message);
-        finalResponse = "⚠ Le service d'IA est momentanément indisponible. Veuillez réessayer dans un instant.";
+        finalResponse = "⚠️ Le service d'IA est momentanément indisponible. Veuillez réessayer dans un instant.";
         providerUsed = "error_v100";
         break;
       }
@@ -1404,7 +1420,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
           await saveMessage(conversationId, "assistant", `✅ Numéro enregistré. Quel message voulez-vous envoyer ?`);
           return { reply: `✅ Numéro enregistré. Quel message voulez-vous envoyer à ${userMessage.trim()} ?`, error: false };
         }
-        return { reply: "⚠ Numéro invalide. Veuillez fournir un numéro valide (ex: +33612345678).", error: true };
+        return { reply: "⚠️ Numéro invalide. Veuillez fournir un numéro valide (ex: +33612345678).", error: true };
       }
       if (data.step === "NEED_MESSAGE") {
         try {
@@ -1414,7 +1430,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
           await saveMessage(conversationId, "assistant", `✅ Message mis en file d'envoi vers ${data.recipient}`);
           return { reply: `✅ Message WhatsApp mis en file d'envoi vers ${data.recipient} !`, error: false };
         } catch (error) {
-          return { reply: `⚠ Erreur d'envoi: ${error.message}`, error: true };
+          return { reply: `⚠️ Erreur d'envoi: ${error.message}`, error: true };
         }
       }
       break;
@@ -1427,7 +1443,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
           await setActiveIntent(conversationId, "EMAIL", { step: "NEED_SUBJECT", recipient: userMessage.trim() });
           return { reply: "✅ Destinataire enregistré. Quel est le sujet de l'email ?", error: false };
         }
-        return { reply: "⚠ Adresse email invalide.", error: true };
+        return { reply: "⚠️ Adresse email invalide.", error: true };
       }
       if (data.step === "NEED_SUBJECT") {
         await setActiveIntent(conversationId, "EMAIL", { step: "NEED_BODY", recipient: data.recipient, subject: userMessage });
@@ -1437,7 +1453,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         const result = await dispatchSendEmail({ googleAccessToken, recipient: data.recipient, subject: data.subject, body: userMessage });
         await clearActiveIntent(conversationId);
         if (result.success) return { reply: `✅ Email envoyé à ${data.recipient} (via ${result.provider}) !`, error: false };
-        return { reply: `⚠ Erreur: ${result.error}`, error: true };
+        return { reply: `⚠️ Erreur: ${result.error}`, error: true };
       }
       break;
     }
@@ -1524,7 +1540,7 @@ app.get(
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ ${error.message}`, error: true, messages: [] });
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true, messages: [] });
     }
     const rows = await dbAll("SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 200", [conversationId]);
     return res.status(200).json({
@@ -1548,10 +1564,10 @@ app.post(
     const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(200).json({ reply: "⚠ Le paramètre 'message' est obligatoire.", error: true });
+      return res.status(200).json({ reply: "⚠️ Le paramètre 'message' est obligatoire.", error: true });
     }
     if (message.length > CONFIG.MAX_MESSAGE_LENGTH) {
-      return res.status(200).json({ reply: `⚠ Message trop long (max ${CONFIG.MAX_MESSAGE_LENGTH} caractères).`, error: true });
+      return res.status(200).json({ reply: `⚠️ Message trop long (max ${CONFIG.MAX_MESSAGE_LENGTH} caractères).`, error: true });
     }
 
     if (!conversationId || typeof conversationId !== "string") {
@@ -1562,7 +1578,7 @@ app.post(
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ ${error.message}`, error: true });
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
 
     if (modelTier === "v250") {
@@ -1577,7 +1593,7 @@ app.post(
       return res.status(200).json({ ...result, conversationId, isNewConversation });
     } catch (error) {
       console.error("❌ Erreur /api/chat:", error.message);
-      return res.status(200).json({ reply: "⚠ Une erreur est survenue. Veuillez réessayer.", error: true, conversationId, modelTier });
+      return res.status(200).json({ reply: "⚠️ Une erreur est survenue. Veuillez réessayer.", error: true, conversationId, modelTier });
     }
   })
 );
@@ -1592,7 +1608,7 @@ app.post(
     const params = req.body.params || req.body.arguments || {};
 
     if (!toolName || typeof toolName !== "string") {
-      return res.status(200).json({ success: false, error: true, reply: "⚠ Le paramètre 'toolName' (ou 'action') est obligatoire." });
+      return res.status(200).json({ success: false, error: true, reply: "⚠️ Le paramètre 'toolName' (ou 'action') est obligatoire." });
     }
 
     const googleAccessToken = extractGoogleAccessToken(req);
@@ -1603,7 +1619,7 @@ app.post(
       return res.status(200).json({ success: true, error: false, toolName, result, sources });
     } catch (error) {
       console.error(`❌ Erreur /api/tools (${toolName}):`, error.message);
-      return res.status(200).json({ success: false, error: true, reply: `⚠ ${error.message}`, toolName });
+      return res.status(200).json({ success: false, error: true, reply: `⚠️ ${error.message}`, toolName });
     }
   })
 );
@@ -1626,10 +1642,10 @@ app.post(
       }
 
       if (qrCode) return res.status(200).json({ reply: "📱 Scannez ce QR Code avec WhatsApp :", qrCode, error: false });
-      return res.status(200).json({ reply: "⚠ Délai dépassé en attendant le QR Code. Veuillez réessayer.", error: true });
+      return res.status(200).json({ reply: "⚠️ Délai dépassé en attendant le QR Code. Veuillez réessayer.", error: true });
     } catch (error) {
       console.error("❌ Erreur WhatsApp connect (Baileys):", error.message);
-      return res.status(200).json({ reply: "⚠ Erreur lors de la connexion WhatsApp.", error: true });
+      return res.status(200).json({ reply: "⚠️ Erreur lors de la connexion WhatsApp.", error: true });
     }
   })
 );
@@ -1640,13 +1656,13 @@ app.post(
   authenticateUser,
   asyncHandler(async (req, res) => {
     if (!req.body.to || !req.body.message) {
-      return res.status(200).json({ reply: "⚠ Les paramètres 'to' et 'message' sont obligatoires.", error: true });
+      return res.status(200).json({ reply: "⚠️ Les paramètres 'to' et 'message' sont obligatoires.", error: true });
     }
     try {
       const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
       return res.status(200).json({ reply: `✅ Message envoyé à ${req.body.to}`, error: false, data: result });
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ Erreur: ${error.message}`, error: true });
+      return res.status(200).json({ reply: `⚠️ Erreur: ${error.message}`, error: true });
     }
   })
 );
@@ -1657,13 +1673,13 @@ app.get(
   strictLimiter,
   asyncHandler(async (req, res) => {
     if (process.env.ADMIN_API_KEY && req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
-      return res.status(401).json({ error: true, reply: "⚠ Non autorisé." });
+      return res.status(401).json({ error: true, reply: "⚠️ Non autorisé." });
     }
     try {
       const data = await whatsappGateway.getQRCode();
       return res.status(200).json({ reply: "📱 QR Code généré.", error: false, data });
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ ${error.message}`, error: true });
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
   })
 );
@@ -1676,7 +1692,7 @@ app.get(
       const data = await whatsappGateway.getStatus();
       return res.status(200).json({ reply: "Statut récupéré.", error: false, data });
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ ${error.message}`, error: true });
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
   })
 );
@@ -1686,7 +1702,7 @@ app.post(
   webhookLimiter,
   asyncHandler(async (req, res) => {
     if (!verifyWhatsappWebhookSignature(req)) {
-      console.warn("⚠ Webhook WhatsApp: signature invalide ou manquante");
+      console.warn("⚠️ Webhook WhatsApp: signature invalide ou manquante");
       return res.status(401).json({ error: true, reply: "Signature invalide." });
     }
     res.status(200).json({ received: true });
@@ -1725,12 +1741,12 @@ app.post(
     const { intentType, conversationId, conversation_id: conversationIdSnake } = req.body;
     const convId = conversationId || conversationIdSnake;
     if (!convId || typeof convId !== "string") {
-      return res.status(200).json({ reply: "⚠ Le paramètre 'conversationId' est obligatoire.", error: true });
+      return res.status(200).json({ reply: "⚠️ Le paramètre 'conversationId' est obligatoire.", error: true });
     }
     try {
       await assertConversationOwnership(convId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ ${error.message}`, error: true });
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
     await getSession(convId, req.userId);
 
@@ -1742,7 +1758,7 @@ app.post(
       await setActiveIntent(convId, "EMAIL", { step: "NEED_RECIPIENT" });
       return res.status(200).json({ reply: "📧 Envoi d'email initié. Quelle est l'adresse du destinataire ?", error: false });
     }
-    return res.status(200).json({ reply: "⚠ Type d'intention inconnu.", error: true });
+    return res.status(200).json({ reply: "⚠️ Type d'intention inconnu.", error: true });
   })
 );
 
@@ -1752,12 +1768,12 @@ app.post(
   asyncHandler(async (req, res) => {
     const conversationId = req.body.conversationId || req.body.conversation_id;
     if (!conversationId || typeof conversationId !== "string") {
-      return res.status(200).json({ reply: "⚠ Le paramètre 'conversationId' est obligatoire.", error: true });
+      return res.status(200).json({ reply: "⚠️ Le paramètre 'conversationId' est obligatoire.", error: true });
     }
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: `⚠ ${error.message}`, error: true });
+      return res.status(200).json({ reply: `⚠️ ${error.message}`, error: true });
     }
     await dbRun("DELETE FROM messages WHERE session_id = ?", [conversationId]);
     await clearActiveIntent(conversationId);
@@ -1767,9 +1783,9 @@ app.post(
 
 // ==================== 404 ====================
 app.use((req, res) => {
-  console.warn(`⚠ 404 — Route non trouvée: ${req.method} ${req.originalUrl}`);
+  console.warn(`⚠️ 404 — Route non trouvée: ${req.method} ${req.originalUrl}`);
   res.status(404).json({
-    reply: `⚠ Route non trouvée: ${req.method} ${req.originalUrl}`,
+    reply: `⚠️ Route non trouvée: ${req.method} ${req.originalUrl}`,
     error: true,
     availableRoutes: [
       "GET /",
@@ -1791,10 +1807,10 @@ app.use((req, res) => {
 
 // ==================== ERREURS GLOBALES ====================
 app.use((err, req, res, next) => {
-  if (err?.type === "entity.parse.failed") return res.status(200).json({ reply: "⚠ Corps de requête JSON invalide.", error: true });
-  if (err?.message === "Origine non autorisée") return res.status(200).json({ reply: "⚠ Origine non autorisée.", error: true });
+  if (err?.type === "entity.parse.failed") return res.status(200).json({ reply: "⚠️ Corps de requête JSON invalide.", error: true });
+  if (err?.message === "Origine non autorisée") return res.status(200).json({ reply: "⚠️ Origine non autorisée.", error: true });
   console.error(`❌ [${req.requestId || "unknown"}] Erreur non gérée:`, err?.message || err);
-  return res.status(200).json({ reply: "⚠ Une erreur interne est survenue. Veuillez réessayer.", error: true });
+  return res.status(200).json({ reply: "⚠️ Une erreur interne est survenue. Veuillez réessayer.", error: true });
 });
 
 // ==================== DÉMARRAGE ====================
@@ -1805,8 +1821,8 @@ const server = app.listen(PORT, () => {
   console.log("=".repeat(60));
   console.log(`🔢 Version : ${CONFIG.VERSION}`);
   console.log(`🔌 Port : ${PORT}`);
-  console.log(`🔐 Sécurité utilisateur : ${firebaseApp ? "Firebase Admin actif (tokens vérifiés)" : "⚠ NON vérifiée cryptographiquement"}`);
-  console.log(`🎚 Tiers LLM : v100 (${MODEL_TIERS.v100.primaryModel} → ${MODEL_TIERS.v100.fallbackModel}) | v250 (${MODEL_TIERS.v250.reasoningModel}[${MODEL_TIERS.v250.reasoningMaxTokens}tok] → ${MODEL_TIERS.v250.codeModel}[${MODEL_TIERS.v250.codeMaxTokens}tok])`);
+  console.log(`🔐 Sécurité utilisateur : ${firebaseApp ? "Firebase Admin actif (tokens vérifiés)" : "⚠️ NON vérifiée cryptographiquement"}`);
+  console.log(`🎚️ Tiers LLM : v100 (${MODEL_TIERS.v100.primaryModel} → ${MODEL_TIERS.v100.fallbackModel}) | v250 (${MODEL_TIERS.v250.reasoningModel}[${MODEL_TIERS.v250.reasoningMaxTokens}tok] → ${MODEL_TIERS.v250.codeModel}[${MODEL_TIERS.v250.codeMaxTokens}tok])`);
   console.log(`📧 Email : Gmail OAuth + Resend (${process.env.RESEND_API_KEY ? "configuré" : "non configuré"}) + SMTP (${emailTransporter ? "configuré" : "non configuré"})`);
   console.log(`📱 WhatsApp : Baileys (sans Chrome)`);
   console.log(`🌍 Sources ouvertes : ${Object.keys(OPEN_SOURCES).join(", ")}`);
@@ -1824,7 +1840,7 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
   console.log(`\n🛑 Arrêt gracieux (${signal})...`);
   const forceExitTimer = setTimeout(() => {
-    console.error("⏱ Arrêt forcé après délai dépassé");
+    console.error("⏱️ Arrêt forcé après délai dépassé");
     process.exit(1);
   }, 10000);
 
@@ -1833,7 +1849,7 @@ async function gracefulShutdown(signal) {
     if (whatsappWorker) await whatsappWorker.close();
     if (whatsappQueue) await whatsappQueue.close();
     if (emailTransporter) emailTransporter.close();
-    await new Promise((resolve) => db.close((err) => { if (err) console.error("⚠ Erreur fermeture DB:", err.message); resolve(); }));
+    await new Promise((resolve) => db.close((err) => { if (err) console.error("⚠️ Erreur fermeture DB:", err.message); resolve(); }));
     server.close(() => {
       clearTimeout(forceExitTimer);
       console.log("✅ Arrêt terminé");
