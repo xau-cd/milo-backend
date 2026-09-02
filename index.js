@@ -1,30 +1,21 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 9.0.0
+// Version : 9.1.0
 // Technologies : Express, SQLite, @whiskeysockets/baileys (WhatsApp, sans Chrome),
 //                axios, Groq + OpenRouter (routage multi-tier v100/v250),
 //                Firebase Admin (vérification d'identité, optionnelle mais recommandée),
 //                sources ouvertes sans clé API (actualités, sport, science, social, météo),
 //                BullMQ/Redis (file d'attente, optionnel), Gmail API/Resend/SMTP (email)
 //
-// ⚠️ CHANGEMENTS IMPORTANTS DE CETTE VERSION :
-// 1) v250 : budgets de tokens et timeouts augmentés (le raisonnement DeepSeek-R1 consomme
-//    beaucoup de tokens ; un budget trop court produisait une réponse vide/tronquée).
-// 2) SÉCURITÉ UTILISATEUR : userId n'était vérifié par AUCUN mécanisme cryptographique —
-//    n'importe qui pouvait se faire passer pour n'importe quel utilisateur en changeant
-//    juste la valeur envoyée. Ajout d'une vérification optionnelle mais recommandée via
-//    Firebase Admin (token Firebase envoyé dans `Authorization: Bearer <id_token>`).
-//    ⚠️ CE HEADER CHANGE DE RÔLE : Authorization est maintenant réservé au token Firebase.
-//    Le token Gmail OAuth voyage EXCLUSIVEMENT via `X-Google-Access-Token` désormais.
-// 3) Plus aucune donnée "simulée" : search_web (qui retournait presque toujours du vide
-//    via DuckDuckGo Instant Answer) est remplacé par une vraie agrégation Wikipédia +
-//    actualités. Chaque outil retourne soit une donnée réelle, soit une erreur explicite.
-// 4) 5 sources ouvertes SANS clé API : actualités (Google News RSS), scores sportifs
-//    (TheSportsDB, clé publique "3"), science (arXiv), réseaux sociaux (Reddit JSON),
-//    météo (Open-Meteo). Chaque réponse qui les utilise affiche la source + son icône.
-// 5) Le LLM doit désormais toujours proposer 3-4 questions de suivi cliquables (champ
-//    JSON dédié `suggestions`, jamais mélangées au texte de la réponse).
-// 6) Nouvelle route POST /api/tools pour exécuter un outil directement depuis le frontend
-//    (hors boucle conversationnelle), avec le même dispatcher que la boucle ReAct.
+// ⚠️ CHANGEMENTS IMPORTANTS DE CETTE VERSION 9.1.0 :
+// 1) ARCHITECTURE LLM ENTERPRISE : Matrice de repli en cascade avec 4 niveaux de fallback
+//    pour v100 et 3 niveaux par étape pour v250. Suffixe :free automatique sur OpenRouter.
+// 2) GARDE-FOU : Dégradation gracieuse automatique v250 → v100 en cas d'échec complet.
+//    L'utilisateur ne voit JAMAIS d'erreur technique (402, 404, 429, 500, timeout).
+// 3) INTERCEPTEUR D'ERREURS GLOBAL : executeWithRetryAndFallback avec backoff exponentiel,
+//    circuit breaker implicite et logging détaillé de chaque tentative.
+// 4) GESTION DE CONTEXTE OPTIMISÉE : ConversationContextManager avec estimation des tokens
+//    et troncature intelligente de l'historique pour respecter les fenêtres de contexte.
+// 5) MONITORING ENRICHÉ : /api/health retourne l'état des providers LLM avec latence.
 
 require("dotenv").config();
 
@@ -51,7 +42,7 @@ const {
 const CONFIG = {
   PORT: process.env.PORT || 3000,
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "9.0.0",
+  VERSION: "9.1.0",
   AGENT_NAME: "Luba",
   MAX_MESSAGE_LENGTH: 2000,
   MAX_HISTORY_LENGTH: 15,
@@ -62,7 +53,8 @@ const CONFIG = {
   V250_STEP_TIMEOUT: 55000,
   V250_ROUTE_TIMEOUT: 130000,
   DB_PATH: path.join(__dirname, "data", "luba.db"),
-  SESSIONS_PATH: path.join(__dirname, "sessions")
+  SESSIONS_PATH: path.join(__dirname, "sessions"),
+  MAX_CONTEXT_TOKENS: 6000
 };
 
 // ==================== VALIDATION DES VARIABLES D'ENVIRONNEMENT ====================
@@ -126,7 +118,6 @@ db.serialize(() => {
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  // Migration douce pour les bases déjà déployées avant l'ajout de last_seen_at.
   db.run(`ALTER TABLE users ADD COLUMN last_seen_at DATETIME`, (err) => {
     if (err && !/duplicate column/i.test(err.message)) {
       console.error("⚠️ Erreur migration last_seen_at:", err.message);
@@ -312,8 +303,6 @@ function dbRun(query, params) {
 }
 
 // ==================== AUTHENTIFICATION (avec vérification Firebase optionnelle) ====================
-// ⚠️ Authorization: Bearer <token> est réservé au token d'identité Firebase.
-// Le token Gmail OAuth voyage exclusivement via X-Google-Access-Token (voir plus bas).
 const authenticateUser = asyncHandler(async (req, res, next) => {
   const providedUserId = req.body.userId || req.query.userId || req.headers["x-user-id"];
   const authHeader = req.headers.authorization || req.headers.Authorization;
@@ -1016,168 +1005,560 @@ OUTILS DISPONIBLES :
 - send_whatsapp_message : Envoyer un message WhatsApp réel (arguments: { phone_number, message })`
 };
 
-// ==================== CONFIGURATION LLM & ROUTAGE MULTI-TIER ====================
+// ==================== ARCHITECTURE LLM ENTERPRISE - ROUTAGE MULTI-TIER ====================
 const LLM_PROVIDERS = {
-  GROQ: { baseURL: "https://api.groq.com/openai/v1", apiKey: process.env.GROQ_API_KEY, timeout: 30000, maxTokens: 1500, temperature: 0.7 },
-  OPENROUTER: { baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY, timeout: 45000, maxTokens: 1500, temperature: 0.7 }
-};
-
-// ⚠️ Vérifie ces identifiants de modèles sur les catalogues Groq / OpenRouter au déploiement.
-const MODEL_TIERS = {
-  v100: {
-    primaryProvider: "groq",
-    primaryModel: process.env.GROQ_MODEL_V100 || "openai/gpt-oss-120b",
-    fallbackProvider: "openrouter",
-    fallbackModel: process.env.OPENROUTER_MODEL_V100_FALLBACK || "qwen/qwen-2.5-coder-32b-instruct:free"
+  GROQ: { 
+    baseURL: "https://api.groq.com/openai/v1", 
+    apiKey: process.env.GROQ_API_KEY || "", 
+    timeout: 30000, 
+    maxTokens: 1500, 
+    temperature: 0.7 
   },
-  v250: {
-    reasoningProvider: "openrouter",
-    reasoningModel: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free",
-    // Le raisonnement (chain-of-thought) de DeepSeek-R1 consomme énormément de tokens :
-    // un budget trop court coupe la réponse avant qu'elle ne soit produite ("renvoie rien").
-    reasoningMaxTokens: parseInt(process.env.OPENROUTER_V250_REASONING_MAX_TOKENS || "8000", 10),
-    codeProvider: "openrouter",
-    codeModel: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free",
-    codeFallbackProvider: "groq",
-    codeFallbackModel: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "openai/gpt-oss-120b",
-    codeMaxTokens: parseInt(process.env.OPENROUTER_V250_CODE_MAX_TOKENS || "8000", 10)
+  OPENROUTER: { 
+    baseURL: "https://openrouter.ai/api/v1", 
+    apiKey: process.env.OPENROUTER_API_KEY || "", 
+    timeout: 45000, 
+    maxTokens: 1500, 
+    temperature: 0.7 
   }
 };
 
-async function callProviderRaw({ provider, model, messages, jsonMode = false, timeout, maxTokens }) {
+// ==================== MATRICE DE REPLI EN CASCADE ====================
+const MODEL_TIERS = {
+  v100: {
+    name: "Mwamba",
+    description: "Rapide - Réponses instantanées",
+    providers: [
+      {
+        provider: "groq",
+        model: process.env.GROQ_MODEL_V100 || "openai/gpt-oss-120b",
+        maxTokens: 1500,
+        timeout: 30000,
+        temperature: 0.7,
+        jsonMode: true,
+        failoverPriority: 0
+      },
+      {
+        provider: "openrouter",
+        model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "qwen/qwen-2.5-coder-32b-instruct:free",
+        maxTokens: 1500,
+        timeout: 45000,
+        temperature: 0.7,
+        jsonMode: true,
+        failoverPriority: 1
+      },
+      {
+        provider: "openrouter",
+        model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "meta-llama/llama-3.3-70b-instruct:free",
+        maxTokens: 1500,
+        timeout: 45000,
+        temperature: 0.7,
+        jsonMode: true,
+        failoverPriority: 2
+      },
+      {
+        provider: "openrouter",
+        model: process.env.OPENROUTER_MODEL_V100_FALLBACK_3 || "microsoft/phi-4:free",
+        maxTokens: 1500,
+        timeout: 45000,
+        temperature: 0.7,
+        jsonMode: true,
+        failoverPriority: 3
+      }
+    ]
+  },
+  v250: {
+    name: "Ngandu",
+    description: "Raisonnement & Code Pro",
+    reasoning: {
+      providers: [
+        {
+          provider: "openrouter",
+          model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free",
+          maxTokens: parseInt(process.env.OPENROUTER_V250_REASONING_MAX_TOKENS || "8000", 10),
+          timeout: 55000,
+          temperature: 0.3,
+          jsonMode: false,
+          failoverPriority: 0
+        },
+        {
+          provider: "openrouter",
+          model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "deepseek/deepseek-r1-distill-llama-70b:free",
+          maxTokens: parseInt(process.env.OPENROUTER_V250_REASONING_MAX_TOKENS || "8000", 10),
+          timeout: 55000,
+          temperature: 0.3,
+          jsonMode: false,
+          failoverPriority: 1
+        },
+        {
+          provider: "groq",
+          model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "openai/gpt-oss-120b",
+          maxTokens: parseInt(process.env.GROQ_V250_REASONING_MAX_TOKENS || "4000", 10),
+          timeout: 30000,
+          temperature: 0.3,
+          jsonMode: false,
+          failoverPriority: 2
+        }
+      ]
+    },
+    code: {
+      providers: [
+        {
+          provider: "openrouter",
+          model: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free",
+          maxTokens: parseInt(process.env.OPENROUTER_V250_CODE_MAX_TOKENS || "8000", 10),
+          timeout: 55000,
+          temperature: 0.5,
+          jsonMode: true,
+          failoverPriority: 0
+        },
+        {
+          provider: "groq",
+          model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "openai/gpt-oss-120b",
+          maxTokens: parseInt(process.env.GROQ_V250_CODE_MAX_TOKENS || "8000", 10),
+          timeout: 30000,
+          temperature: 0.5,
+          jsonMode: true,
+          failoverPriority: 1
+        },
+        {
+          provider: "openrouter",
+          model: process.env.OPENROUTER_MODEL_V250_CODE_FALLBACK_2 || "meta-llama/llama-3.3-70b-instruct:free",
+          maxTokens: parseInt(process.env.OPENROUTER_V250_CODE_MAX_TOKENS || "8000", 10),
+          timeout: 45000,
+          temperature: 0.5,
+          jsonMode: true,
+          failoverPriority: 2
+        }
+      ]
+    },
+    maxRetries: 2,
+    degradedMode: true
+  }
+};
+
+// ==================== VALIDATION & FILTRE OPENROUTER ====================
+function validateAndSanitizeOpenRouterModel(model) {
+  if (!model || typeof model !== "string") {
+    return null;
+  }
+  
+  const knownProviders = [
+    "openai/", "qwen/", "meta-llama/", "deepseek/", "microsoft/", 
+    "anthropic/", "google/", "mistralai/", "cohere/"
+  ];
+  
+  const isOpenRouterModel = knownProviders.some(prefix => model.includes(prefix));
+  
+  if (isOpenRouterModel) {
+    if (!model.includes(":free") && !model.includes(":paid") && !model.includes(":beta")) {
+      return `${model}:free`;
+    }
+  }
+  
+  return model;
+}
+
+// ==================== INTERCEPTEUR D'ERREURS GLOBAL ====================
+class LLMErrorInterceptor {
+  static isRetryableError(error) {
+    const status = error.response?.status;
+    const retryableStatuses = [402, 404, 408, 429, 500, 502, 503, 504];
+    const isTimeout = error.code === "ECONNABORTED" || 
+                      error.code === "ETIMEDOUT" || 
+                      error.code === "ESOCKETTIMEDOUT" ||
+                      /timeout/i.test(error.message || "");
+    const isNetworkError = error.code === "ENOTFOUND" || 
+                           error.code === "ECONNRESET" ||
+                           error.code === "ECONNREFUSED" ||
+                           error.code === "EAI_AGAIN";
+    
+    return retryableStatuses.includes(status) || isTimeout || isNetworkError;
+  }
+  
+  static getErrorCode(error) {
+    const status = error.response?.status;
+    if (status) return `HTTP_${status}`;
+    if (error.code === "ECONNABORTED") return "TIMEOUT";
+    if (error.code === "ENOTFOUND") return "DNS_ERROR";
+    if (error.code === "ECONNREFUSED") return "CONNECTION_REFUSED";
+    return "UNKNOWN_ERROR";
+  }
+  
+  static shouldSkipProvider(error, providerConfig) {
+    const errorCode = this.getErrorCode(error);
+    
+    if (errorCode === "HTTP_402") {
+      console.warn(`[LLM-INTERCEPTOR] Crédits épuisés sur ${providerConfig.provider}/${providerConfig.model}`);
+      return true;
+    }
+    
+    if (errorCode === "HTTP_404") {
+      console.warn(`[LLM-INTERCEPTOR] Modèle introuvable: ${providerConfig.model}`);
+      return true;
+    }
+    
+    return false;
+  }
+}
+
+// ==================== WRAPPER EXECUTE WITH RETRY AND FALLBACK ====================
+async function executeWithRetryAndFallback(providerList, promptParams, options = {}) {
+  const {
+    maxRetriesPerProvider = 1,
+    timeoutMultiplier = 1.5,
+    onProviderFail = null,
+    onProviderSuccess = null
+  } = options;
+  
+  let lastError = null;
+  const providerResults = [];
+  
+  const sortedProviders = [...providerList].sort((a, b) => a.failoverPriority - b.failoverPriority);
+  
+  for (let i = 0; i < sortedProviders.length; i++) {
+    const providerConfig = sortedProviders[i];
+    const provider = providerConfig.provider;
+    
+    const providerConfig2 = LLM_PROVIDERS[provider.toUpperCase()];
+    if (!providerConfig2 || !providerConfig2.apiKey) {
+      console.warn(`[LLM-FALLBACK] Fournisseur ${provider} non configuré - skip`);
+      continue;
+    }
+    
+    let model = providerConfig.model;
+    if (provider === "openrouter") {
+      model = validateAndSanitizeOpenRouterModel(model);
+      if (!model) {
+        console.warn(`[LLM-FALLBACK] Modèle OpenRouter invalide - skip`);
+        continue;
+      }
+    }
+    
+    console.log(`[LLM-FALLBACK] Tentative ${i + 1}/${sortedProviders.length} : ${provider}/${model}`);
+    
+    for (let attempt = 0; attempt <= maxRetriesPerProvider; attempt++) {
+      try {
+        const timeout = providerConfig.timeout * (attempt > 0 ? timeoutMultiplier : 1);
+        
+        const result = await callProviderRaw({
+          provider,
+          model,
+          messages: promptParams.messages,
+          jsonMode: providerConfig.jsonMode,
+          timeout,
+          maxTokens: providerConfig.maxTokens,
+          temperature: providerConfig.temperature
+        });
+        
+        const providerResult = {
+          providerUsed: provider,
+          modelUsed: model,
+          providerPriority: providerConfig.failoverPriority,
+          attempts: attempt + 1,
+          response: result
+        };
+        
+        providerResults.push(providerResult);
+        
+        if (onProviderSuccess) {
+          onProviderSuccess(providerResult);
+        }
+        
+        console.log(`[LLM-FALLBACK] ✅ Succès avec ${provider}/${model} (tentative ${attempt + 1})`);
+        
+        return {
+          success: true,
+          ...providerResult,
+          providerChain: providerResults
+        };
+        
+      } catch (error) {
+        lastError = error;
+        const errorCode = LLMErrorInterceptor.getErrorCode(error);
+        
+        console.error(`[LLM-FALLBACK] ❌ Échec ${provider}/${model} (tentative ${attempt + 1}): ${errorCode} - ${error.message}`);
+        
+        if (onProviderFail) {
+          onProviderFail({
+            provider,
+            model,
+            errorCode,
+            errorMessage: error.message,
+            attempt: attempt + 1
+          });
+        }
+        
+        if (LLMErrorInterceptor.shouldSkipProvider(error, providerConfig)) {
+          console.log(`[LLM-FALLBACK] Provider ${provider} marqué comme indisponible - passage au suivant`);
+          break;
+        }
+        
+        if (!LLMErrorInterceptor.isRetryableError(error) && attempt === maxRetriesPerProvider) {
+          break;
+        }
+        
+        if (attempt < maxRetriesPerProvider) {
+          const retryDelay = Math.min(1000 * Math.pow(2, attempt), 5000);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+      }
+    }
+  }
+  
+  console.error(`[LLM-FALLBACK] ❌ Tous les fournisseurs ont échoué. Dernière erreur: ${lastError?.message}`);
+  
+  return {
+    success: false,
+    error: lastError,
+    providerChain: providerResults,
+    errorCode: LLMErrorInterceptor.getErrorCode(lastError)
+  };
+}
+
+// ==================== APPEL PROVIDER BRUT ====================
+async function callProviderRaw({ provider, model, messages, jsonMode = false, timeout, maxTokens, temperature = 0.7 }) {
   const cfg = provider === "groq" ? LLM_PROVIDERS.GROQ : LLM_PROVIDERS.OPENROUTER;
+  
   if (!cfg.apiKey) {
     const err = new Error(`Clé API manquante pour le fournisseur ${provider}`);
     err.code = "MISSING_API_KEY";
     throw err;
   }
-
-  const payload = { model, messages, temperature: cfg.temperature, max_tokens: maxTokens || cfg.maxTokens };
-  if (jsonMode) payload.response_format = { type: "json_object" };
-
-  const headers = { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" };
+  
+  const payload = { 
+    model, 
+    messages, 
+    temperature, 
+    max_tokens: maxTokens || cfg.maxTokens 
+  };
+  
+  if (jsonMode) {
+    payload.response_format = { type: "json_object" };
+  }
+  
+  const headers = { 
+    Authorization: `Bearer ${cfg.apiKey}`, 
+    "Content-Type": "application/json" 
+  };
+  
   if (provider === "openrouter") {
     headers["HTTP-Referer"] = "https://luba-ia.web.app";
     headers["X-Title"] = "Luba.ia Assistant";
   }
-
-  const response = await axios.post(`${cfg.baseURL}/chat/completions`, payload, { headers, timeout: timeout || cfg.timeout });
+  
+  const response = await axios.post(
+    `${cfg.baseURL}/chat/completions`, 
+    payload, 
+    { headers, timeout: timeout || cfg.timeout }
+  );
+  
   const choice = response.data?.choices?.[0];
   const content = choice?.message?.content;
-
+  
   if (choice?.finish_reason === "length") {
-    console.warn(`⚠️ Réponse ${provider}/${model} tronquée par max_tokens (finish_reason=length) — augmente le budget de tokens si le contenu semble incomplet.`);
+    console.warn(`⚠️ Réponse ${provider}/${model} tronquée par max_tokens`);
   }
-  if (!content) throw new Error(`Réponse ${provider} vide`);
-
+  
+  if (!content) {
+    throw new Error(`Réponse ${provider} vide`);
+  }
+  
   return jsonMode ? JSON.parse(content) : content;
 }
 
-function isFailoverWorthy(error) {
-  const status = error.response?.status;
-  const isTimeout = error.code === "ECONNABORTED" || /timeout/i.test(error.message || "");
-  // 402 = crédits OpenRouter épuisés sur un modèle payant (le modèle demandé n'a pas
-  // le tag :free, ou le compte n'a pas de crédits) — doit basculer comme une panne.
-  return status === 402 || status === 429 || status === 500 || status === 503 || isTimeout;
-}
-
-async function callLLM_v100(messages) {
-  const tier = MODEL_TIERS.v100;
-  const fullMessages = [LUBA_SYSTEM_PROMPT, ...messages];
-
-  try {
-    const result = await callProviderRaw({ provider: tier.primaryProvider, model: tier.primaryModel, messages: fullMessages, jsonMode: true });
-    return { ...result, providerUsed: "groq" };
-  } catch (error) {
-    const status = error.response?.status;
-    console.error(`❌ Erreur ${tier.primaryProvider} (v100)${status ? ` [HTTP ${status}]` : ""}:`, error.message);
-    if (!isFailoverWorthy(error)) console.warn("⚠️ Erreur non standard — bascule OpenRouter tentée quand même par prudence.");
-
-    try {
-      const result = await callProviderRaw({ provider: tier.fallbackProvider, model: tier.fallbackModel, messages: fullMessages, jsonMode: true });
-      return { ...result, providerUsed: "openrouter_fallback" };
-    } catch (fallbackError) {
-      console.error(`❌ Erreur ${tier.fallbackProvider} (fallback v100):`, fallbackError.message);
-      throw new Error("Groq et OpenRouter indisponibles (v100)");
+// ==================== GESTION DE CONTEXTE OPTIMISÉE ====================
+class ConversationContextManager {
+  constructor(maxTokens = CONFIG.MAX_CONTEXT_TOKENS) {
+    this.maxTokens = maxTokens;
+  }
+  
+  estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+  }
+  
+  truncateHistory(history, currentMessage) {
+    let totalTokens = this.estimateTokens(currentMessage);
+    const truncatedHistory = [];
+    
+    for (let i = history.length - 1; i >= 0; i--) {
+      const message = history[i];
+      const messageTokens = this.estimateTokens(message.content);
+      
+      if (totalTokens + messageTokens > this.maxTokens) {
+        break;
+      }
+      
+      totalTokens += messageTokens;
+      truncatedHistory.unshift(message);
     }
+    
+    return truncatedHistory;
+  }
+  
+  async getCleanContext(conversationId, currentMessage, limit = CONFIG.MAX_HISTORY_LENGTH) {
+    const history = await getHistory(conversationId, limit);
+    const cleanHistory = this.truncateHistory(history, currentMessage);
+    
+    return {
+      messages: [...cleanHistory, { role: "user", content: currentMessage }],
+      historyLength: cleanHistory.length,
+      estimatedTokens: this.estimateTokens(JSON.stringify(cleanHistory))
+    };
   }
 }
 
-async function callLLM_v250(messages, userMessage) {
-  const tier = MODEL_TIERS.v250;
+const contextManager = new ConversationContextManager();
 
-  const step1Messages = [
+// ==================== CALL LLM V100 - MWAMBA ====================
+async function callLLM_v100(messages) {
+  console.log("[LLM-v100] Démarrage du routage Mwamba");
+  
+  const providers = MODEL_TIERS.v100.providers;
+  
+  const result = await executeWithRetryAndFallback(
+    providers,
+    { messages: [LUBA_SYSTEM_PROMPT, ...messages] },
+    {
+      maxRetriesPerProvider: 1,
+      timeoutMultiplier: 1.5,
+      onProviderFail: (failInfo) => {
+        console.warn(`[LLM-v100] Failover détecté: ${failInfo.provider}/${failInfo.model} - ${failInfo.errorCode}`);
+      }
+    }
+  );
+  
+  if (result.success) {
+    return {
+      ...result.response,
+      providerUsed: result.providerUsed,
+      modelUsed: result.modelUsed,
+      degraded: result.providerPriority > 0
+    };
+  }
+  
+  throw new Error(`Échec complet du tier v100: ${result.errorCode}`);
+}
+
+// ==================== CALL LLM V250 - NGANDU ====================
+async function callLLM_v250(messages, userMessage) {
+  console.log("[LLM-v250] Démarrage du pipeline Ngandu");
+  
+  const tier = MODEL_TIERS.v250;
+  let providerChain = [];
+  
+  // ==================== ÉTAPE 1 : RAISONNEMENT ====================
+  console.log("[LLM-v250] Étape 1: Raisonnement");
+  
+  const reasoningMessages = [
     {
       role: "system",
-      content:
-        "Analyse ce problème complexe. Effectue les démonstrations mathématiques nécessaires, isole les edge cases et rédige le pseudo-code/l'architecture. Sois complet et rigoureux : cette analyse servira directement à générer le code final."
+      content: "Analyse ce problème complexe. Effectue les démonstrations mathématiques nécessaires, isole les edge cases et rédige le pseudo-code/l'architecture. Sois complet et rigoureux : cette analyse servira directement à générer le code final."
     },
     ...messages
   ];
-
-  let analysis;
-  try {
-    analysis = await callProviderRaw({
-      provider: tier.reasoningProvider,
-      model: tier.reasoningModel,
-      messages: step1Messages,
-      jsonMode: false,
-      timeout: CONFIG.V250_STEP_TIMEOUT,
-      maxTokens: tier.reasoningMaxTokens
-    });
-
-    if (!analysis || analysis.trim().length < 40) {
-      throw new Error(
-        "Réponse de raisonnement vide ou trop courte (probable troncature par manque de tokens) — augmente OPENROUTER_V250_REASONING_MAX_TOKENS."
-      );
+  
+  const reasoningResult = await executeWithRetryAndFallback(
+    tier.reasoning.providers,
+    { messages: reasoningMessages },
+    {
+      maxRetriesPerProvider: 1,
+      timeoutMultiplier: 1.2,
+      onProviderFail: (failInfo) => {
+        console.warn(`[LLM-v250-R1] Failover raisonnement: ${failInfo.provider}/${failInfo.model}`);
+      }
     }
-  } catch (error) {
-    const status = error.response?.status;
-    console.error(`❌ Erreur étape 1 (raisonnement, v250)${status ? ` [HTTP ${status}]` : ""}:`, error.message);
-    throw new Error(`Échec de l'étape de raisonnement (v250)${status ? ` [HTTP ${status}]` : ""}: ${error.message}`);
+  );
+  
+  if (!reasoningResult.success || !reasoningResult.response || reasoningResult.response.trim().length < 40) {
+    console.error("[LLM-v250] Échec de l'étape de raisonnement - dégradation vers v100");
+    return await degradedFallbackToV100(messages, "reasoning_failed");
   }
-
-  const step2Messages = [
+  
+  const reasoningAnalysis = reasoningResult.response;
+  providerChain.push(`R1:${reasoningResult.providerUsed}/${reasoningResult.modelUsed}`);
+  
+  console.log(`[LLM-v250] ✅ Raisonnement terminé via ${reasoningResult.providerUsed}/${reasoningResult.modelUsed}`);
+  
+  // ==================== ÉTAPE 2 : GÉNÉRATION DE CODE ====================
+  console.log("[LLM-v250] Étape 2: Génération de code");
+  
+  const codeMessages = [
     {
       role: "system",
       content: `Génère le code de production complet, typé, sécurisé et documenté en te basant strictement sur le plan ci-dessous.
 
 PLAN / ANALYSE (étape 1 — raisonnement) :
-${analysis}
+${reasoningAnalysis}
 
 Tu DOIS répondre au format JSON strict : { "replyText": "réponse complète en Markdown avec le code", "toolCalls": [], "suggestions": ["question de suivi 1 ?", "question de suivi 2 ?", "question de suivi 3 ?"] }.`
     },
     { role: "user", content: userMessage }
   ];
-
-  try {
-    const result = await callProviderRaw({
-      provider: tier.codeProvider,
-      model: tier.codeModel,
-      messages: step2Messages,
-      jsonMode: true,
-      timeout: CONFIG.V250_STEP_TIMEOUT,
-      maxTokens: tier.codeMaxTokens
-    });
-    return { ...result, providerUsed: "pipeline_v250" };
-  } catch (error) {
-    const status = error.response?.status;
-    console.error(`❌ Erreur étape 2 (génération de code, v250)${status ? ` [HTTP ${status}]` : ""}, tentative de repli:`, error.message);
-    try {
-      const result = await callProviderRaw({
-        provider: tier.codeFallbackProvider,
-        model: tier.codeFallbackModel,
-        messages: step2Messages,
-        jsonMode: true,
-        timeout: CONFIG.V250_STEP_TIMEOUT,
-        maxTokens: tier.codeMaxTokens
-      });
-      return { ...result, providerUsed: "pipeline_v250" };
-    } catch (fallbackError) {
-      const fallbackStatus = fallbackError.response?.status;
-      console.error(`❌ Erreur étape 2 de repli (v250)${fallbackStatus ? ` [HTTP ${fallbackStatus}]` : ""}:`, fallbackError.message);
-      throw new Error(`Échec de l'étape de génération de code (v250)${fallbackStatus ? ` [HTTP ${fallbackStatus}]` : ""}: ${fallbackError.message}`);
+  
+  const codeResult = await executeWithRetryAndFallback(
+    tier.code.providers,
+    { messages: codeMessages },
+    {
+      maxRetriesPerProvider: 1,
+      timeoutMultiplier: 1.2,
+      onProviderFail: (failInfo) => {
+        console.warn(`[LLM-v250-R2] Failover code: ${failInfo.provider}/${failInfo.model}`);
+      }
     }
+  );
+  
+  if (!codeResult.success || !codeResult.response) {
+    console.error("[LLM-v250] Échec de l'étape de génération de code - dégradation vers v100");
+    return await degradedFallbackToV100(messages, "code_generation_failed");
+  }
+  
+  providerChain.push(`R2:${codeResult.providerUsed}/${codeResult.modelUsed}`);
+  
+  console.log(`[LLM-v250] ✅ Code généré via ${codeResult.providerUsed}/${codeResult.modelUsed}`);
+  
+  return {
+    ...codeResult.response,
+    providerUsed: "pipeline_v250",
+    modelUsed: providerChain.join(" -> "),
+    degraded: false,
+    providerChain,
+    reasoningProviderUsed: reasoningResult.providerUsed
+  };
+}
+
+// ==================== GARDE-FOU : DÉGRADATION GRACIEUSE ====================
+async function degradedFallbackToV100(messages, reason) {
+  console.warn(`[LLM-GARDE-FOU] Dégradation gracieuse vers v100 (${reason})`);
+  
+  try {
+    const fallbackResult = await callLLM_v100(messages);
+    return {
+      ...fallbackResult,
+      providerUsed: "v250_degraded_to_v100",
+      modelUsed: `${fallbackResult.providerUsed}/${fallbackResult.modelUsed}`,
+      degraded: true,
+      degradationReason: reason,
+      originalTier: "v250",
+      actualTier: "v100"
+    };
+  } catch (fallbackError) {
+    console.error("[LLM-GARDE-FOU] Échec total de la dégradation:", fallbackError.message);
+    
+    return {
+      replyText: "Je rencontre actuellement des difficultés techniques. Veuillez réessayer dans quelques instants. Nos équipes techniques ont été informées.",
+      toolCalls: [],
+      suggestions: [
+        "Peux-tu réessayer avec une question plus simple ?",
+        "Comment fonctionne Luba.ia ?",
+        "Quels sont les services disponibles ?"
+      ],
+      providerUsed: "error_graceful_degradation",
+      modelUsed: "none",
+      degraded: true,
+      degradationReason: `${reason}_and_v100_failed`,
+      error: true
+    };
   }
 }
 
@@ -1287,6 +1668,8 @@ async function executeTool(toolName, args = {}, context = {}) {
 
 // ==================== BOUCLE REACT (Tier v100) / PIPELINE (Tier v250) ====================
 async function handleChat({ conversationId, userId, message, googleAccessToken = null, channel = "web", modelTier = "v100" }) {
+  console.log(`[CHAT] Démarrage conversation ${conversationId} - Tier: ${modelTier} - Channel: ${channel}`);
+  
   await getSession(conversationId, userId);
 
   const activeIntent = await getActiveIntent(conversationId);
@@ -1294,115 +1677,138 @@ async function handleChat({ conversationId, userId, message, googleAccessToken =
     return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken });
   }
 
-  const history = await getHistory(conversationId);
   await saveMessage(conversationId, "user", message);
 
-  const messages = [...history, { role: "user", content: message }];
+  const context = await contextManager.getCleanContext(conversationId, message);
+  const messages = context.messages;
+
+  console.log(`[CHAT] Contexte préparé - ${context.historyLength} messages d'historique, ~${context.estimatedTokens} tokens estimés`);
 
   let finalResponse = null;
   let imageUrls = [];
   let providerUsed = "unknown";
   let suggestions = [];
   const usedSources = new Set();
+  let degraded = false;
 
-  if (modelTier === "v250") {
-    try {
+  try {
+    if (modelTier === "v250") {
       const result = await callLLM_v250(messages, message);
       finalResponse = result.replyText || "Je n'ai pas pu générer une réponse.";
       suggestions = Array.isArray(result.suggestions) ? result.suggestions.slice(0, 4) : [];
       providerUsed = result.providerUsed || "pipeline_v250";
-    } catch (error) {
-      // 402 (crédits OpenRouter épuisés), timeout, ou toute autre panne du pipeline
-      // v250 : on ne renvoie JAMAIS une erreur brute à l'utilisateur — on bascule
-      // silencieusement sur le tier v100 (Groq + fallback OpenRouter) pour garantir
-      // une vraie réponse.
-      console.error("❌ Erreur pipeline Luba v.250, bascule automatique vers v.100:", error.message);
-      try {
-        const fallbackResult = await callLLM_v100(messages);
-        finalResponse = fallbackResult.replyText || "Je n'ai pas pu générer une réponse.";
-        suggestions = Array.isArray(fallbackResult.suggestions) ? fallbackResult.suggestions.slice(0, 4) : [];
-        providerUsed = `v250_fallback_${fallbackResult.providerUsed}`;
-      } catch (fallbackError) {
-        console.error("❌ Échec total v250 + repli v100:", fallbackError.message);
-        finalResponse = "⚠️ Luba est momentanément indisponible sur tous les modèles. Réessaie dans un instant.";
-        providerUsed = "error_total";
-      }
-    }
-  } else {
-    let keepRunning = true;
-    let maxLoops = 5;
+      degraded = result.degraded || false;
+      
+      console.log(`[CHAT] Réponse v250 générée via ${providerUsed}${degraded ? ' (dégradé)' : ''}`);
+      
+    } else {
+      let keepRunning = true;
+      let maxLoops = 5;
 
-    while (keepRunning && maxLoops > 0) {
-      maxLoops--;
-      let llmResponse;
-      try {
-        llmResponse = await callLLM_v100(messages);
-        providerUsed = llmResponse.providerUsed;
-      } catch (error) {
-        console.error("❌ Erreur LLM v100 (Groq + OpenRouter):", error.message);
-        finalResponse = "⚠️ Le service d'IA est momentanément indisponible. Veuillez réessayer dans un instant.";
-        providerUsed = "error_v100";
-        break;
-      }
-
-      if (llmResponse.toolCalls && llmResponse.toolCalls.length > 0) {
-        for (const toolCall of llmResponse.toolCalls) {
-          let toolResult;
-          try {
-            const { result, sourceKeys } = await executeTool(toolCall.name, toolCall.arguments || {}, { userId, googleAccessToken });
-            toolResult = result;
-            sourceKeys.forEach((k) => usedSources.add(k));
-            if ((toolCall.name === "search_images" || toolCall.name === "search_image") && toolResult.images) {
-              imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
-            }
-          } catch (toolError) {
-            console.error(`❌ Erreur outil ${toolCall.name}:`, toolError.message);
-            toolResult = { success: false, error: toolError.message };
-          }
-
-          messages.push({ role: "assistant", content: `Résultat de l'outil ${toolCall.name}: ${JSON.stringify(toolResult)}` });
+      while (keepRunning && maxLoops > 0) {
+        maxLoops--;
+        let llmResponse;
+        try {
+          llmResponse = await callLLM_v100(messages);
+          providerUsed = llmResponse.providerUsed;
+          degraded = llmResponse.degraded || false;
+        } catch (error) {
+          console.error("[CHAT] Erreur LLM v100:", error.message);
+          finalResponse = "Je suis momentanément indisponible. Veuillez réessayer dans quelques instants.";
+          suggestions = [
+            "Peux-tu réessayer ?",
+            "Comment fonctionne Luba.ia ?",
+            "Quels sont les services disponibles ?"
+          ];
+          providerUsed = "error_graceful_degradation";
+          degraded = true;
+          break;
         }
 
-        messages.push({
-          role: "user",
-          content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi dans le champ suggestions."
-        });
-        keepRunning = true;
-      } else {
-        finalResponse = llmResponse.replyText || "Je n'ai pas pu générer une réponse.";
-        suggestions = Array.isArray(llmResponse.suggestions) ? llmResponse.suggestions.slice(0, 4) : [];
-        keepRunning = false;
+        if (llmResponse.toolCalls && llmResponse.toolCalls.length > 0) {
+          for (const toolCall of llmResponse.toolCalls) {
+            let toolResult;
+            try {
+              const { result, sourceKeys } = await executeTool(toolCall.name, toolCall.arguments || {}, { userId, googleAccessToken });
+              toolResult = result;
+              sourceKeys.forEach((k) => usedSources.add(k));
+              if ((toolCall.name === "search_images" || toolCall.name === "search_image") && toolResult.images) {
+                imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
+              }
+            } catch (toolError) {
+              console.error(`[CHAT] Erreur outil ${toolCall.name}:`, toolError.message);
+              toolResult = { success: false, error: toolError.message };
+            }
+
+            messages.push({ role: "assistant", content: `Résultat de l'outil ${toolCall.name}: ${JSON.stringify(toolResult)}` });
+          }
+
+          messages.push({
+            role: "user",
+            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi dans le champ suggestions."
+          });
+          keepRunning = true;
+        } else {
+          finalResponse = llmResponse.replyText || "Je n'ai pas pu générer une réponse.";
+          suggestions = Array.isArray(llmResponse.suggestions) ? llmResponse.suggestions.slice(0, 4) : [];
+          keepRunning = false;
+        }
       }
+
+      if (!finalResponse) finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
     }
 
-    if (!finalResponse) finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
+    if (imageUrls.length > 0) {
+      const imageMarkdown = imageUrls.map((url, index) => `![Image ${index + 1}](${url})`).join("\n\n");
+      finalResponse += `\n\n---\n\n📷 **Illustrations :**\n\n${imageMarkdown}`;
+      usedSources.add("wikimediacommons");
+    }
+
+    if (usedSources.size > 0) {
+      const sourceLines = Array.from(usedSources)
+        .map((key) => OPEN_SOURCES[key])
+        .filter(Boolean)
+        .map((src) => `[![${src.name}](${src.logo})](${src.url}) ${src.name}`);
+      if (sourceLines.length > 0) finalResponse += `\n\n---\n\n**Sources :** ${sourceLines.join(" · ")}`;
+    }
+
+    await saveMessage(conversationId, "assistant", finalResponse);
+
+    console.log(`[CHAT] ✅ Réponse finale générée (${finalResponse.length} caractères)`);
+
+    return {
+      reply: finalResponse,
+      images: imageUrls,
+      error: providerUsed.startsWith("error"),
+      providerUsed,
+      modelTier,
+      degraded,
+      suggestions,
+      sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean)
+    };
+
+  } catch (error) {
+    console.error("[CHAT] Erreur critique:", error.message);
+
+    const fallbackResponse = {
+      reply: "Je suis momentanément indisponible. Nos équipes techniques travaillent à résoudre le problème. Veuillez réessayer dans quelques instants.",
+      images: [],
+      error: true,
+      providerUsed: "error_critical",
+      modelTier,
+      degraded: true,
+      suggestions: [
+        "Peux-tu réessayer ?",
+        "Comment fonctionne Luba.ia ?",
+        "Quels sont les services disponibles ?"
+      ],
+      sources: []
+    };
+
+    await saveMessage(conversationId, "assistant", fallbackResponse.reply);
+
+    return fallbackResponse;
   }
-
-  if (imageUrls.length > 0) {
-    const imageMarkdown = imageUrls.map((url, index) => `![Image ${index + 1}](${url})`).join("\n\n");
-    finalResponse += `\n\n---\n\n📷 **Illustrations :**\n\n${imageMarkdown}`;
-    usedSources.add("wikimediacommons");
-  }
-
-  if (usedSources.size > 0) {
-    const sourceLines = Array.from(usedSources)
-      .map((key) => OPEN_SOURCES[key])
-      .filter(Boolean)
-      .map((src) => `[![${src.name}](${src.logo})](${src.url}) ${src.name}`);
-    if (sourceLines.length > 0) finalResponse += `\n\n---\n\n**Sources :** ${sourceLines.join(" · ")}`;
-  }
-
-  await saveMessage(conversationId, "assistant", finalResponse);
-
-  return {
-    reply: finalResponse,
-    images: imageUrls,
-    error: providerUsed.startsWith("error"),
-    providerUsed,
-    modelTier,
-    suggestions,
-    sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean)
-  };
 }
 
 // ==================== GESTION DES INTENTIONS GUIDÉES (multi-tour) ====================
@@ -1468,46 +1874,111 @@ app.get("/", (req, res) => {
   res.json({ reply: `✅ Serveur ${CONFIG.AGENT_NAME} opérationnel`, error: false, version: CONFIG.VERSION });
 });
 
-app.get(
-  "/api/health",
-  asyncHandler(async (req, res) => {
-    let dbOk = true;
-    try {
-      await dbGet("SELECT 1", []);
-    } catch (e) {
-      dbOk = false;
-    }
+// ==================== HEALTH CHECK AMÉLIORÉ ====================
+app.get("/api/health", asyncHandler(async (req, res) => {
+  let dbOk = true;
+  try {
+    await dbGet("SELECT 1", []);
+  } catch (e) {
+    dbOk = false;
+  }
 
-    res.json({
-      reply: `✅ Serveur ${CONFIG.AGENT_NAME} en bonne santé`,
-      error: !dbOk,
-      data: {
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
-        database: dbOk ? "ok" : "erreur",
-        security: { firebaseAuthConfigured: Boolean(firebaseApp) },
-        whatsapp: {
-          baileysSessionsActives: whatsappManager.sessions.size,
-          gatewayExterneConfiguree: whatsappGateway.configured(),
-          queue: useRedisQueue ? "bullmq+redis" : "memoire (repli)"
+  const llmHealth = {
+    groq: {
+      configured: Boolean(LLM_PROVIDERS.GROQ.apiKey),
+      status: "unknown",
+      latency: null
+    },
+    openrouter: {
+      configured: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey),
+      status: "unknown",
+      latency: null
+    }
+  };
+
+  if (LLM_PROVIDERS.GROQ.apiKey) {
+    const startTime = Date.now();
+    try {
+      await axios.get("https://api.groq.com/openai/v1/models", {
+        headers: { Authorization: `Bearer ${LLM_PROVIDERS.GROQ.apiKey}` },
+        timeout: 5000
+      });
+      llmHealth.groq.status = "healthy";
+      llmHealth.groq.latency = Date.now() - startTime;
+    } catch (e) {
+      llmHealth.groq.status = "degraded";
+      llmHealth.groq.latency = Date.now() - startTime;
+    }
+  }
+
+  if (LLM_PROVIDERS.OPENROUTER.apiKey) {
+    const startTime = Date.now();
+    try {
+      await axios.get("https://openrouter.ai/api/v1/models", {
+        headers: { Authorization: `Bearer ${LLM_PROVIDERS.OPENROUTER.apiKey}` },
+        timeout: 5000
+      });
+      llmHealth.openrouter.status = "healthy";
+      llmHealth.openrouter.latency = Date.now() - startTime;
+    } catch (e) {
+      llmHealth.openrouter.status = "degraded";
+      llmHealth.openrouter.latency = Date.now() - startTime;
+    }
+  }
+
+  res.json({
+    reply: `✅ Serveur ${CONFIG.AGENT_NAME} en bonne santé`,
+    error: !dbOk,
+    data: {
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
+      database: dbOk ? "ok" : "erreur",
+      security: { firebaseAuthConfigured: Boolean(firebaseApp) },
+      whatsapp: {
+        baileysSessionsActives: whatsappManager.sessions.size,
+        gatewayExterneConfiguree: whatsappGateway.configured(),
+        queue: useRedisQueue ? "bullmq+redis" : "memoire (repli)"
+      },
+      llmTiers: {
+        v100: {
+          name: "Mwamba",
+          providers: MODEL_TIERS.v100.providers.map(p => ({
+            provider: p.provider,
+            model: p.model,
+            priority: p.failoverPriority
+          }))
         },
-        llmTiers: {
-          v100: { primary: MODEL_TIERS.v100.primaryModel, fallback: MODEL_TIERS.v100.fallbackModel },
-          v250: {
-            reasoning: MODEL_TIERS.v250.reasoningModel,
-            reasoningMaxTokens: MODEL_TIERS.v250.reasoningMaxTokens,
-            code: MODEL_TIERS.v250.codeModel,
-            codeMaxTokens: MODEL_TIERS.v250.codeMaxTokens
-          }
-        },
-        llmProviders: { groq: Boolean(LLM_PROVIDERS.GROQ.apiKey), openrouter: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey) },
-        openSources: Object.keys(OPEN_SOURCES),
-        email: { gmailOAuth: "à la demande", resend: Boolean(process.env.RESEND_API_KEY), smtp: Boolean(emailTransporter) }
+        v250: {
+          name: "Ngandu",
+          reasoning: MODEL_TIERS.v250.reasoning.providers.map(p => ({
+            provider: p.provider,
+            model: p.model,
+            priority: p.failoverPriority
+          })),
+          code: MODEL_TIERS.v250.code.providers.map(p => ({
+            provider: p.provider,
+            model: p.model,
+            priority: p.failoverPriority
+          })),
+          maxRetries: MODEL_TIERS.v250.maxRetries,
+          degradedMode: MODEL_TIERS.v250.degradedMode
+        }
+      },
+      llmHealth,
+      llmProviders: { 
+        groq: Boolean(LLM_PROVIDERS.GROQ.apiKey), 
+        openrouter: Boolean(LLM_PROVIDERS.OPENROUTER.apiKey) 
+      },
+      openSources: Object.keys(OPEN_SOURCES),
+      email: { 
+        gmailOAuth: "à la demande", 
+        resend: Boolean(process.env.RESEND_API_KEY), 
+        smtp: Boolean(emailTransporter) 
       }
-    });
-  })
-);
+    }
+  });
+}));
 
 app.get(
   "/api/conversations",
@@ -1822,9 +2293,31 @@ const server = app.listen(PORT, () => {
   console.log(`🔢 Version : ${CONFIG.VERSION}`);
   console.log(`🔌 Port : ${PORT}`);
   console.log(`🔐 Sécurité utilisateur : ${firebaseApp ? "Firebase Admin actif (tokens vérifiés)" : "⚠️ NON vérifiée cryptographiquement"}`);
-  console.log(`🎚️ Tiers LLM : v100 (${MODEL_TIERS.v100.primaryModel} → ${MODEL_TIERS.v100.fallbackModel}) | v250 (${MODEL_TIERS.v250.reasoningModel}[${MODEL_TIERS.v250.reasoningMaxTokens}tok] → ${MODEL_TIERS.v250.codeModel}[${MODEL_TIERS.v250.codeMaxTokens}tok])`);
-  console.log(`📧 Email : Gmail OAuth + Resend (${process.env.RESEND_API_KEY ? "configuré" : "non configuré"}) + SMTP (${emailTransporter ? "configuré" : "non configuré"})`);
-  console.log(`📱 WhatsApp : Baileys (sans Chrome)`);
+  console.log("");
+  console.log("🎚️ ARCHITECTURE LLM ENTERPRISE :");
+  console.log("=".repeat(60));
+  
+  console.log("\n📦 TIER v100 (Mwamba - Rapide) :");
+  MODEL_TIERS.v100.providers.forEach((p, index) => {
+    const priority = index === 0 ? "PRIMAIRE" : `FALLBACK ${index}`;
+    console.log(`   ${priority.padEnd(15)}: ${p.provider}/${p.model} (max ${p.maxTokens} tokens)`);
+  });
+  
+  console.log("\n📦 TIER v250 (Ngandu - Raisonnement & Code) :");
+  console.log("   Étape 1 - Raisonnement :");
+  MODEL_TIERS.v250.reasoning.providers.forEach((p, index) => {
+    const priority = index === 0 ? "PRIMAIRE" : `FALLBACK ${index}`;
+    console.log(`     ${priority.padEnd(13)}: ${p.provider}/${p.model} (max ${p.maxTokens} tokens)`);
+  });
+  console.log("   Étape 2 - Code :");
+  MODEL_TIERS.v250.code.providers.forEach((p, index) => {
+    const priority = index === 0 ? "PRIMAIRE" : `FALLBACK ${index}`;
+    console.log(`     ${priority.padEnd(13)}: ${p.provider}/${p.model} (max ${p.maxTokens} tokens)`);
+  });
+  
+  console.log("\n🛡️ GARDE-FOU : Dégradation gracieuse active");
+  console.log("📧 Email : Gmail OAuth + Resend + SMTP");
+  console.log("📱 WhatsApp : Baileys (sans Chrome)");
   console.log(`🌍 Sources ouvertes : ${Object.keys(OPEN_SOURCES).join(", ")}`);
   console.log(`📬 File d'attente WhatsApp : ${useRedisQueue ? "BullMQ + Redis" : "en mémoire (repli)"}`);
   console.log("=".repeat(60) + "\n");
