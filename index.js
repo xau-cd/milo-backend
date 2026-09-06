@@ -1,25 +1,24 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 9.3.1 Enterprise (corrigée et complétée)
+// Version : 9.3.2 Enterprise (corrigée et complétée)
 // Architecture : Modulaire, Microservices-ready, Haute Disponibilité
 //
-// ⚠️ CORRECTIFS DE CETTE VERSION (par rapport à la 9.3.0 fournie) :
-// 1) Prompt système : ajout des règles strictes de génération HTML/CSS/JS valide.
-//    Le prompt est construit via un TABLEAU DE CHAÎNES joint par .join("\n") — donc
-//    AUCUN backtick n'est utilisé dans sa définition, ce qui élimine structurellement
-//    tout risque de crash au démarrage lié à des backticks mal échappés (plutôt que
-//    d'échapper des backticks à la main, on évite complètement le problème).
-// 2) Route POST /api/whatsapp/connect ajoutée (absente du fichier fourni).
-// 3) Sauvegarde systématique des messages en base (déjà présente dans handleChat,
-//    renforcée), logging complet des erreurs, chaînage optionnel sécurisé, et 500
-//    explicite avec détail sur /api/chat et /api/whatsapp/connect.
+// ⚠️ CORRECTIFS DE CETTE VERSION (9.3.2) :
+// P0 - Sécurité :
+// 1) Authentification Firebase OBLIGATOIRE en production (401/403 au lieu de 200)
+// 2) Persistance WhatsApp dans Supabase avec chiffrement AES-256-GCM
+// 3) CSP configurée (plus de contentSecurityPolicy: false)
 //
-// ⚠️ MODULES RESTAURÉS (référencés dans le fichier fourni mais jamais définis —
-// le serveur aurait planté au premier appel d'outil ou de WhatsApp) :
-// OPEN_SOURCES, searchWikimediaImages, searchWeb, searchNews, searchSportsScores,
-// searchScience, searchSocial, getWeather, dispatchSendEmail (+ Gmail/Resend/SMTP),
-// whatsappManager (Baileys, sans Chrome), sendWhatsAppSmart, et les routes
-// /api/whatsapp/send, /api/intent/init, /api/memory/clear (listées dans le 404
-// mais absentes du fichier fourni).
+// P0 - Bugs :
+// 4) /api/whatsapp/connect : champ harmonisé (data.qrCode + data.qrCodeBase64 + qr rétrocompat)
+// 5) /api/tools : accepte req.body.data
+// 6) Codes HTTP harmonisés (400, 401, 403, 408, 500, 503)
+//
+// P1 - Fonctionnalités :
+// 7) Vérification scope Gmail avant envoi
+// 8) Audit LLM dans llm_audit_log
+// 9) Validation stricte des variables d'environnement
+// 10) Route DELETE /api/account (RGPD)
+// 11) .env.example complet
 // ================================================================================
 
 require("dotenv").config();
@@ -69,7 +68,7 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "9.3.1",
+  VERSION: "9.3.2",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON Technology",
 
@@ -109,18 +108,57 @@ const CONFIG = {
   // Types MIME autorisés
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
 
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/9.3.1 (contact@luba.ia)"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/9.3.2 (contact@luba.ia)"
 };
 
 // ==================== VALIDATION ENVIRONNEMENT ====================
-const requiredEnvVars = ["GROQ_API_KEY", "OPENROUTER_API_KEY"];
-const missingEnvVars = requiredEnvVars.filter((varName) => !process.env[varName]);
-
-if (missingEnvVars.length > 0) {
-  console.error("=".repeat(60));
-  console.error("❌ VARIABLES D'ENVIRONNEMENT OBLIGATOIRES MANQUANTES :");
-  missingEnvVars.forEach((varName) => console.error(`   - ${varName}`));
-  console.error("=".repeat(60));
+function validateEnvironment() {
+  const errors = [];
+  const warnings = [];
+  
+  // Variables critiques
+  if (!process.env.GROQ_API_KEY) {
+    errors.push("GROQ_API_KEY manquante - tier v100 indisponible");
+  }
+  
+  if (!process.env.OPENROUTER_API_KEY) {
+    errors.push("OPENROUTER_API_KEY manquante - tier v250 et fallbacks indisponibles");
+  }
+  
+  // En production, Firebase est obligatoire
+  if (CONFIG.ENV === "production" && !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    errors.push("FIREBASE_SERVICE_ACCOUNT_JSON manquant en production - authentification impossible");
+  }
+  
+  // Variables recommandées
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+    warnings.push("Supabase non configuré - persistance multi-appareils désactivée");
+  }
+  
+  if (!process.env.RESEND_API_KEY && !process.env.SMTP_HOST) {
+    warnings.push("Aucun service email configuré - envoi d'email indisponible");
+  }
+  
+  if (!process.env.WHATSAPP_ENCRYPTION_KEY || !process.env.WHATSAPP_ENCRYPTION_IV) {
+    warnings.push("Clés de chiffrement WhatsApp manquantes - utilisation de clés par défaut");
+  }
+  
+  if (errors.length > 0) {
+    logger.error("Erreurs de configuration fatales :");
+    errors.forEach(err => logger.error("  - " + err));
+    
+    if (CONFIG.ENV === "production") {
+      logger.error("Arrêt du serveur - configuration invalide");
+      process.exit(1);
+    } else {
+      logger.warn("Mode développement : démarrage malgré les erreurs");
+    }
+  }
+  
+  if (warnings.length > 0) {
+    logger.warn("Avertissements de configuration :");
+    warnings.forEach(warn => logger.warn("  - " + warn));
+  }
 }
 
 // ==================== CRÉATION DES DOSSIERS ====================
@@ -290,7 +328,7 @@ if (firebaseAdmin && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   }
 }
 
-// ==================== CONFIGURATION EMAIL (Gmail OAuth -> Resend -> SMTP) ====================
+// ==================== CONFIGURATION EMAIL ====================
 let emailTransporter = null;
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   emailTransporter = nodemailer.createTransport({
@@ -385,6 +423,20 @@ function dbRun(query, params = []) {
       else resolve(this);
     });
   });
+}
+
+// ==================== AUDIT LLM ====================
+async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTokens, completionTokens, latencyMs, status, errorCode }) {
+  try {
+    await dbRun(
+      `INSERT INTO llm_audit_log 
+       (session_id, user_id, provider, model, tier, prompt_tokens, completion_tokens, latency_ms, status, error_code)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [sessionId, userId, provider, model, tier, promptTokens, completionTokens, latencyMs, status, errorCode]
+    );
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur audit LLM");
+  }
 }
 
 // ==================== CIRCUIT BREAKER PATTERN ====================
@@ -547,6 +599,7 @@ const OPEN_SOURCES = {
   openmeteo: { name: "Open-Meteo", url: "https://open-meteo.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=open-meteo.com" }
 };
 
+// ==================== FONCTIONS DE RECHERCHE ====================
 async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
   try {
@@ -567,7 +620,7 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
       .filter((img) => img.url);
     return { images };
   } catch (error) {
-    console.error("Détail Erreur recherche images Wikimedia:", error);
+    logger.error({ error: error.message }, "Erreur recherche images Wikimedia");
     return { images: [], error: error.message };
   }
 }
@@ -605,7 +658,7 @@ async function searchNews(query) {
     }
     return { articles: items };
   } catch (error) {
-    console.error("Détail Erreur recherche actualités:", error);
+    logger.error({ error: error.message }, "Erreur recherche actualités");
     return { articles: [], error: error.message };
   }
 }
@@ -643,7 +696,7 @@ async function searchSportsScores(query) {
     }));
     return { team: team.strTeam, events };
   } catch (error) {
-    console.error("Détail Erreur recherche scores sportifs:", error);
+    logger.error({ error: error.message }, "Erreur recherche scores sportifs");
     return { events: [], error: error.message };
   }
 }
@@ -666,7 +719,7 @@ async function searchScience(query) {
     }
     return { papers: items };
   } catch (error) {
-    console.error("Détail Erreur recherche scientifique (arXiv):", error);
+    logger.error({ error: error.message }, "Erreur recherche scientifique (arXiv)");
     return { papers: [], error: error.message };
   }
 }
@@ -684,7 +737,7 @@ async function searchSocial(query) {
     }));
     return { posts };
   } catch (error) {
-    console.error("Détail Erreur recherche réseaux sociaux (Reddit):", error);
+    logger.error({ error: error.message }, "Erreur recherche réseaux sociaux (Reddit)");
     return { posts: [], error: error.message };
   }
 }
@@ -707,13 +760,39 @@ async function getWeather(location) {
       weatherCode: current?.weather_code
     };
   } catch (error) {
-    console.error("Détail Erreur météo:", error);
+    logger.error({ error: error.message }, "Erreur météo");
     return { error: error.message };
   }
 }
 
-// ==================== ENVOI D'EMAIL : GMAIL API (OAuth) -> RESEND -> SMTP ====================
+// ==================== ENVOI D'EMAIL ====================
+async function verifyGmailScope(accessToken) {
+  try {
+    const response = await axios.get(
+      "https://www.googleapis.com/oauth2/v1/tokeninfo",
+      {
+        params: { access_token: accessToken },
+        timeout: 10000
+      }
+    );
+    
+    const scopes = response.data.scope?.split(" ") || [];
+    return scopes.includes("https://www.googleapis.com/auth/gmail.send") || 
+           scopes.includes("https://mail.google.com/");
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur vérification scope Gmail");
+    return false;
+  }
+}
+
 async function sendEmailViaGmail(accessToken, recipient, subject, body) {
+  const hasValidScope = await verifyGmailScope(accessToken);
+  if (!hasValidScope) {
+    const error = new Error("Token Gmail invalide ou scope gmail.send manquant");
+    error.code = "GMAIL_SCOPE_MISSING";
+    throw error;
+  }
+  
   const messageLines = [
     `To: ${recipient}`,
     `Subject: =?utf-8?B?${Buffer.from(subject || "(sans sujet)").toString("base64")}?=`,
@@ -749,7 +828,7 @@ async function sendEmailViaResend(recipient, subject, body) {
     return { success: true, provider: "resend", messageId: response.data?.id || null };
   } catch (error) {
     const apiError = error.response?.data?.message || error.message;
-    console.error("Détail Erreur envoi email via Resend:", error);
+    logger.error({ error: apiError }, "Erreur envoi email via Resend");
     return { success: false, error: `Resend: ${apiError}` };
   }
 }
@@ -766,7 +845,7 @@ async function sendEmailViaSMTP(to, subject, body) {
     });
     return { success: true, provider: "smtp", messageId: info.messageId };
   } catch (error) {
-    console.error("Détail Erreur envoi email SMTP:", error);
+    logger.error({ error: error.message }, "Erreur envoi email SMTP");
     return { success: false, error: error.message };
   }
 }
@@ -782,9 +861,8 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }
     try {
       result = await sendEmailViaGmail(googleAccessToken, recipient, subject, body);
     } catch (error) {
-      const apiError = error.response?.data?.error?.message || error.message;
-      console.error("Détail Erreur envoi email via Gmail API:", error);
-      result = { success: false, error: `Gmail API: ${apiError}` };
+      logger.error({ error: error.message }, "Erreur envoi email via Gmail API");
+      result = { success: false, error: `Gmail API: ${error.message}` };
     }
   } else if (process.env.RESEND_API_KEY) {
     result = await sendEmailViaResend(recipient, subject, body);
@@ -801,13 +879,82 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }
       result.error || null
     ]);
   } catch (logErr) {
-    console.error("Détail Erreur journalisation email:", logErr);
+    logger.error({ error: logErr.message }, "Erreur journalisation email");
   }
 
   return result;
 }
 
-// ==================== WHATSAPP — BAILEYS (WebSocket natif, sans Chrome) ====================
+// ==================== PERSISTANCE WHATSAPP ====================
+async function saveWhatsAppCredentials(userId, credentialsData) {
+  if (!supabase) {
+    logger.warn("Supabase non configuré - persistance WhatsApp locale uniquement");
+    return false;
+  }
+  
+  try {
+    const cipher = crypto.createCipheriv(
+      'aes-256-gcm',
+      Buffer.from(process.env.WHATSAPP_ENCRYPTION_KEY || 'default-key-32-bytes-long!!!!!!'),
+      Buffer.from(process.env.WHATSAPP_ENCRYPTION_IV || 'default-iv-16')
+    );
+    
+    let encrypted = cipher.update(JSON.stringify(credentialsData), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    
+    const { error } = await supabase
+      .from('whatsapp_credentials')
+      .upsert({
+        user_id: userId,
+        encrypted_data: encrypted,
+        auth_tag: authTag,
+        updated_at: new Date().toISOString()
+      });
+    
+    if (error) {
+      logger.error({ error: error.message }, "Erreur sauvegarde credentials WhatsApp");
+      return false;
+    }
+    
+    return true;
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur chiffrement credentials WhatsApp");
+    return false;
+  }
+}
+
+async function loadWhatsAppCredentials(userId) {
+  if (!supabase) return null;
+  
+  try {
+    const { data, error } = await supabase
+      .from('whatsapp_credentials')
+      .select('encrypted_data, auth_tag')
+      .eq('user_id', userId)
+      .single();
+    
+    if (error || !data) return null;
+    
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      Buffer.from(process.env.WHATSAPP_ENCRYPTION_KEY || 'default-key-32-bytes-long!!!!!!'),
+      Buffer.from(process.env.WHATSAPP_ENCRYPTION_IV || 'default-iv-16')
+    );
+    
+    decipher.setAuthTag(Buffer.from(data.auth_tag, 'hex'));
+    
+    let decrypted = decipher.update(data.encrypted_data, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    
+    return JSON.parse(decrypted);
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur déchiffrement credentials WhatsApp");
+    return null;
+  }
+}
+
+// ==================== WHATSAPP — BAILEYS ====================
 function toPlainWhatsAppText(markdown) {
   return String(markdown)
     .replace(/!\[.*?\]\(.*?\)/g, "")
@@ -830,6 +977,16 @@ class BaileysManager {
     const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
     if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
+    // Tenter de charger les credentials depuis Supabase
+    const savedCredentials = await loadWhatsAppCredentials(userId);
+    if (savedCredentials) {
+      try {
+        fs.writeFileSync(path.join(authDir, "creds.json"), JSON.stringify(savedCredentials));
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur restauration credentials WhatsApp");
+      }
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     let version;
     try {
@@ -849,7 +1006,11 @@ class BaileysManager {
     const sessionData = { sock, qrCode: null, ready: false };
     this.sessions.set(userId, sessionData);
 
-    sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", async (creds) => {
+      await saveCreds();
+      // Sauvegarder les credentials dans Supabase
+      await saveWhatsAppCredentials(userId, creds);
+    });
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -859,7 +1020,7 @@ class BaileysManager {
           sessionData.qrCode = await qrcode.toDataURL(qr, { width: 600, margin: 2 });
           logger.info({ userId }, "QR Code (Baileys) généré");
         } catch (e) {
-          console.error("Détail Erreur génération QR (Baileys):", e);
+          logger.error({ error: e.message }, "Erreur génération QR (Baileys)");
         }
       }
 
@@ -879,7 +1040,7 @@ class BaileysManager {
         this.sessions.delete(userId);
         if (shouldReconnect) {
           setTimeout(() => {
-            this.initClient(userId).catch((e) => console.error("Détail Erreur reconnexion Baileys:", e));
+            this.initClient(userId).catch((e) => logger.error({ error: e.message }, "Erreur reconnexion Baileys"));
           }, CONFIG.WHATSAPP_RETRY_DELAY);
         }
       }
@@ -913,7 +1074,7 @@ class BaileysManager {
             await sock.sendMessage(remoteJid, { text: toPlainWhatsAppText(result.reply) || "🙂" });
           }
         } catch (err) {
-          console.error("Détail Erreur traitement message entrant WhatsApp (Baileys):", err);
+          logger.error({ error: err.message }, "Erreur traitement message entrant WhatsApp (Baileys)");
         }
       }
     });
@@ -948,7 +1109,7 @@ class BaileysManager {
       try {
         session.sock.end(undefined);
       } catch (e) {
-        console.error(`Détail Erreur fermeture socket WhatsApp (${userId}):`, e);
+        logger.error({ error: e.message }, `Erreur fermeture socket WhatsApp (${userId})`);
       }
     }
   }
@@ -956,11 +1117,10 @@ class BaileysManager {
 
 const whatsappManager = new BaileysManager();
 
-// File d'attente pour les envois WhatsApp sortants (résilience réseau + débit contrôlé).
+// File d'attente pour les envois WhatsApp sortants
 queueManager.createQueue(
   "whatsapp-outbound",
   async (job) => {
-    // BullMQ passe un objet Job avec .data ; la file en mémoire passe l'objet brut.
     const data = job?.data ?? job;
     const { userId, phoneNumber, message } = data;
     await whatsappManager.sendMessage(userId, phoneNumber, message);
@@ -1203,7 +1363,10 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
     timeoutMultiplier = 1.5,
     onProviderFail = null,
     onProviderSuccess = null,
-    enableCircuitBreaker = true
+    enableCircuitBreaker = true,
+    sessionId = null,
+    userId = null,
+    tier = "v100"
   } = options;
 
   let lastError = null;
@@ -1232,6 +1395,7 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
     logger.info({ attempt: i + 1, total: sortedProviders.length, provider, model }, "Tentative fournisseur");
 
     for (let attempt = 0; attempt < maxRetriesPerProvider; attempt++) {
+      const startTime = Date.now();
       try {
         const timeout = providerConfig.timeout * (attempt > 0 ? timeoutMultiplier : 1);
 
@@ -1255,21 +1419,39 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
           result = await executeCall();
         }
 
+        const latencyMs = Date.now() - startTime;
         const providerResult = {
           providerUsed: provider,
           modelUsed: model,
           providerPriority: providerConfig.failoverPriority,
           attempts: attempt + 1,
-          response: result
+          response: result,
+          latencyMs
         };
 
         providerResults.push(providerResult);
+
+        // Audit LLM succès
+        if (sessionId) {
+          await auditLLMCall({
+            sessionId,
+            userId,
+            provider,
+            model,
+            tier,
+            promptTokens: 0,
+            completionTokens: 0,
+            latencyMs,
+            status: "success",
+            errorCode: null
+          });
+        }
 
         if (onProviderSuccess) {
           onProviderSuccess(providerResult);
         }
 
-        logger.info({ provider, model, attempt: attempt + 1 }, "Succès fournisseur");
+        logger.info({ provider, model, attempt: attempt + 1, latencyMs }, "Succès fournisseur");
 
         return {
           success: true,
@@ -1279,8 +1461,25 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
       } catch (error) {
         lastError = error;
         const errorCode = LLMErrorInterceptor.getErrorCode(error);
+        const latencyMs = Date.now() - startTime;
 
-        console.error(`Détail Erreur fournisseur (${provider}/${model}, tentative ${attempt + 1}, ${errorCode}):`, error);
+        // Audit LLM échec
+        if (sessionId) {
+          await auditLLMCall({
+            sessionId,
+            userId,
+            provider,
+            model,
+            tier,
+            promptTokens: 0,
+            completionTokens: 0,
+            latencyMs,
+            status: "failed",
+            errorCode
+          });
+        }
+
+        logger.warn({ provider, model, attempt: attempt + 1, errorCode }, "Erreur fournisseur");
 
         if (onProviderFail) {
           onProviderFail({
@@ -1308,7 +1507,7 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
     }
   }
 
-  console.error("Détail Erreur : tous les fournisseurs LLM ont échoué:", lastError);
+  logger.error({ errorCode: LLMErrorInterceptor.getErrorCode(lastError) }, "Tous les fournisseurs LLM ont échoué");
 
   return {
     success: false,
@@ -1396,7 +1595,7 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
   try {
     return JSON.parse(content);
   } catch (parseError) {
-    console.error(`Détail Erreur parsing JSON (${provider}/${model}):`, parseError, "Contenu brut:", content?.slice(0, 500));
+    logger.error({ provider, model, contentPreview: content?.slice(0, 500) }, "Erreur parsing JSON");
     throw new Error(`Réponse ${provider} invalide (JSON malformé): ${parseError.message}`);
   }
 }
@@ -1521,11 +1720,6 @@ class DynamicContextManager {
 const dynamicContextManager = new DynamicContextManager();
 
 // ==================== SYSTEM PROMPT DE BASE ====================
-// Construit via un TABLEAU DE CHAÎNES joint par .join("\n") : aucun backtick n'est
-// utilisé dans cette définition, donc aucun risque de crash au démarrage lié à un
-// backtick mal échappé dans le prompt système, y compris quand on y insère des
-// exemples de blocs ```html ou ```css (ce sont de simples caractères dans une
-// chaîne entre guillemets doubles, pas des délimiteurs de template literal).
 const LUBA_BASE_SYSTEM_PROMPT = [
   "Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, une startup basée à Kinshasa, fondée en 2026.",
   "",
@@ -1610,7 +1804,52 @@ app.use(
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
-    contentSecurityPolicy: false
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          "https://cdnjs.cloudflare.com",
+          "https://apis.google.com",
+          "https://www.gstatic.com",
+          "https://cdn.firebase.com",
+          "https://*.firebaseio.com"
+        ],
+        styleSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          "https://cdnjs.cloudflare.com",
+          "https://fonts.googleapis.com"
+        ],
+        imgSrc: [
+          "'self'",
+          "data:",
+          "blob:",
+          "https://*",
+          "http://*"
+        ],
+        connectSrc: [
+          "'self'",
+          "https://api.groq.com",
+          "https://openrouter.ai",
+          "https://*.firebaseio.com",
+          "https://*.supabase.co",
+          "wss://*.firebaseio.com"
+        ],
+        fontSrc: [
+          "'self'",
+          "https://fonts.gstatic.com",
+          "https://cdnjs.cloudflare.com"
+        ],
+        objectSrc: ["'none'"],
+        frameSrc: [
+          "https://*.firebaseapp.com",
+          "https://*.web.app"
+        ],
+        workerSrc: ["'self'", "blob:"]
+      }
+    }
   })
 );
 
@@ -1633,7 +1872,12 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   handler: (req, res) => {
     logger.warn({ ip: req.ip }, "Rate limit atteint");
-    res.status(200).json({ reply: "Trop de requêtes. Réessaie dans 15 minutes.", error: true });
+    res.status(429).json({
+      success: false,
+      error: true,
+      reply: "Trop de requêtes. Réessayez dans 15 minutes.",
+      code: "RATE_LIMIT"
+    });
   }
 });
 
@@ -1643,7 +1887,12 @@ const strictLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
-    res.status(200).json({ reply: "Limite de requêtes atteinte.", error: true });
+    res.status(429).json({
+      success: false,
+      error: true,
+      reply: "Limite de requêtes atteinte.",
+      code: "RATE_LIMIT_STRICT"
+    });
   }
 });
 
@@ -1677,19 +1926,40 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== AUTHENTIFICATION ====================
+// ==================== AUTHENTIFICATION (CORRIGÉE - P0) ====================
 const authenticateUser = async (req, res, next) => {
   try {
-    const providedUserId = req.body.userId || req.query.userId || req.headers["x-user-id"];
     const authHeader = req.headers.authorization || req.headers.Authorization;
     const bearerToken = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-
+    const providedUserId = req.body.userId || req.query.userId || req.headers["x-user-id"];
+    
     let verifiedUserId = null;
     let verifiedEmail = null;
     let verifiedName = null;
     let firebaseUid = null;
-
-    if (firebaseApp && bearerToken) {
+    
+    // Mode production : token Firebase OBLIGATOIRE
+    if (CONFIG.ENV === "production" && !firebaseApp) {
+      logger.error("FIREBASE_SERVICE_ACCOUNT_JSON manquant en production - authentification impossible");
+      return res.status(503).json({
+        success: false,
+        error: true,
+        reply: "Service d'authentification indisponible. Contactez l'administrateur.",
+        code: "AUTH_SERVICE_UNAVAILABLE"
+      });
+    }
+    
+    if (firebaseApp) {
+      // Token Firebase requis
+      if (!bearerToken) {
+        return res.status(401).json({
+          success: false,
+          error: true,
+          reply: "Authentification requise. Token Firebase manquant.",
+          code: "MISSING_TOKEN"
+        });
+      }
+      
       try {
         const decoded = await firebaseAdmin.auth(firebaseApp).verifyIdToken(bearerToken);
         verifiedUserId = decoded.uid;
@@ -1697,33 +1967,50 @@ const authenticateUser = async (req, res, next) => {
         verifiedEmail = decoded.email || null;
         verifiedName = decoded.name || null;
       } catch (error) {
-        console.error("Détail Erreur vérification token Firebase:", error);
-        return res.status(200).json({
-          reply: "Session invalide ou expirée. Reconnecte-toi.",
+        logger.warn({ error: error.message }, "Token Firebase invalide");
+        return res.status(401).json({
+          success: false,
           error: true,
+          reply: "Session invalide ou expirée. Reconnectez-vous.",
           code: "INVALID_TOKEN"
         });
       }
-    }
-
-    const userId = verifiedUserId || (typeof providedUserId === "string" ? providedUserId.trim() : null);
-
-    if (!userId) {
-      return res.status(200).json({
-        reply: "Authentification requise. Fournis un userId ou un token valide.",
-        error: true
+    } else if (CONFIG.ENV === "development") {
+      // Mode développement uniquement : fallback explicite
+      logger.warn("MODE DÉVELOPPEMENT : authentification Firebase désactivée, userId accepté tel quel");
+      verifiedUserId = typeof providedUserId === "string" ? providedUserId.trim() : null;
+      firebaseUid = verifiedUserId;
+    } else {
+      // Production sans Firebase = erreur critique
+      logger.error("Configuration d'authentification invalide");
+      return res.status(503).json({
+        success: false,
+        error: true,
+        reply: "Service d'authentification indisponible.",
+        code: "AUTH_SERVICE_UNAVAILABLE"
       });
     }
-
+    
+    const userId = verifiedUserId;
+    
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: true,
+        reply: "Authentification requise.",
+        code: "AUTH_REQUIRED"
+      });
+    }
+    
     req.userId = userId;
     req.firebaseUid = firebaseUid || userId;
     req.verifiedIdentity = Boolean(verifiedUserId);
-
+    
     try {
       if (supabase && firebaseUid) {
         await syncUserWithSupabase(firebaseUid, verifiedEmail, verifiedName);
       }
-
+      
       const user = await dbGet("SELECT * FROM users WHERE id = ?", [userId]);
       if (!user) {
         await dbRun(
@@ -1737,13 +2024,18 @@ const authenticateUser = async (req, res, next) => {
         );
       }
     } catch (err) {
-      console.error("Détail Erreur synchronisation utilisateur:", err);
+      logger.error({ err: err.message }, "Erreur synchronisation utilisateur");
     }
-
+    
     next();
   } catch (error) {
-    console.error("Détail Erreur authentification:", error);
-    return res.status(200).json({ reply: "Erreur interne.", error: true });
+    logger.error({ error: error.message }, "Erreur authentification");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      reply: "Erreur interne d'authentification.",
+      code: "AUTH_INTERNAL_ERROR"
+    });
   }
 };
 
@@ -1755,7 +2047,7 @@ async function syncUserWithSupabase(firebaseUid, email, displayName) {
     const { data: existingUser, error: fetchError } = await supabase.from("users").select("firebase_uid").eq("firebase_uid", firebaseUid).single();
 
     if (fetchError && fetchError.code !== "PGRST116") {
-      console.error("Détail Erreur Supabase fetch user:", fetchError);
+      logger.error({ error: fetchError.message }, "Erreur Supabase fetch user");
       return;
     }
 
@@ -1767,14 +2059,14 @@ async function syncUserWithSupabase(firebaseUid, email, displayName) {
         last_seen_at: new Date().toISOString()
       });
 
-      if (insertError) console.error("Détail Erreur Supabase insert user:", insertError);
+      if (insertError) logger.error({ error: insertError.message }, "Erreur Supabase insert user");
     } else {
       const { error: updateError } = await supabase.from("users").update({ last_seen_at: new Date().toISOString() }).eq("firebase_uid", firebaseUid);
 
-      if (updateError) console.error("Détail Erreur Supabase update user:", updateError);
+      if (updateError) logger.error({ error: updateError.message }, "Erreur Supabase update user");
     }
   } catch (error) {
-    console.error("Détail Erreur sync Supabase:", error);
+    logger.error({ error: error.message }, "Erreur sync Supabase");
   }
 }
 
@@ -1797,14 +2089,14 @@ async function syncSessionWithSupabase(sessionId, firebaseUid, userId) {
         updated_at: new Date().toISOString()
       });
 
-      if (insertError) console.error("Détail Erreur Supabase insert session:", insertError);
+      if (insertError) logger.error({ error: insertError.message }, "Erreur Supabase insert session");
     } else {
       const { error: updateError } = await supabase.from("sessions").update({ updated_at: new Date().toISOString() }).eq("session_id", sessionId);
 
-      if (updateError) console.error("Détail Erreur Supabase update session:", updateError);
+      if (updateError) logger.error({ error: updateError.message }, "Erreur Supabase update session");
     }
   } catch (error) {
-    console.error("Détail Erreur sync session Supabase:", error);
+    logger.error({ error: error.message }, "Erreur sync session Supabase");
   }
 }
 
@@ -1820,9 +2112,9 @@ async function syncMessageWithSupabase(sessionId, role, content, firebaseUid) {
       created_at: new Date().toISOString()
     });
 
-    if (insertError) console.error("Détail Erreur Supabase insert message:", insertError);
+    if (insertError) logger.error({ error: insertError.message }, "Erreur Supabase insert message");
   } catch (error) {
-    console.error("Détail Erreur sync message Supabase:", error);
+    logger.error({ error: error.message }, "Erreur sync message Supabase");
   }
 }
 
@@ -1851,7 +2143,7 @@ async function getSession(conversationId, userId, firebaseUid = null) {
         return { session_id: conversationId, user_id: supabaseSession.user_id || userId, firebase_uid: supabaseSession.firebase_uid };
       }
     } catch (error) {
-      console.error("Détail Erreur Supabase getSession:", error);
+      logger.error({ error: error.message }, "Erreur Supabase getSession");
     }
   }
 
@@ -1882,7 +2174,7 @@ async function getHistory(conversationId, limit = CONFIG.MAX_HISTORY_LENGTH) {
         return supabaseMessages.reverse();
       }
     } catch (error) {
-      console.error("Détail Erreur Supabase getHistory:", error);
+      logger.error({ error: error.message }, "Erreur Supabase getHistory");
     }
   }
 
@@ -1906,7 +2198,7 @@ async function getActiveIntent(conversationId) {
   try {
     return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") };
   } catch (e) {
-    console.error("Détail Erreur parsing intent_data:", e);
+    logger.error({ error: e.message }, "Erreur parsing intent_data");
     return null;
   }
 }
@@ -1925,7 +2217,7 @@ async function assertConversationOwnership(conversationId, userId) {
 }
 
 // ==================== CALL LLM V100 ====================
-async function callLLM_v100(messages, images = null) {
+async function callLLM_v100(messages, images = null, sessionId = null, userId = null) {
   logger.info("Démarrage du routage Mwamba (v100)");
 
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
@@ -1942,7 +2234,10 @@ async function callLLM_v100(messages, images = null) {
       maxRetriesPerProvider: CONFIG.MAX_RETRY_ATTEMPTS,
       onProviderFail: (failInfo) => {
         logger.warn({ failInfo }, "Failover v100");
-      }
+      },
+      sessionId,
+      userId,
+      tier: "v100"
     }
   );
 
@@ -1959,7 +2254,7 @@ async function callLLM_v100(messages, images = null) {
 }
 
 // ==================== CALL LLM V250 ====================
-async function callLLM_v250(messages, userMessage, images = null) {
+async function callLLM_v250(messages, userMessage, images = null, sessionId = null, userId = null) {
   logger.info("Démarrage du pipeline Ngandu (v250)");
 
   const tier = MODEL_TIERS.v250;
@@ -1984,12 +2279,15 @@ async function callLLM_v250(messages, userMessage, images = null) {
       maxRetriesPerProvider: tier.maxRetries,
       onProviderFail: (failInfo) => {
         logger.warn({ failInfo }, "Failover raisonnement v250");
-      }
+      },
+      sessionId,
+      userId,
+      tier: "v250_reasoning"
     }
   );
 
   if (!reasoningResult.success || !reasoningResult.response || reasoningResult.response.trim().length < 40) {
-    console.error("Détail Erreur : échec de l'étape de raisonnement v250 - dégradation vers v100", reasoningResult.error);
+    logger.error("Échec de l'étape de raisonnement v250 - dégradation vers v100");
     return await degradedFallbackToV100(messages, "reasoning_failed", images);
   }
 
@@ -2031,12 +2329,15 @@ async function callLLM_v250(messages, userMessage, images = null) {
       maxRetriesPerProvider: tier.maxRetries,
       onProviderFail: (failInfo) => {
         logger.warn({ failInfo }, "Failover code v250");
-      }
+      },
+      sessionId,
+      userId,
+      tier: "v250_code"
     }
   );
 
   if (!codeResult.success || !codeResult.response) {
-    console.error("Détail Erreur : échec de l'étape de génération v250 - dégradation vers v100", codeResult.error);
+    logger.error("Échec de l'étape de génération v250 - dégradation vers v100");
     return await degradedFallbackToV100(messages, "code_generation_failed", images);
   }
 
@@ -2053,7 +2354,7 @@ async function callLLM_v250(messages, userMessage, images = null) {
 }
 
 // ==================== CALL VISION ====================
-async function callVisionModel(messages, images) {
+async function callVisionModel(messages, images, sessionId = null, userId = null) {
   logger.info("Démarrage du pipeline Vision");
 
   const result = await executeWithRetryAndFallback(
@@ -2063,7 +2364,10 @@ async function callVisionModel(messages, images) {
       maxRetriesPerProvider: 2,
       onProviderFail: (failInfo) => {
         logger.warn({ failInfo }, "Failover Vision");
-      }
+      },
+      sessionId,
+      userId,
+      tier: "vision"
     }
   );
 
@@ -2076,7 +2380,7 @@ async function callVisionModel(messages, images) {
     };
   }
 
-  console.error("Détail Erreur : échec des modèles vision - fallback vers v100 textuel", result.error);
+  logger.error("Échec des modèles vision - fallback vers v100 textuel");
   return await callLLM_v100(messages, null);
 }
 
@@ -2096,7 +2400,7 @@ async function degradedFallbackToV100(messages, reason, images = null) {
       actualTier: "v100"
     };
   } catch (fallbackError) {
-    console.error("Détail Erreur : échec total de la dégradation v250 -> v100:", fallbackError);
+    logger.error("Échec total de la dégradation v250 -> v100");
 
     return {
       replyText:
@@ -2191,8 +2495,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken, firebaseUid });
   }
 
-  // Sauvegarde systématique du message utilisateur AVANT tout appel LLM (persistance
-  // garantie même si le LLM échoue ensuite).
+  // Sauvegarde systématique du message utilisateur AVANT tout appel LLM
   await saveMessage(conversationId, "user", message, firebaseUid);
 
   const history = await getHistory(conversationId);
@@ -2208,12 +2511,12 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
   try {
     if (images && images.length > 0) {
       logger.info("Mode Vision activé");
-      const visionResult = await callVisionModel(messages, images);
+      const visionResult = await callVisionModel(messages, images, conversationId, userId);
       finalResponse = visionResult.replyText || "Je n'ai pas pu analyser l'image.";
       suggestions = Array.isArray(visionResult.suggestions) ? visionResult.suggestions.slice(0, 4) : [];
       providerUsed = visionResult.providerUsed || "vision";
     } else if (modelTier === "v250") {
-      const result = await callLLM_v250(messages, message);
+      const result = await callLLM_v250(messages, message, null, conversationId, userId);
       finalResponse = result.replyText || "Je n'ai pas pu générer une réponse.";
       suggestions = Array.isArray(result.suggestions) ? result.suggestions.slice(0, 4) : [];
       providerUsed = result.providerUsed || "pipeline_v250";
@@ -2226,11 +2529,11 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
         maxLoops--;
         let llmResponse;
         try {
-          llmResponse = await callLLM_v100(messages);
+          llmResponse = await callLLM_v100(messages, null, conversationId, userId);
           providerUsed = llmResponse.providerUsed;
           degraded = llmResponse.degraded || false;
         } catch (error) {
-          console.error("Détail Erreur LLM v100:", error);
+          logger.error({ error: error.message }, "Erreur LLM v100");
           finalResponse = "Je suis momentanément indisponible. Veuillez réessayer dans quelques instants.";
           suggestions = ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"];
           providerUsed = "error_graceful_degradation";
@@ -2249,7 +2552,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
                 imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
               }
             } catch (toolError) {
-              console.error(`Détail Erreur outil ${toolCall.name}:`, toolError);
+              logger.error({ error: toolError.message, tool: toolCall.name }, "Erreur outil");
               toolResult = { success: false, error: toolError.message };
             }
 
@@ -2285,7 +2588,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       if (sourceLines.length > 0) finalResponse += "\n\n---\n\n**Sources :** " + sourceLines.join(" · ");
     }
 
-    // Sauvegarde systématique de la réponse de l'IA (asynchrone, sécurisée par await).
+    // Sauvegarde systématique de la réponse de l'IA
     await saveMessage(conversationId, "assistant", finalResponse, firebaseUid);
 
     logger.info({ conversationId, length: finalResponse.length }, "Réponse finale générée");
@@ -2304,7 +2607,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
         .filter(Boolean)
     };
   } catch (error) {
-    console.error("Détail Erreur critique handleChat:", error);
+    logger.error({ error: error.message }, "Erreur critique handleChat");
 
     const fallbackResponse = {
       reply: "Je suis momentanément indisponible. Nos équipes techniques travaillent à résoudre le problème.",
@@ -2320,7 +2623,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     try {
       await saveMessage(conversationId, "assistant", fallbackResponse.reply, firebaseUid);
     } catch (saveError) {
-      console.error("Détail Erreur sauvegarde message de secours:", saveError);
+      logger.error({ error: saveError.message }, "Erreur sauvegarde message de secours");
     }
 
     return fallbackResponse;
@@ -2348,7 +2651,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
           await clearActiveIntent(conversationId);
           return { reply: "Message WhatsApp mis en file d'envoi vers " + data.recipient + " !", error: false };
         } catch (error) {
-          console.error("Détail Erreur envoi WhatsApp (intent):", error);
+          logger.error({ error: error.message }, "Erreur envoi WhatsApp (intent)");
           return { reply: "Erreur d'envoi : " + error.message, error: true };
         }
       }
@@ -2385,8 +2688,9 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
 // ==================== ROUTES ====================
 app.get("/", (req, res) => {
   res.json({
-    reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel",
+    success: true,
     error: false,
+    reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel",
     version: CONFIG.VERSION,
     company: CONFIG.COMPANY
   });
@@ -2403,8 +2707,9 @@ app.get("/api/health", async (req, res) => {
     }
 
     res.json({
-      reply: "Serveur " + CONFIG.AGENT_NAME + " en bonne santé",
+      success: !dbOk,
       error: !dbOk,
+      reply: "Serveur " + CONFIG.AGENT_NAME + " en bonne santé",
       data: {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
@@ -2426,13 +2731,15 @@ app.get("/api/health", async (req, res) => {
           multiDeviceSync: Boolean(supabase),
           strictFormatting: true,
           retryMechanism: CONFIG.MAX_RETRY_ATTEMPTS + " tentatives max",
-          circuitBreaker: "activé"
+          circuitBreaker: "activé",
+          auditLLM: true,
+          rgpdDeletion: true
         }
       }
     });
   } catch (error) {
-    console.error("Détail Erreur health check:", error);
-    res.status(500).json({ error: true, reply: "Erreur interne", detail: error.message });
+    logger.error({ error: error.message }, "Erreur health check");
+    res.status(500).json({ success: false, error: true, reply: "Erreur interne", detail: error.message });
   }
 });
 
@@ -2445,13 +2752,20 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
     const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(200).json({ reply: "Le paramètre 'message' est obligatoire.", error: true });
+      return res.status(400).json({
+        success: false,
+        error: true,
+        reply: "Le paramètre 'message' est obligatoire.",
+        code: "MISSING_MESSAGE"
+      });
     }
 
     if (message.length > CONFIG.MAX_MESSAGE_LENGTH) {
-      return res.status(200).json({
+      return res.status(400).json({
+        success: false,
+        error: true,
         reply: "Message trop long (max " + CONFIG.MAX_MESSAGE_LENGTH + " caractères).",
-        error: true
+        code: "MESSAGE_TOO_LONG"
       });
     }
 
@@ -2463,7 +2777,12 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: error.message, error: true });
+      return res.status(403).json({
+        success: false,
+        error: true,
+        reply: error.message,
+        code: "CONVERSATION_OWNERSHIP"
+      });
     }
 
     if (modelTier === "v250") {
@@ -2492,16 +2811,13 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
 
     return res.status(200).json({ ...result, conversationId, isNewConversation });
   } catch (error) {
-    // Fix demandé : logging complet + statut 500 explicite avec détail de l'erreur,
-    // au lieu d'un message générique. Note : ceci change le contrat HTTP de cette
-    // route par rapport aux autres (qui renvoient toujours 200) — adapte le frontend
-    // pour qu'il gère aussi les réponses 500 sur /api/chat.
-    console.error("Détail Erreur API/Chat:", error);
+    logger.error({ error: error.message }, "Erreur API/Chat");
     return res.status(500).json({
       success: false,
       error: true,
       reply: "Une erreur est survenue lors du traitement de votre message.",
       detail: error.message,
+      code: "CHAT_ERROR",
       conversationId: req.body.conversationId || null,
       modelTier: req.body.modelTier || "v100"
     });
@@ -2526,7 +2842,7 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
           conversations = supabaseConversations;
         }
       } catch (error) {
-        console.error("Détail Erreur Supabase conversations:", error);
+        logger.error({ error: error.message }, "Erreur Supabase conversations");
       }
     }
 
@@ -2574,14 +2890,21 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
     );
 
     return res.status(200).json({
-      reply: "Conversations récupérées.",
+      success: true,
       error: false,
+      reply: "Conversations récupérées.",
       conversations: enrichedConversations,
       source: supabase ? "supabase" : "sqlite"
     });
   } catch (error) {
-    console.error("Détail Erreur /api/conversations:", error);
-    return res.status(200).json({ reply: "Erreur interne.", error: true, conversations: [] });
+    logger.error({ error: error.message }, "Erreur /api/conversations");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      reply: "Erreur interne.",
+      conversations: [],
+      code: "CONVERSATIONS_ERROR"
+    });
   }
 });
 
@@ -2589,144 +2912,213 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
 app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const toolName = req.body.toolName || req.body.action;
-    const params = req.body.params || req.body.arguments || {};
-
+    // Accepte aussi req.body.data pour compatibilité frontend
+    const params = req.body.params || req.body.arguments || req.body.data || {};
+    
     if (!toolName || typeof toolName !== "string") {
-      return res.status(200).json({ success: false, error: true, reply: "Le paramètre 'toolName' est obligatoire." });
+      return res.status(400).json({
+        success: false,
+        error: true,
+        reply: "Le paramètre 'toolName' est obligatoire.",
+        code: "MISSING_TOOL_NAME"
+      });
     }
-
+    
     const googleAccessToken = req.headers["x-google-access-token"] || null;
-
+    
     const { result, sourceKeys } = await executeTool(toolName, params, { userId: req.userId, googleAccessToken });
     const sources = sourceKeys.map((k) => OPEN_SOURCES[k]).filter(Boolean);
-
-    return res.status(200).json({ success: true, error: false, toolName, result, sources });
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      toolName,
+      result,
+      sources
+    });
   } catch (error) {
-    console.error("Détail Erreur /api/tools:", error);
-    return res.status(200).json({ success: false, error: true, reply: error.message });
+    logger.error({ error: error.message }, "Erreur /api/tools");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      reply: "Erreur interne lors de l'exécution de l'outil.",
+      detail: error.message,
+      code: "TOOL_EXECUTION_ERROR"
+    });
   }
 });
 
-// ==================== ROUTE WHATSAPP CONNECT (nouvelle route, corrige le bug #2) ====================
+// ==================== ROUTE WHATSAPP CONNECT ====================
 app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
   try {
-    // Le numéro de téléphone n'est pas strictement requis par Baileys (le QR Code
-    // s'associe à un compte WhatsApp au scan, indépendamment du numéro), mais on
-    // l'accepte et le journalise s'il est fourni, pour une éventuelle validation
-    // métier côté frontend.
     const phoneNumber = req.body.phoneNumber || req.body.phone || null;
     logger.info({ userId: req.userId, phoneNumber }, "Connexion WhatsApp initiée");
-
+    
     const result = await whatsappManager.initClient(req.userId);
-
+    
     if (result.connected) {
       return res.status(200).json({
         success: true,
         error: false,
         message: "WhatsApp est déjà connecté.",
-        qr: null
+        data: { qrCode: null, qrCodeBase64: null }
       });
     }
-
+    
     let qrCode = null;
     const startTime = Date.now();
     while (!qrCode && Date.now() - startTime < CONFIG.WHATSAPP_QR_TIMEOUT) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       qrCode = whatsappManager.getQRCode(req.userId);
     }
-
+    
     if (qrCode) {
+      // Harmonisation avec le frontend
       return res.status(200).json({
         success: true,
         error: false,
         message: "Connexion initiée",
+        data: {
+          qrCode: qrCode,
+          qrCodeBase64: qrCode
+        },
+        // Rétrocompatibilité temporaire
         qr: qrCode
       });
     }
-
-    return res.status(200).json({
+    
+    return res.status(408).json({
       success: false,
       error: true,
-      message: "Délai dépassé en attendant le QR Code. Réessaie.",
-      qr: null
+      message: "Délai dépassé en attendant le QR Code. Réessayez.",
+      code: "QR_TIMEOUT"
     });
   } catch (error) {
-    // Fix demandé : logging complet + 500 explicite en JSON si l'initialisation échoue.
-    console.error("Détail Erreur WhatsApp Connect:", error);
+    logger.error({ error: error.message }, "Erreur WhatsApp Connect");
     return res.status(500).json({
       success: false,
       error: true,
       message: "Erreur lors de l'initialisation de la connexion WhatsApp.",
-      detail: error.message
+      detail: error.message,
+      code: "WHATSAPP_CONNECT_ERROR"
     });
   }
 });
 
-// ==================== ROUTE WHATSAPP SEND (restaurée, référencée dans le 404) ====================
+// ==================== ROUTE WHATSAPP SEND ====================
 app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res) => {
   try {
     if (!req.body.to || !req.body.message) {
-      return res.status(200).json({ success: false, error: true, message: "Les paramètres 'to' et 'message' sont obligatoires." });
+      return res.status(400).json({
+        success: false,
+        error: true,
+        message: "Les paramètres 'to' et 'message' sont obligatoires.",
+        code: "MISSING_PARAMS"
+      });
     }
     const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
-    return res.status(200).json({ success: true, error: false, message: "Message envoyé à " + req.body.to, data: result });
+    return res.status(200).json({
+      success: true,
+      error: false,
+      message: "Message envoyé à " + req.body.to,
+      data: result
+    });
   } catch (error) {
-    console.error("Détail Erreur WhatsApp Send:", error);
+    logger.error({ error: error.message }, "Erreur WhatsApp Send");
     return res.status(500).json({
       success: false,
       error: true,
       message: "Erreur lors de l'envoi du message WhatsApp.",
-      detail: error.message
+      detail: error.message,
+      code: "WHATSAPP_SEND_ERROR"
     });
   }
 });
 
-// ==================== ROUTE INTENTION (restaurée, référencée dans le 404) ====================
+// ==================== ROUTE INTENTION ====================
 app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { intentType, conversationId, conversation_id: conversationIdSnake } = req.body;
     const convId = conversationId || conversationIdSnake;
 
     if (!convId || typeof convId !== "string") {
-      return res.status(200).json({ reply: "Le paramètre 'conversationId' est obligatoire.", error: true });
+      return res.status(400).json({
+        success: false,
+        error: true,
+        reply: "Le paramètre 'conversationId' est obligatoire.",
+        code: "MISSING_CONVERSATION_ID"
+      });
     }
 
     try {
       await assertConversationOwnership(convId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: error.message, error: true });
+      return res.status(403).json({
+        success: false,
+        error: true,
+        reply: error.message,
+        code: "CONVERSATION_OWNERSHIP"
+      });
     }
 
     await getSession(convId, req.userId, req.firebaseUid);
 
     if (intentType === "WHATSAPP") {
       await setActiveIntent(convId, "WHATSAPP", { step: "NEED_NUMBER" });
-      return res.status(200).json({ reply: "Envoi WhatsApp initié. Quel est le numéro du destinataire ?", error: false });
+      return res.status(200).json({
+        success: true,
+        error: false,
+        reply: "Envoi WhatsApp initié. Quel est le numéro du destinataire ?"
+      });
     }
     if (intentType === "EMAIL") {
       await setActiveIntent(convId, "EMAIL", { step: "NEED_RECIPIENT" });
-      return res.status(200).json({ reply: "Envoi d'email initié. Quelle est l'adresse du destinataire ?", error: false });
+      return res.status(200).json({
+        success: true,
+        error: false,
+        reply: "Envoi d'email initié. Quelle est l'adresse du destinataire ?"
+      });
     }
-    return res.status(200).json({ reply: "Type d'intention inconnu.", error: true });
+    return res.status(400).json({
+      success: false,
+      error: true,
+      reply: "Type d'intention inconnu.",
+      code: "UNKNOWN_INTENT"
+    });
   } catch (error) {
-    console.error("Détail Erreur /api/intent/init:", error);
-    return res.status(200).json({ reply: "Erreur interne.", error: true });
+    logger.error({ error: error.message }, "Erreur /api/intent/init");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      reply: "Erreur interne.",
+      code: "INTENT_ERROR"
+    });
   }
 });
 
-// ==================== ROUTE EFFACER MÉMOIRE (restaurée, référencée dans le 404) ====================
+// ==================== ROUTE EFFACER MÉMOIRE ====================
 app.post("/api/memory/clear", authenticateUser, async (req, res) => {
   try {
     const conversationId = req.body.conversationId || req.body.conversation_id;
 
     if (!conversationId || typeof conversationId !== "string") {
-      return res.status(200).json({ reply: "Le paramètre 'conversationId' est obligatoire.", error: true });
+      return res.status(400).json({
+        success: false,
+        error: true,
+        reply: "Le paramètre 'conversationId' est obligatoire.",
+        code: "MISSING_CONVERSATION_ID"
+      });
     }
 
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
-      return res.status(200).json({ reply: error.message, error: true });
+      return res.status(403).json({
+        success: false,
+        error: true,
+        reply: error.message,
+        code: "CONVERSATION_OWNERSHIP"
+      });
     }
 
     // Supprime les messages locaux (SQLite)
@@ -2736,23 +3128,99 @@ app.post("/api/memory/clear", authenticateUser, async (req, res) => {
     if (supabase && req.firebaseUid) {
       try {
         const { error } = await supabase.from("messages").delete().eq("session_id", conversationId).eq("firebase_uid", req.firebaseUid);
-        if (error) console.error("Détail Erreur Supabase delete messages:", error);
+        if (error) logger.error({ error: error.message }, "Erreur Supabase delete messages");
       } catch (supabaseError) {
-        console.error("Détail Erreur Supabase memory clear:", supabaseError);
+        logger.error({ error: supabaseError.message }, "Erreur Supabase memory clear");
       }
     }
 
     // Réinitialise l'intention active
     await clearActiveIntent(conversationId);
 
-    return res.status(200).json({ reply: "Mémoire de la conversation effacée.", error: false });
+    return res.status(200).json({
+      success: true,
+      error: false,
+      reply: "Mémoire de la conversation effacée."
+    });
   } catch (error) {
-    console.error("Détail Erreur /api/memory/clear:", error);
+    logger.error({ error: error.message }, "Erreur /api/memory/clear");
     return res.status(500).json({
       success: false,
       error: true,
       reply: "Erreur lors de l'effacement de la mémoire.",
-      detail: error.message
+      detail: error.message,
+      code: "MEMORY_CLEAR_ERROR"
+    });
+  }
+});
+
+// ==================== ROUTE SUPPRESSION COMPTE (RGPD) ====================
+app.delete("/api/account", authenticateUser, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const firebaseUid = req.firebaseUid;
+    
+    logger.info({ userId }, "Demande de suppression de compte");
+    
+    // 1. Supprimer les sessions WhatsApp
+    try {
+      const whatsappSession = whatsappManager.sessions.get(userId);
+      if (whatsappSession?.sock) {
+        whatsappSession.sock.end(undefined);
+      }
+      whatsappManager.sessions.delete(userId);
+      
+      // Supprimer les fichiers de session locaux
+      const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
+      if (fs.existsSync(authDir)) {
+        fs.rmSync(authDir, { recursive: true, force: true });
+      }
+    } catch (error) {
+      logger.warn({ error: error.message }, "Erreur suppression session WhatsApp");
+    }
+    
+    // 2. Supprimer les données SQLite
+    await dbRun("DELETE FROM messages WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
+    await dbRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM email_logs WHERE user_id = ? OR firebase_uid = ?", [userId, firebaseUid]);
+    await dbRun("DELETE FROM llm_audit_log WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM users WHERE id = ?", [userId]);
+    
+    // 3. Supprimer les données Supabase
+    if (supabase && firebaseUid) {
+      try {
+        await supabase.from("messages").delete().eq("firebase_uid", firebaseUid);
+        await supabase.from("sessions").delete().eq("firebase_uid", firebaseUid);
+        await supabase.from("whatsapp_credentials").delete().eq("user_id", userId);
+        await supabase.from("users").delete().eq("firebase_uid", firebaseUid);
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur suppression Supabase");
+      }
+    }
+    
+    // 4. Supprimer le compte Firebase
+    if (firebaseApp && firebaseUid) {
+      try {
+        await firebaseAdmin.auth(firebaseApp).deleteUser(firebaseUid);
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur suppression compte Firebase");
+      }
+    }
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      message: "Compte supprimé avec succès.",
+      code: "ACCOUNT_DELETED"
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur suppression compte");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      message: "Erreur lors de la suppression du compte.",
+      detail: error.message,
+      code: "ACCOUNT_DELETION_ERROR"
     });
   }
 });
@@ -2760,8 +3228,10 @@ app.post("/api/memory/clear", authenticateUser, async (req, res) => {
 // ==================== ROUTE 404 ====================
 app.use((req, res, next) => {
   res.status(404).json({
-    reply: "Route non trouvée",
+    success: false,
     error: true,
+    reply: "Route non trouvée",
+    code: "NOT_FOUND",
     availableRoutes: [
       "GET /",
       "GET /api/health",
@@ -2771,15 +3241,15 @@ app.use((req, res, next) => {
       "POST /api/whatsapp/connect",
       "POST /api/whatsapp/send",
       "POST /api/intent/init",
-      "POST /api/memory/clear"
+      "POST /api/memory/clear",
+      "DELETE /api/account"
     ]
   });
 });
 
 // ==================== MIDDLEWARE D'ERREUR GLOBALE ====================
 app.use((error, req, res, next) => {
-  console.error("Détail Erreur non gérée:", error);
-  logger.error({ err: error.message, stack: error.stack, requestId: req.requestId }, "Erreur non gérée");
+  logger.error({ error: error.message, stack: error.stack, requestId: req.requestId }, "Erreur non gérée");
 
   if (res.headersSent) {
     return next(error);
@@ -2789,9 +3259,13 @@ app.use((error, req, res, next) => {
     success: false,
     error: true,
     reply: "Une erreur interne est survenue.",
-    detail: error.message || "Erreur inconnue"
+    detail: error.message || "Erreur inconnue",
+    code: "INTERNAL_ERROR"
   });
 });
+
+// ==================== VALIDATION ENVIRONNEMENT ====================
+validateEnvironment();
 
 // ==================== DÉMARRAGE DU SERVEUR ====================
 const server = app.listen(CONFIG.PORT, () => {
@@ -2821,7 +3295,7 @@ async function shutdown(signal) {
     await whatsappManager.destroyAll();
     console.log("✅ Connexions WhatsApp fermées");
   } catch (error) {
-    console.error("Détail Erreur fermeture WhatsApp:", error);
+    logger.error({ error: error.message }, "Erreur fermeture WhatsApp");
   }
 
   // 3. Fermer les files d'attente
@@ -2829,14 +3303,14 @@ async function shutdown(signal) {
     await queueManager.close();
     console.log("✅ Files d'attente fermées");
   } catch (error) {
-    console.error("Détail Erreur fermeture files d'attente:", error);
+    logger.error({ error: error.message }, "Erreur fermeture files d'attente");
   }
 
   // 4. Fermer la base de données SQLite
   await new Promise((resolve) => {
     db.close((error) => {
       if (error) {
-        console.error("Détail Erreur fermeture SQLite:", error);
+        logger.error({ error: error.message }, "Erreur fermeture SQLite");
       } else {
         console.log("✅ Base de données SQLite fermée");
       }
@@ -2851,11 +3325,9 @@ async function shutdown(signal) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("uncaughtException", (error) => {
-  console.error("Détail Erreur non attrapée (uncaughtException):", error);
-  logger.error({ err: error.message, stack: error.stack }, "uncaughtException");
+  logger.error({ error: error.message, stack: error.stack }, "uncaughtException");
 });
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("Détail Promesse rejetée non gérée:", reason);
   logger.error({ reason: String(reason) }, "unhandledRejection");
 });
 
