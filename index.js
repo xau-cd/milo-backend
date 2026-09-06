@@ -1,10 +1,10 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 9.3.2 Enterprise (corrigée et complétée)
+// Version : 9.3.3 Enterprise (corrigée et complétée)
 // Architecture : Modulaire, Microservices-ready, Haute Disponibilité
 //
-// ⚠️ CORRECTIFS DE CETTE VERSION (9.3.2) :
+// ⚠️ CORRECTIFS DE CETTE VERSION (9.3.3) :
 // P0 - Sécurité :
-// 1) Authentification Firebase OBLIGATOIRE en production (401/403 au lieu de 200)
+// 1) Authentification Firebase via API REST (sans Admin SDK)
 // 2) Persistance WhatsApp dans Supabase avec chiffrement AES-256-GCM
 // 3) CSP configurée (plus de contentSecurityPolicy: false)
 //
@@ -18,7 +18,6 @@
 // 8) Audit LLM dans llm_audit_log
 // 9) Validation stricte des variables d'environnement
 // 10) Route DELETE /api/account (RGPD)
-// 11) .env.example complet
 // ================================================================================
 
 require("dotenv").config();
@@ -41,13 +40,6 @@ const { createClient } = require("@supabase/supabase-js");
 const { EventEmitter } = require("events");
 
 // ==================== IMPORTS OPTIONNELS ====================
-let firebaseAdmin = null;
-try {
-  firebaseAdmin = require("firebase-admin");
-} catch (e) {
-  console.warn("⚠️ firebase-admin non installé - authentification Firebase désactivée");
-}
-
 let BullMQ = null;
 let IORedis = null;
 try {
@@ -68,7 +60,7 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "9.3.2",
+  VERSION: "9.3.3",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON Technology",
 
@@ -108,7 +100,14 @@ const CONFIG = {
   // Types MIME autorisés
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
 
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/9.3.2 (contact@luba.ia)"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/9.3.3 (contact@luba.ia)"
+};
+
+// ==================== CONFIGURATION FIREBASE (SANS ADMIN SDK) ====================
+const FIREBASE_CONFIG = {
+  apiKey: process.env.FIREBASE_API_KEY || "AIzaSyDEYSKvR6MNMxH6yBnoitRKbNyn-d14zoE",
+  projectId: process.env.FIREBASE_PROJECT_ID || "milo-ead21",
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN || "milo-ead21.firebaseapp.com"
 };
 
 // ==================== VALIDATION ENVIRONNEMENT ====================
@@ -125,9 +124,9 @@ function validateEnvironment() {
     errors.push("OPENROUTER_API_KEY manquante - tier v250 et fallbacks indisponibles");
   }
   
-  // En production, Firebase est obligatoire
-  if (CONFIG.ENV === "production" && !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    errors.push("FIREBASE_SERVICE_ACCOUNT_JSON manquant en production - authentification impossible");
+  // Firebase API Key (nouvelle méthode - plus besoin de Admin SDK)
+  if (CONFIG.ENV === "production" && !process.env.FIREBASE_API_KEY && !FIREBASE_CONFIG.apiKey) {
+    errors.push("FIREBASE_API_KEY manquante en production - authentification impossible");
   }
   
   // Variables recommandées
@@ -301,33 +300,6 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
   logger.warn("Supabase non configuré - persistance multi-appareils désactivée");
 }
 
-// ==================== INITIALISATION FIREBASE ADMIN ====================
-let firebaseApp = null;
-
-function parseFirebaseServiceAccount(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    try {
-      return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
-    } catch (e2) {
-      throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON invalide");
-    }
-  }
-}
-
-if (firebaseAdmin && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  try {
-    const serviceAccount = parseFirebaseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    firebaseApp = firebaseAdmin.initializeApp({
-      credential: firebaseAdmin.credential.cert(serviceAccount)
-    });
-    logger.info("Firebase Admin initialisé");
-  } catch (e) {
-    logger.error({ err: e.message }, "Erreur initialisation Firebase Admin");
-  }
-}
-
 // ==================== CONFIGURATION EMAIL ====================
 let emailTransporter = null;
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
@@ -395,6 +367,37 @@ function decodeXmlEntities(str) {
     .replace(/&#39;/g, "'")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// ==================== VÉRIFICATION TOKEN FIREBASE (API REST) ====================
+async function verifyFirebaseToken(token) {
+  try {
+    if (!FIREBASE_CONFIG.apiKey) {
+      throw new Error("FIREBASE_API_KEY manquante");
+    }
+    
+    const response = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
+      { idToken: token },
+      { timeout: 10000 }
+    );
+    
+    if (response.data.users && response.data.users.length > 0) {
+      const user = response.data.users[0];
+      return {
+        uid: user.localId,
+        email: user.email || null,
+        displayName: user.displayName || null,
+        photoURL: user.photoUrl || null,
+        emailVerified: user.emailVerified || false
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur vérification token Firebase");
+    throw error;
+  }
 }
 
 // ==================== WRAPPERS SQLITE PROMISES ====================
@@ -1926,7 +1929,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== AUTHENTIFICATION (CORRIGÉE - P0) ====================
+// ==================== AUTHENTIFICATION (CORRIGÉE - SANS ADMIN SDK) ====================
 const authenticateUser = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || req.headers.Authorization;
@@ -1938,36 +1941,19 @@ const authenticateUser = async (req, res, next) => {
     let verifiedName = null;
     let firebaseUid = null;
     
-    // Mode production : token Firebase OBLIGATOIRE
-    if (CONFIG.ENV === "production" && !firebaseApp) {
-      logger.error("FIREBASE_SERVICE_ACCOUNT_JSON manquant en production - authentification impossible");
-      return res.status(503).json({
+    // Vérifier le token Firebase via l'API REST
+    if (!bearerToken) {
+      return res.status(401).json({
         success: false,
         error: true,
-        reply: "Service d'authentification indisponible. Contactez l'administrateur.",
-        code: "AUTH_SERVICE_UNAVAILABLE"
+        reply: "Authentification requise. Token Firebase manquant.",
+        code: "MISSING_TOKEN"
       });
     }
     
-    if (firebaseApp) {
-      // Token Firebase requis
-      if (!bearerToken) {
-        return res.status(401).json({
-          success: false,
-          error: true,
-          reply: "Authentification requise. Token Firebase manquant.",
-          code: "MISSING_TOKEN"
-        });
-      }
-      
-      try {
-        const decoded = await firebaseAdmin.auth(firebaseApp).verifyIdToken(bearerToken);
-        verifiedUserId = decoded.uid;
-        firebaseUid = decoded.uid;
-        verifiedEmail = decoded.email || null;
-        verifiedName = decoded.name || null;
-      } catch (error) {
-        logger.warn({ error: error.message }, "Token Firebase invalide");
+    try {
+      const user = await verifyFirebaseToken(bearerToken);
+      if (!user) {
         return res.status(401).json({
           success: false,
           error: true,
@@ -1975,19 +1961,18 @@ const authenticateUser = async (req, res, next) => {
           code: "INVALID_TOKEN"
         });
       }
-    } else if (CONFIG.ENV === "development") {
-      // Mode développement uniquement : fallback explicite
-      logger.warn("MODE DÉVELOPPEMENT : authentification Firebase désactivée, userId accepté tel quel");
-      verifiedUserId = typeof providedUserId === "string" ? providedUserId.trim() : null;
-      firebaseUid = verifiedUserId;
-    } else {
-      // Production sans Firebase = erreur critique
-      logger.error("Configuration d'authentification invalide");
-      return res.status(503).json({
+      
+      verifiedUserId = user.uid;
+      firebaseUid = user.uid;
+      verifiedEmail = user.email;
+      verifiedName = user.displayName;
+    } catch (error) {
+      logger.warn({ error: error.message }, "Token Firebase invalide");
+      return res.status(401).json({
         success: false,
         error: true,
-        reply: "Service d'authentification indisponible.",
-        code: "AUTH_SERVICE_UNAVAILABLE"
+        reply: "Session invalide ou expirée. Reconnectez-vous.",
+        code: "INVALID_TOKEN"
       });
     }
     
@@ -2006,6 +1991,7 @@ const authenticateUser = async (req, res, next) => {
     req.firebaseUid = firebaseUid || userId;
     req.verifiedIdentity = Boolean(verifiedUserId);
     
+    // Synchronisation utilisateur
     try {
       if (supabase && firebaseUid) {
         await syncUserWithSupabase(firebaseUid, verifiedEmail, verifiedName);
@@ -2716,7 +2702,7 @@ app.get("/api/health", async (req, res) => {
         memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
         database: dbOk ? "ok" : "erreur",
         supabase: Boolean(supabase),
-        firebaseAuth: Boolean(firebaseApp),
+        firebaseAuth: "api_rest",
         whatsapp: {
           baileysSessionsActives: whatsappManager.sessions.size,
           queue: queueManager.useRedis ? "bullmq+redis" : "memoire (repli)"
@@ -3198,20 +3184,15 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
       }
     }
     
-    // 4. Supprimer le compte Firebase
-    if (firebaseApp && firebaseUid) {
-      try {
-        await firebaseAdmin.auth(firebaseApp).deleteUser(firebaseUid);
-      } catch (error) {
-        logger.error({ error: error.message }, "Erreur suppression compte Firebase");
-      }
-    }
+    // Note : La suppression du compte Firebase nécessite l'Admin SDK
+    // ou une Cloud Function. À implémenter côté frontend ou via une Cloud Function.
     
     return res.status(200).json({
       success: true,
       error: false,
-      message: "Compte supprimé avec succès.",
-      code: "ACCOUNT_DELETED"
+      message: "Compte supprimé avec succès des bases de données.",
+      code: "ACCOUNT_DELETED",
+      note: "La suppression du compte Firebase doit être effectuée côté client"
     });
   } catch (error) {
     logger.error({ error: error.message }, "Erreur suppression compte");
