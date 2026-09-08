@@ -1,23 +1,18 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 9.3.3 Enterprise (corrigée et complétée)
+// Version : 9.5.0 Enterprise (Production Ready avec Firebase Admin)
 // Architecture : Modulaire, Microservices-ready, Haute Disponibilité
 //
-// ⚠️ CORRECTIFS DE CETTE VERSION (9.3.3) :
-// P0 - Sécurité :
-// 1) Authentification Firebase via API REST (sans Admin SDK)
-// 2) Persistance WhatsApp dans Supabase avec chiffrement AES-256-GCM
-// 3) CSP configurée (plus de contentSecurityPolicy: false)
-//
-// P0 - Bugs :
-// 4) /api/whatsapp/connect : champ harmonisé (data.qrCode + data.qrCodeBase64 + qr rétrocompat)
-// 5) /api/tools : accepte req.body.data
-// 6) Codes HTTP harmonisés (400, 401, 403, 408, 500, 503)
-//
-// P1 - Fonctionnalités :
-// 7) Vérification scope Gmail avant envoi
-// 8) Audit LLM dans llm_audit_log
-// 9) Validation stricte des variables d'environnement
-// 10) Route DELETE /api/account (RGPD)
+// ⚠️ FONCTIONNALITÉS DE SÉCURITÉ AVANCÉES (9.5.0) :
+// 1) Firebase Admin SDK pour gestion complète des utilisateurs
+// 2) Vérification des tokens avec révocation
+// 3) Gestion des rôles personnalisés (Custom Claims)
+// 4) Vérification des emails obligatoire
+// 5) Protection contre les tokens volés (session management)
+// 6) Limitation par IP et détection de connexions suspectes
+// 7) Suppression complète du compte Firebase
+// 8) Audit de sécurité complet
+// 9) Protection contre le brute force
+// 10) Gestion des sessions multiples
 // ================================================================================
 
 require("dotenv").config();
@@ -38,6 +33,14 @@ const pino = require("pino");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const { EventEmitter } = require("events");
+
+// ==================== IMPORTS FIREBASE ADMIN ====================
+let firebaseAdmin = null;
+try {
+  firebaseAdmin = require("firebase-admin");
+} catch (e) {
+  console.warn("⚠️ firebase-admin non installé - authentification Firebase désactivée");
+}
 
 // ==================== IMPORTS OPTIONNELS ====================
 let BullMQ = null;
@@ -60,7 +63,7 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "9.3.3",
+  VERSION: "9.5.0",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON Technology",
 
@@ -88,6 +91,12 @@ const CONFIG = {
   WHATSAPP_QR_TIMEOUT: parseInt(process.env.WHATSAPP_QR_TIMEOUT || "30000", 10),
   WHATSAPP_RETRY_DELAY: parseInt(process.env.WHATSAPP_RETRY_DELAY || "3000", 10),
 
+  // Sécurité
+  MAX_LOGIN_ATTEMPTS: parseInt(process.env.MAX_LOGIN_ATTEMPTS || "5", 10),
+  LOGIN_BLOCK_DURATION: parseInt(process.env.LOGIN_BLOCK_DURATION || "900000", 10), // 15 minutes
+  MAX_SESSIONS_PER_USER: parseInt(process.env.MAX_SESSIONS_PER_USER || "10", 10),
+  TOKEN_REFRESH_WINDOW: parseInt(process.env.TOKEN_REFRESH_WINDOW || "300000", 10), // 5 minutes
+
   // Chemins
   DB_PATH: path.join(__dirname, "data", "luba.db"),
   SESSIONS_PATH: path.join(__dirname, "sessions"),
@@ -100,15 +109,88 @@ const CONFIG = {
   // Types MIME autorisés
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
 
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/9.3.3 (contact@luba.ia)"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/9.5.0 (contact@luba.ia)"
 };
 
-// ==================== CONFIGURATION FIREBASE (SANS ADMIN SDK) ====================
+// ==================== CONFIGURATION FIREBASE ====================
 const FIREBASE_CONFIG = {
-  apiKey: process.env.FIREBASE_API_KEY || "AIzaSyDEYSKvR6MNMxH6yBnoitRKbNyn-d14zoE",
-  projectId: process.env.FIREBASE_PROJECT_ID || "milo-ead21",
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN || "milo-ead21.firebaseapp.com"
+  apiKey: process.env.FIREBASE_API_KEY || "AIzaSyAdGCNZZAmbFyFSiDErjpEA4C1-PVsy52A",
+  projectId: process.env.FIREBASE_PROJECT_ID || "luba-ia-636",
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN || "luba-ia-636.firebaseapp.com",
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || "luba-ia-636.firebasestorage.app",
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || "502404354252",
+  appId: process.env.FIREBASE_APP_ID || "1:502404354252:web:660ab2109ce448e1803269"
 };
+
+// ==================== CONFIGURATION HOSTING ====================
+const HOSTING_CONFIG = {
+  domain: process.env.HOSTING_DOMAIN || "https://luba.web.app",
+  firebaseDomain: process.env.FIREBASE_HOSTING_DOMAIN || "https://luba-ia-636.web.app",
+  allowedOrigins: [
+    "https://luba.web.app",
+    "https://luba-ia-636.web.app",
+    "https://luba-ia-636.firebaseapp.com",
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://localhost:4200"
+  ]
+};
+
+// ==================== SYSTÈME DE QUOTAS ====================
+const USER_QUOTAS = {
+  FREE: {
+    maxMessagesPerDay: 100,
+    maxImagesPerDay: 20,
+    maxWhatsAppMessagesPerDay: 10,
+    maxEmailsPerDay: 5,
+    maxTokensPerRequest: 8000
+  },
+  PREMIUM: {
+    maxMessagesPerDay: 1000,
+    maxImagesPerDay: 200,
+    maxWhatsAppMessagesPerDay: 100,
+    maxEmailsPerDay: 50,
+    maxTokensPerRequest: 32000
+  },
+  ADMIN: {
+    maxMessagesPerDay: 999999,
+    maxImagesPerDay: 999999,
+    maxWhatsAppMessagesPerDay: 999999,
+    maxEmailsPerDay: 999999,
+    maxTokensPerRequest: 128000
+  }
+};
+
+// ==================== INITIALISATION FIREBASE ADMIN ====================
+let firebaseApp = null;
+
+function parseFirebaseServiceAccount(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    try {
+      return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+    } catch (e2) {
+      throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON invalide");
+    }
+  }
+}
+
+if (firebaseAdmin && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  try {
+    const serviceAccount = parseFirebaseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    firebaseApp = firebaseAdmin.initializeApp({
+      credential: firebaseAdmin.credential.cert(serviceAccount),
+      projectId: FIREBASE_CONFIG.projectId
+    });
+    logger.info("Firebase Admin initialisé avec succès");
+  } catch (e) {
+    logger.error({ err: e.message }, "Erreur initialisation Firebase Admin");
+  }
+} else {
+  logger.warn("Firebase Admin non initialisé - utilisera l'API REST pour la vérification des tokens");
+}
 
 // ==================== VALIDATION ENVIRONNEMENT ====================
 function validateEnvironment() {
@@ -124,9 +206,11 @@ function validateEnvironment() {
     errors.push("OPENROUTER_API_KEY manquante - tier v250 et fallbacks indisponibles");
   }
   
-  // Firebase API Key (nouvelle méthode - plus besoin de Admin SDK)
-  if (CONFIG.ENV === "production" && !process.env.FIREBASE_API_KEY && !FIREBASE_CONFIG.apiKey) {
-    errors.push("FIREBASE_API_KEY manquante en production - authentification impossible");
+  // Firebase
+  if (CONFIG.ENV === "production") {
+    if (!firebaseApp && !FIREBASE_CONFIG.apiKey) {
+      errors.push("Aucune authentification Firebase configurée - authentification impossible");
+    }
   }
   
   // Variables recommandées
@@ -140,6 +224,10 @@ function validateEnvironment() {
   
   if (!process.env.WHATSAPP_ENCRYPTION_KEY || !process.env.WHATSAPP_ENCRYPTION_IV) {
     warnings.push("Clés de chiffrement WhatsApp manquantes - utilisation de clés par défaut");
+  }
+  
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    warnings.push("FIREBASE_SERVICE_ACCOUNT_JSON manquant - fonctionnalités admin limitées (suppression compte, rôles personnalisés)");
   }
   
   if (errors.length > 0) {
@@ -210,6 +298,8 @@ db.serialize(() => {
       firebase_uid TEXT UNIQUE,
       email TEXT UNIQUE,
       display_name TEXT,
+      role TEXT DEFAULT 'FREE',
+      email_verified INTEGER DEFAULT 0,
       whatsapp_connected INTEGER DEFAULT 0,
       whatsapp_session_id TEXT,
       last_seen_at DATETIME,
@@ -281,6 +371,83 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  // Table des quotas utilisateur
+  db.run(`
+    CREATE TABLE IF NOT EXISTS user_quotas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      date TEXT NOT NULL,
+      messages_count INTEGER DEFAULT 0,
+      images_count INTEGER DEFAULT 0,
+      whatsapp_count INTEGER DEFAULT 0,
+      emails_count INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, date),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Table des logs de sécurité
+  db.run(`
+    CREATE TABLE IF NOT EXISTS security_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT,
+      event_type TEXT NOT NULL,
+      details TEXT DEFAULT '{}',
+      ip_address TEXT,
+      user_agent TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Table des sessions actives
+  db.run(`
+    CREATE TABLE IF NOT EXISTS active_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      session_token TEXT UNIQUE,
+      ip_address TEXT,
+      user_agent TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
+      expires_at DATETIME,
+      is_revoked INTEGER DEFAULT 0,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Table des tentatives de connexion
+  db.run(`
+    CREATE TABLE IF NOT EXISTS login_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT,
+      ip_address TEXT,
+      success INTEGER DEFAULT 0,
+      error_message TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Table des IPs bloquées
+  db.run(`
+    CREATE TABLE IF NOT EXISTS blocked_ips (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ip_address TEXT UNIQUE,
+      reason TEXT,
+      blocked_until DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Index pour les performances
+  db.run("CREATE INDEX IF NOT EXISTS idx_user_quotas_user_date ON user_quotas(user_id, date)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_security_logs_user ON security_logs(user_id, created_at DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_llm_audit_user ON llm_audit_log(user_id, created_at DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_email_logs_user ON email_logs(user_id, created_at DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_active_sessions_user ON active_sessions(user_id, created_at DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address, created_at DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip ON blocked_ips(ip_address)");
 });
 
 logger.info("Schéma SQLite initialisé");
@@ -356,6 +523,10 @@ function generateConversationId() {
   return `conv_${crypto.randomUUID()}`;
 }
 
+function generateSessionToken() {
+  return `sess_${crypto.randomBytes(32).toString("hex")}`;
+}
+
 function decodeXmlEntities(str) {
   return String(str)
     .replace(/<!\[CDATA\[/g, "")
@@ -367,37 +538,6 @@ function decodeXmlEntities(str) {
     .replace(/&#39;/g, "'")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-// ==================== VÉRIFICATION TOKEN FIREBASE (API REST) ====================
-async function verifyFirebaseToken(token) {
-  try {
-    if (!FIREBASE_CONFIG.apiKey) {
-      throw new Error("FIREBASE_API_KEY manquante");
-    }
-    
-    const response = await axios.post(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
-      { idToken: token },
-      { timeout: 10000 }
-    );
-    
-    if (response.data.users && response.data.users.length > 0) {
-      const user = response.data.users[0];
-      return {
-        uid: user.localId,
-        email: user.email || null,
-        displayName: user.displayName || null,
-        photoURL: user.photoUrl || null,
-        emailVerified: user.emailVerified || false
-      };
-    }
-    
-    return null;
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur vérification token Firebase");
-    throw error;
-  }
 }
 
 // ==================== WRAPPERS SQLITE PROMISES ====================
@@ -442,6 +582,334 @@ async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTo
   }
 }
 
+// ==================== LOGS DE SÉCURITÉ ====================
+async function logSecurityEvent(userId, eventType, details = {}, ipAddress = null, userAgent = null) {
+  try {
+    await dbRun(
+      `INSERT INTO security_logs (user_id, event_type, details, ip_address, user_agent) 
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId, eventType, JSON.stringify(details), ipAddress, userAgent]
+    );
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur log sécurité");
+  }
+}
+
+// ==================== GESTION DES SESSIONS ACTIVES ====================
+async function createActiveSession(userId, ipAddress, userAgent) {
+  const sessionToken = generateSessionToken();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 heures
+  
+  // Vérifier le nombre de sessions actives
+  const activeSessions = await dbAll(
+    `SELECT COUNT(*) as count FROM active_sessions WHERE user_id = ? AND is_revoked = 0 AND expires_at > CURRENT_TIMESTAMP`,
+    [userId]
+  );
+  
+  if (activeSessions[0]?.count >= CONFIG.MAX_SESSIONS_PER_USER) {
+    // Révoquer la session la plus ancienne
+    await dbRun(
+      `UPDATE active_sessions SET is_revoked = 1 
+       WHERE id = (SELECT id FROM active_sessions WHERE user_id = ? AND is_revoked = 0 ORDER BY created_at ASC LIMIT 1)`,
+      [userId]
+    );
+  }
+  
+  await dbRun(
+    `INSERT INTO active_sessions (user_id, session_token, ip_address, user_agent, expires_at) 
+     VALUES (?, ?, ?, ?, ?)`,
+    [userId, sessionToken, ipAddress, userAgent, expiresAt]
+  );
+  
+  return sessionToken;
+}
+
+async function validateActiveSession(userId, sessionToken) {
+  const session = await dbGet(
+    `SELECT * FROM active_sessions 
+     WHERE user_id = ? AND session_token = ? AND is_revoked = 0 AND expires_at > CURRENT_TIMESTAMP`,
+    [userId, sessionToken]
+  );
+  
+  if (session) {
+    // Mettre à jour la dernière activité
+    await dbRun(
+      `UPDATE active_sessions SET last_activity = CURRENT_TIMESTAMP WHERE id = ?`,
+      [session.id]
+    );
+    return true;
+  }
+  
+  return false;
+}
+
+async function revokeSession(userId, sessionToken) {
+  await dbRun(
+    `UPDATE active_sessions SET is_revoked = 1 WHERE user_id = ? AND session_token = ?`,
+    [userId, sessionToken]
+  );
+}
+
+async function revokeAllSessions(userId) {
+  await dbRun(
+    `UPDATE active_sessions SET is_revoked = 1 WHERE user_id = ? AND is_revoked = 0`,
+    [userId]
+  );
+}
+
+// ==================== GESTION DES TENTATIVES DE CONNEXION ====================
+async function checkLoginAttempts(ipAddress, userId = null) {
+  const cutoffTime = new Date(Date.now() - CONFIG.LOGIN_BLOCK_DURATION).toISOString();
+  
+  const attempts = await dbGet(
+    `SELECT COUNT(*) as count FROM login_attempts 
+     WHERE ip_address = ? AND success = 0 AND created_at > ?`,
+    [ipAddress, cutoffTime]
+  );
+  
+  if (attempts?.count >= CONFIG.MAX_LOGIN_ATTEMPTS) {
+    // Bloquer l'IP
+    await dbRun(
+      `INSERT OR REPLACE INTO blocked_ips (ip_address, reason, blocked_until) 
+       VALUES (?, 'Trop de tentatives échouées', ?)`,
+      [ipAddress, new Date(Date.now() + CONFIG.LOGIN_BLOCK_DURATION).toISOString()]
+    );
+    
+    return {
+      blocked: true,
+      message: "Trop de tentatives échouées. IP bloquée temporairement."
+    };
+  }
+  
+  return { blocked: false };
+}
+
+async function recordLoginAttempt(ipAddress, userId, success, errorMessage = null) {
+  await dbRun(
+    `INSERT INTO login_attempts (user_id, ip_address, success, error_message) 
+     VALUES (?, ?, ?, ?)`,
+    [userId, ipAddress, success ? 1 : 0, errorMessage]
+  );
+}
+
+async function isIPBlocked(ipAddress) {
+  const blocked = await dbGet(
+    `SELECT * FROM blocked_ips WHERE ip_address = ? AND blocked_until > CURRENT_TIMESTAMP`,
+    [ipAddress]
+  );
+  
+  return Boolean(blocked);
+}
+
+// ==================== GESTION DES QUOTAS ====================
+async function checkUserQuota(userId, action, userRole = 'FREE') {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    const quotaRow = await dbGet(
+      `SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`,
+      [userId, today]
+    );
+    
+    if (!quotaRow) {
+      await dbRun(
+        `INSERT INTO user_quotas (user_id, date, messages_count, images_count, whatsapp_count, emails_count) 
+         VALUES (?, ?, 0, 0, 0, 0)`,
+        [userId, today]
+      );
+      return { allowed: true, remaining: USER_QUOTAS[userRole] || USER_QUOTAS.FREE };
+    }
+    
+    const limits = USER_QUOTAS[userRole] || USER_QUOTAS.FREE;
+    
+    let currentCount = 0;
+    let maxAllowed = 0;
+    
+    switch (action) {
+      case 'message':
+        currentCount = quotaRow.messages_count;
+        maxAllowed = limits.maxMessagesPerDay;
+        break;
+      case 'image':
+        currentCount = quotaRow.images_count;
+        maxAllowed = limits.maxImagesPerDay;
+        break;
+      case 'whatsapp':
+        currentCount = quotaRow.whatsapp_count;
+        maxAllowed = limits.maxWhatsAppMessagesPerDay;
+        break;
+      case 'email':
+        currentCount = quotaRow.emails_count;
+        maxAllowed = limits.maxEmailsPerDay;
+        break;
+    }
+    
+    if (currentCount >= maxAllowed) {
+      return { 
+        allowed: false, 
+        remaining: 0,
+        message: `Limite quotidienne atteinte pour ${action}. Limite : ${maxAllowed}`,
+        current: currentCount,
+        max: maxAllowed
+      };
+    }
+    
+    return { 
+      allowed: true, 
+      remaining: maxAllowed - currentCount,
+      current: currentCount,
+      max: maxAllowed
+    };
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur vérification quota");
+    return { allowed: true, remaining: null };
+  }
+}
+
+async function incrementUserQuota(userId, action) {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    let columnToUpdate;
+    switch (action) {
+      case 'message':
+        columnToUpdate = 'messages_count';
+        break;
+      case 'image':
+        columnToUpdate = 'images_count';
+        break;
+      case 'whatsapp':
+        columnToUpdate = 'whatsapp_count';
+        break;
+      case 'email':
+        columnToUpdate = 'emails_count';
+        break;
+      default:
+        return;
+    }
+    
+    await dbRun(
+      `UPDATE user_quotas SET ${columnToUpdate} = ${columnToUpdate} + 1 WHERE user_id = ? AND date = ?`,
+      [userId, today]
+    );
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur mise à jour quota");
+  }
+}
+
+// ==================== VÉRIFICATION TOKEN FIREBASE ====================
+async function verifyFirebaseToken(token) {
+  // Si Firebase Admin est disponible, l'utiliser
+  if (firebaseApp && firebaseAdmin) {
+    try {
+      const decodedToken = await firebaseAdmin.auth(firebaseApp).verifyIdToken(token, true); // true = check revoked
+      return {
+        uid: decodedToken.uid,
+        email: decodedToken.email || null,
+        displayName: decodedToken.name || null,
+        photoURL: decodedToken.picture || null,
+        emailVerified: decodedToken.email_verified || false,
+        role: decodedToken.role || 'FREE',
+        customClaims: decodedToken
+      };
+    } catch (error) {
+      logger.error({ error: error.message }, "Erreur vérification token Firebase (Admin SDK)");
+      throw error;
+    }
+  }
+  
+  // Fallback : API REST
+  try {
+    if (!FIREBASE_CONFIG.apiKey) {
+      throw new Error("FIREBASE_API_KEY manquante");
+    }
+    
+    const response = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
+      { idToken: token },
+      { timeout: 10000 }
+    );
+    
+    if (response.data.users && response.data.users.length > 0) {
+      const user = response.data.users[0];
+      
+      return {
+        uid: user.localId,
+        email: user.email || null,
+        displayName: user.displayName || null,
+        photoURL: user.photoUrl || null,
+        emailVerified: user.emailVerified || false,
+        createdAt: user.createdAt || null,
+        lastLoginAt: user.lastLoginAt || null,
+        providers: user.providerUserInfo || [],
+        role: 'FREE'
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur vérification token Firebase (API REST)");
+    throw error;
+  }
+}
+
+// ==================== GESTION DES RÔLES FIREBASE ====================
+async function setUserRole(uid, role) {
+  if (!firebaseApp || !firebaseAdmin) {
+    throw new Error("Firebase Admin non disponible pour la gestion des rôles");
+  }
+  
+  try {
+    await firebaseAdmin.auth(firebaseApp).setCustomUserClaims(uid, { role });
+    
+    // Mettre à jour aussi en base locale
+    await dbRun(
+      `UPDATE users SET role = ? WHERE firebase_uid = ? OR id = ?`,
+      [role, uid, uid]
+    );
+    
+    await logSecurityEvent(uid, 'ROLE_UPDATED', { role }, null);
+    
+    return { success: true, role };
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur mise à jour rôle Firebase");
+    throw error;
+  }
+}
+
+async function getUserRole(uid) {
+  if (!firebaseApp || !firebaseAdmin) {
+    // Fallback : lire depuis la base locale
+    const user = await dbGet("SELECT role FROM users WHERE firebase_uid = ? OR id = ?", [uid, uid]);
+    return user?.role || 'FREE';
+  }
+  
+  try {
+    const user = await firebaseAdmin.auth(firebaseApp).getUser(uid);
+    return user.customClaims?.role || 'FREE';
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur récupération rôle Firebase");
+    const localUser = await dbGet("SELECT role FROM users WHERE firebase_uid = ? OR id = ?", [uid, uid]);
+    return localUser?.role || 'FREE';
+  }
+}
+
+// ==================== SUPPRESSION COMPTE FIREBASE ====================
+async function deleteFirebaseUser(uid) {
+  if (!firebaseApp || !firebaseAdmin) {
+    throw new Error("Firebase Admin non disponible pour la suppression du compte");
+  }
+  
+  try {
+    await firebaseAdmin.auth(firebaseApp).deleteUser(uid);
+    await logSecurityEvent(uid, 'FIREBASE_ACCOUNT_DELETED', {}, null);
+    return { success: true };
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur suppression compte Firebase");
+    throw error;
+  }
+}
+
 // ==================== CIRCUIT BREAKER PATTERN ====================
 class CircuitBreaker {
   constructor(name, options = {}) {
@@ -450,7 +918,7 @@ class CircuitBreaker {
     this.resetTimeout = options.resetTimeout || CONFIG.CIRCUIT_BREAKER_RESET_MS;
     this.failureCount = 0;
     this.lastFailureTime = null;
-    this.state = "CLOSED"; // CLOSED, OPEN, HALF_OPEN
+    this.state = "CLOSED";
     this.emitter = new EventEmitter();
   }
 
@@ -853,10 +1321,17 @@ async function sendEmailViaSMTP(to, subject, body) {
   }
 }
 
-async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }) {
+async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, userId }) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!recipient || !emailRegex.test(String(recipient).trim())) {
     return { success: false, error: "Adresse email destinataire invalide" };
+  }
+
+  if (userId) {
+    const quotaCheck = await checkUserQuota(userId, 'email');
+    if (!quotaCheck.allowed) {
+      return { success: false, error: quotaCheck.message || "Limite d'emails quotidienne atteinte" };
+    }
   }
 
   let result;
@@ -873,8 +1348,13 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body }
     result = await sendEmailViaSMTP(recipient, subject, body);
   }
 
+  if (result.success && userId) {
+    await incrementUserQuota(userId, 'email');
+  }
+
   try {
-    await dbRun("INSERT INTO email_logs (to_email, subject, status, provider, error_message) VALUES (?, ?, ?, ?, ?)", [
+    await dbRun("INSERT INTO email_logs (user_id, to_email, subject, status, provider, error_message) VALUES (?, ?, ?, ?, ?, ?)", [
+      userId || null,
       recipient,
       subject || null,
       result.success ? "sent" : "failed",
@@ -980,7 +1460,6 @@ class BaileysManager {
     const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
     if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
-    // Tenter de charger les credentials depuis Supabase
     const savedCredentials = await loadWhatsAppCredentials(userId);
     if (savedCredentials) {
       try {
@@ -1011,7 +1490,6 @@ class BaileysManager {
 
     sock.ev.on("creds.update", async (creds) => {
       await saveCreds();
-      // Sauvegarder les credentials dans Supabase
       await saveWhatsAppCredentials(userId, creds);
     });
 
@@ -1132,7 +1610,13 @@ queueManager.createQueue(
 );
 
 async function sendWhatsAppSmart(userId, phoneNumber, message) {
+  const quotaCheck = await checkUserQuota(userId, 'whatsapp');
+  if (!quotaCheck.allowed) {
+    throw new Error(quotaCheck.message || "Limite de messages WhatsApp quotidienne atteinte");
+  }
+  
   await queueManager.add("whatsapp-outbound", { userId, phoneNumber, message }, { attempts: 5, backoffDelay: 2000 });
+  await incrementUserQuota(userId, 'whatsapp');
   return { success: true, queued: true };
 }
 
@@ -1434,7 +1918,6 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
 
         providerResults.push(providerResult);
 
-        // Audit LLM succès
         if (sessionId) {
           await auditLLMCall({
             sessionId,
@@ -1466,7 +1949,6 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
         const errorCode = LLMErrorInterceptor.getErrorCode(error);
         const latencyMs = Date.now() - startTime;
 
-        // Audit LLM échec
         if (sessionId) {
           await auditLLMCall({
             sessionId,
@@ -1574,7 +2056,7 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
   };
 
   if (provider === "openrouter") {
-    headers["HTTP-Referer"] = "https://luba-ia.web.app";
+    headers["HTTP-Referer"] = "https://luba.web.app";
     headers["X-Title"] = "Luba.ia Assistant";
   }
 
@@ -1776,15 +2258,7 @@ app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
 // ==================== CORS ====================
-const ALLOWED_ORIGINS = [
-  "https://luba-ia.web.app",
-  "https://luba-ia.firebaseapp.com",
-  "https://milo-ead21.web.app",
-  "http://localhost:3000",
-  "http://localhost:8080",
-  "http://localhost:5173",
-  "http://localhost:4200"
-];
+const ALLOWED_ORIGINS = HOSTING_CONFIG.allowedOrigins;
 
 app.use(
   cors({
@@ -1797,7 +2271,7 @@ app.use(
       }
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id", "X-Google-Access-Token"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id", "X-Google-Access-Token", "X-Session-Token"],
     credentials: true,
     maxAge: 86400
   })
@@ -1929,20 +2403,35 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== AUTHENTIFICATION (CORRIGÉE - SANS ADMIN SDK) ====================
+// ==================== AUTHENTIFICATION AVEC FIREBASE ADMIN ====================
 const authenticateUser = async (req, res, next) => {
   try {
+    // Vérifier si l'IP est bloquée
+    const isBlocked = await isIPBlocked(req.ip);
+    if (isBlocked) {
+      await logSecurityEvent('unknown', 'BLOCKED_IP_ACCESS', { ip: req.ip }, req.ip, req.headers['user-agent']);
+      return res.status(403).json({
+        success: false,
+        error: true,
+        reply: "Accès refusé. IP bloquée temporairement.",
+        code: "IP_BLOCKED"
+      });
+    }
+    
     const authHeader = req.headers.authorization || req.headers.Authorization;
     const bearerToken = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-    const providedUserId = req.body.userId || req.query.userId || req.headers["x-user-id"];
+    const sessionToken = req.headers["x-session-token"] || null;
     
     let verifiedUserId = null;
     let verifiedEmail = null;
     let verifiedName = null;
     let firebaseUid = null;
+    let userRole = 'FREE';
+    let emailVerified = false;
     
-    // Vérifier le token Firebase via l'API REST
     if (!bearerToken) {
+      await recordLoginAttempt(req.ip, null, false, "Token manquant");
+      await logSecurityEvent('unknown', 'MISSING_TOKEN', { ip: req.ip }, req.ip, req.headers['user-agent']);
       return res.status(401).json({
         success: false,
         error: true,
@@ -1954,6 +2443,8 @@ const authenticateUser = async (req, res, next) => {
     try {
       const user = await verifyFirebaseToken(bearerToken);
       if (!user) {
+        await recordLoginAttempt(req.ip, null, false, "Token invalide");
+        await logSecurityEvent('unknown', 'INVALID_TOKEN', { ip: req.ip }, req.ip, req.headers['user-agent']);
         return res.status(401).json({
           success: false,
           error: true,
@@ -1966,13 +2457,69 @@ const authenticateUser = async (req, res, next) => {
       firebaseUid = user.uid;
       verifiedEmail = user.email;
       verifiedName = user.displayName;
+      emailVerified = user.emailVerified;
+      
+      // Récupérer le rôle depuis Firebase Custom Claims ou la base locale
+      if (user.customClaims?.role) {
+        userRole = user.customClaims.role;
+      } else {
+        const userRow = await dbGet("SELECT role FROM users WHERE id = ?", [verifiedUserId]);
+        userRole = userRow?.role || 'FREE';
+      }
+      
+      // Vérifier l'email si nécessaire
+      if (!emailVerified && CONFIG.ENV === "production") {
+        await recordLoginAttempt(req.ip, verifiedUserId, false, "Email non vérifié");
+        await logSecurityEvent(verifiedUserId, 'UNVERIFIED_EMAIL_ACCESS', { email: verifiedEmail }, req.ip, req.headers['user-agent']);
+        return res.status(403).json({
+          success: false,
+          error: true,
+          reply: "Veuillez vérifier votre adresse email pour accéder à cette fonctionnalité.",
+          code: "EMAIL_NOT_VERIFIED"
+        });
+      }
+      
+      // Vérifier la session active si un token de session est fourni
+      if (sessionToken) {
+        const isValidSession = await validateActiveSession(verifiedUserId, sessionToken);
+        if (!isValidSession) {
+          await logSecurityEvent(verifiedUserId, 'INVALID_SESSION', { sessionToken }, req.ip, req.headers['user-agent']);
+          return res.status(401).json({
+            success: false,
+            error: true,
+            reply: "Session invalide. Reconnectez-vous.",
+            code: "INVALID_SESSION"
+          });
+        }
+      }
+      
+      // Enregistrer la connexion réussie
+      await recordLoginAttempt(req.ip, verifiedUserId, true);
+      await logSecurityEvent(verifiedUserId, 'LOGIN_SUCCESS', { 
+        email: verifiedEmail,
+        role: userRole,
+        sessionToken: sessionToken ? 'provided' : 'not_provided'
+      }, req.ip, req.headers['user-agent']);
+      
     } catch (error) {
       logger.warn({ error: error.message }, "Token Firebase invalide");
+      await recordLoginAttempt(req.ip, null, false, error.message);
+      await logSecurityEvent('unknown', 'TOKEN_VERIFICATION_FAILED', { 
+        ip: req.ip,
+        error: error.message
+      }, req.ip, req.headers['user-agent']);
+      
+      // Vérifier si l'IP doit être bloquée
+      const loginCheck = await checkLoginAttempts(req.ip);
+      if (loginCheck.blocked) {
+        await logSecurityEvent('unknown', 'IP_BLOCKED', { ip: req.ip, reason: 'TOO_MANY_FAILED_ATTEMPTS' }, req.ip);
+      }
+      
       return res.status(401).json({
         success: false,
         error: true,
-        reply: "Session invalide ou expirée. Reconnectez-vous.",
-        code: "INVALID_TOKEN"
+        reply: loginCheck.blocked ? loginCheck.message : "Session invalide ou expirée. Reconnectez-vous.",
+        code: loginCheck.blocked ? "IP_BLOCKED" : "INVALID_TOKEN"
       });
     }
     
@@ -1990,6 +2537,9 @@ const authenticateUser = async (req, res, next) => {
     req.userId = userId;
     req.firebaseUid = firebaseUid || userId;
     req.verifiedIdentity = Boolean(verifiedUserId);
+    req.userRole = userRole;
+    req.emailVerified = emailVerified;
+    req.sessionToken = sessionToken;
     
     // Synchronisation utilisateur
     try {
@@ -2000,13 +2550,13 @@ const authenticateUser = async (req, res, next) => {
       const user = await dbGet("SELECT * FROM users WHERE id = ?", [userId]);
       if (!user) {
         await dbRun(
-          "INSERT INTO users (id, firebase_uid, email, display_name, last_seen_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-          [userId, firebaseUid, verifiedEmail, verifiedName || userId]
+          "INSERT INTO users (id, firebase_uid, email, display_name, role, email_verified, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+          [userId, firebaseUid, verifiedEmail, verifiedName || userId, userRole, emailVerified ? 1 : 0]
         );
       } else {
         await dbRun(
-          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, firebase_uid = COALESCE(?, firebase_uid), email = COALESCE(?, email), display_name = COALESCE(?, display_name) WHERE id = ?",
-          [firebaseUid, verifiedEmail, verifiedName, userId]
+          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, firebase_uid = COALESCE(?, firebase_uid), email = COALESCE(?, email), display_name = COALESCE(?, display_name), role = ?, email_verified = ? WHERE id = ?",
+          [firebaseUid, verifiedEmail, verifiedName, userRole, emailVerified ? 1 : 0, userId]
         );
       }
     } catch (err) {
@@ -2023,6 +2573,31 @@ const authenticateUser = async (req, res, next) => {
       code: "AUTH_INTERNAL_ERROR"
     });
   }
+};
+
+// ==================== MIDDLEWARE DE VÉRIFICATION DES RÔLES ====================
+const requireRole = (allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.userRole) {
+      return res.status(403).json({
+        success: false,
+        error: true,
+        reply: "Rôle non défini.",
+        code: "ROLE_UNDEFINED"
+      });
+    }
+    
+    if (allowedRoles.includes(req.userRole) || req.userRole === 'ADMIN') {
+      next();
+    } else {
+      return res.status(403).json({
+        success: false,
+        error: true,
+        reply: "Accès refusé. Rôle insuffisant.",
+        code: "INSUFFICIENT_ROLE"
+      });
+    }
+  };
 };
 
 // ==================== SYNCHRONISATION SUPABASE ====================
@@ -2447,7 +3022,8 @@ async function executeTool(toolName, args = {}, context = {}) {
         googleAccessToken,
         recipient: args.recipient || args.to,
         subject: args.subject,
-        body: args.body
+        body: args.body,
+        userId
       });
       break;
     case "send_whatsapp_message":
@@ -2481,7 +3057,6 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken, firebaseUid });
   }
 
-  // Sauvegarde systématique du message utilisateur AVANT tout appel LLM
   await saveMessage(conversationId, "user", message, firebaseUid);
 
   const history = await getHistory(conversationId);
@@ -2574,7 +3149,6 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       if (sourceLines.length > 0) finalResponse += "\n\n---\n\n**Sources :** " + sourceLines.join(" · ");
     }
 
-    // Sauvegarde systématique de la réponse de l'IA
     await saveMessage(conversationId, "assistant", finalResponse, firebaseUid);
 
     logger.info({ conversationId, length: finalResponse.length }, "Réponse finale générée");
@@ -2658,7 +3232,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         return { reply: "Sujet enregistré. Quel est le contenu de l'email ?", error: false };
       }
       if (data.step === "NEED_BODY") {
-        const result = await dispatchSendEmail({ googleAccessToken, recipient: data.recipient, subject: data.subject, body: userMessage });
+        const result = await dispatchSendEmail({ googleAccessToken, recipient: data.recipient, subject: data.subject, body: userMessage, userId });
         await clearActiveIntent(conversationId);
         if (result.success) return { reply: "Email envoyé à " + data.recipient + " (via " + result.provider + ") !", error: false };
         return { reply: "Erreur : " + result.error, error: true };
@@ -2678,7 +3252,8 @@ app.get("/", (req, res) => {
     error: false,
     reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel",
     version: CONFIG.VERSION,
-    company: CONFIG.COMPANY
+    company: CONFIG.COMPANY,
+    domain: HOSTING_CONFIG.domain
   });
 });
 
@@ -2702,7 +3277,8 @@ app.get("/api/health", async (req, res) => {
         memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
         database: dbOk ? "ok" : "erreur",
         supabase: Boolean(supabase),
-        firebaseAuth: "api_rest",
+        firebaseAuth: firebaseApp ? "admin_sdk" : "api_rest",
+        hosting: HOSTING_CONFIG.domain,
         whatsapp: {
           baileysSessionsActives: whatsappManager.sessions.size,
           queue: queueManager.useRedis ? "bullmq+redis" : "memoire (repli)"
@@ -2719,7 +3295,13 @@ app.get("/api/health", async (req, res) => {
           retryMechanism: CONFIG.MAX_RETRY_ATTEMPTS + " tentatives max",
           circuitBreaker: "activé",
           auditLLM: true,
-          rgpdDeletion: true
+          rgpdDeletion: true,
+          quotas: true,
+          securityLogs: true,
+          firebaseAdmin: Boolean(firebaseApp),
+          customRoles: Boolean(firebaseApp),
+          sessionManagement: true,
+          ipBlocking: true
         }
       }
     });
@@ -2737,6 +3319,17 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
     let isNewConversation = false;
     const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
 
+    const quotaCheck = await checkUserQuota(req.userId, 'message', req.userRole);
+    if (!quotaCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: true,
+        reply: quotaCheck.message || "Limite quotidienne atteinte.",
+        code: "QUOTA_EXCEEDED",
+        quota: quotaCheck
+      });
+    }
+
     if (!message || typeof message !== "string" || message.trim().length === 0) {
       return res.status(400).json({
         success: false,
@@ -2753,6 +3346,18 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
         reply: "Message trop long (max " + CONFIG.MAX_MESSAGE_LENGTH + " caractères).",
         code: "MESSAGE_TOO_LONG"
       });
+    }
+
+    if (req.files && req.files.length > 0) {
+      const imageQuota = await checkUserQuota(req.userId, 'image', req.userRole);
+      if (!imageQuota.allowed) {
+        return res.status(429).json({
+          success: false,
+          error: true,
+          reply: "Limite d'images quotidienne atteinte.",
+          code: "IMAGE_QUOTA_EXCEEDED"
+        });
+      }
     }
 
     if (!conversationId || typeof conversationId !== "string") {
@@ -2782,6 +3387,7 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
     if (req.files && req.files.length > 0) {
       images = req.files.map((file) => convertImageToBase64(file.buffer, file.mimetype));
       logger.info("Images reçues : " + images.length);
+      await incrementUserQuota(req.userId, 'image');
     }
 
     const result = await handleChat({
@@ -2795,7 +3401,17 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
       images
     });
 
-    return res.status(200).json({ ...result, conversationId, isNewConversation });
+    await incrementUserQuota(req.userId, 'message');
+
+    return res.status(200).json({ 
+      ...result, 
+      conversationId, 
+      isNewConversation,
+      quota: {
+        remaining: quotaCheck.remaining - 1,
+        max: quotaCheck.max
+      }
+    });
   } catch (error) {
     logger.error({ error: error.message }, "Erreur API/Chat");
     return res.status(500).json({
@@ -2894,11 +3510,150 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
   }
 });
 
+// ==================== ROUTE STATISTIQUES UTILISATEUR ====================
+app.get("/api/user/stats", authenticateUser, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    const quotaRow = await dbGet(
+      `SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`,
+      [req.userId, today]
+    );
+    
+    const totalMessages = await dbGet(
+      `SELECT COUNT(*) as count FROM messages m 
+       JOIN sessions s ON m.session_id = s.session_id 
+       WHERE s.user_id = ?`,
+      [req.userId]
+    );
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      data: {
+        quotas: quotaRow || {
+          messages_count: 0,
+          images_count: 0,
+          whatsapp_count: 0,
+          emails_count: 0
+        },
+        totalMessages: totalMessages?.count || 0,
+        role: req.userRole || 'FREE',
+        limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE
+      }
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur statistiques utilisateur");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      message: "Erreur lors de la récupération des statistiques.",
+      code: "STATS_ERROR"
+    });
+  }
+});
+
+// ==================== ROUTE GESTION DES RÔLES (ADMIN UNIQUEMENT) ====================
+app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(['ADMIN']), async (req, res) => {
+  try {
+    const { uid, role } = req.body;
+    
+    if (!uid || !role) {
+      return res.status(400).json({
+        success: false,
+        error: true,
+        message: "Les paramètres 'uid' et 'role' sont obligatoires.",
+        code: "MISSING_PARAMS"
+      });
+    }
+    
+    if (!['FREE', 'PREMIUM', 'ADMIN'].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        error: true,
+        message: "Rôle invalide. Rôles autorisés : FREE, PREMIUM, ADMIN",
+        code: "INVALID_ROLE"
+      });
+    }
+    
+    const result = await setUserRole(uid, role);
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      message: "Rôle mis à jour avec succès.",
+      data: result
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur mise à jour rôle");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      message: "Erreur lors de la mise à jour du rôle.",
+      detail: error.message,
+      code: "ROLE_UPDATE_ERROR"
+    });
+  }
+});
+
+// ==================== ROUTE GESTION DES SESSIONS ====================
+app.post("/api/session/create", authenticateUser, async (req, res) => {
+  try {
+    const sessionToken = await createActiveSession(req.userId, req.ip, req.headers['user-agent']);
+    
+    await logSecurityEvent(req.userId, 'SESSION_CREATED', { sessionToken: sessionToken.substring(0, 10) + '...' }, req.ip, req.headers['user-agent']);
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      data: {
+        sessionToken,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+      }
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur création session");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      message: "Erreur lors de la création de la session.",
+      code: "SESSION_CREATE_ERROR"
+    });
+  }
+});
+
+app.post("/api/session/revoke", authenticateUser, async (req, res) => {
+  try {
+    const { sessionToken } = req.body;
+    
+    if (sessionToken) {
+      await revokeSession(req.userId, sessionToken);
+    } else {
+      await revokeAllSessions(req.userId);
+    }
+    
+    await logSecurityEvent(req.userId, 'SESSION_REVOKED', { sessionToken: sessionToken ? sessionToken.substring(0, 10) + '...' : 'all' }, req.ip);
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      message: sessionToken ? "Session révoquée avec succès." : "Toutes les sessions ont été révoquées."
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur révocation session");
+    return res.status(500).json({
+      success: false,
+      error: true,
+      message: "Erreur lors de la révocation de la session.",
+      code: "SESSION_REVOKE_ERROR"
+    });
+  }
+});
+
 // ==================== ROUTE OUTILS ====================
 app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const toolName = req.body.toolName || req.body.action;
-    // Accepte aussi req.body.data pour compatibilité frontend
     const params = req.body.params || req.body.arguments || req.body.data || {};
     
     if (!toolName || typeof toolName !== "string") {
@@ -2959,7 +3714,6 @@ app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, r
     }
     
     if (qrCode) {
-      // Harmonisation avec le frontend
       return res.status(200).json({
         success: true,
         error: false,
@@ -2968,7 +3722,6 @@ app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, r
           qrCode: qrCode,
           qrCodeBase64: qrCode
         },
-        // Rétrocompatibilité temporaire
         qr: qrCode
       });
     }
@@ -3002,7 +3755,20 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
         code: "MISSING_PARAMS"
       });
     }
+    
+    const quotaCheck = await checkUserQuota(req.userId, 'whatsapp', req.userRole);
+    if (!quotaCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: true,
+        message: quotaCheck.message || "Limite de messages WhatsApp quotidienne atteinte.",
+        code: "WHATSAPP_QUOTA_EXCEEDED"
+      });
+    }
+    
     const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
+    await incrementUserQuota(req.userId, 'whatsapp');
+    
     return res.status(200).json({
       success: true,
       error: false,
@@ -3107,10 +3873,8 @@ app.post("/api/memory/clear", authenticateUser, async (req, res) => {
       });
     }
 
-    // Supprime les messages locaux (SQLite)
     await dbRun("DELETE FROM messages WHERE session_id = ?", [conversationId]);
 
-    // Supprime les messages Supabase si configuré
     if (supabase && req.firebaseUid) {
       try {
         const { error } = await supabase.from("messages").delete().eq("session_id", conversationId).eq("firebase_uid", req.firebaseUid);
@@ -3120,7 +3884,6 @@ app.post("/api/memory/clear", authenticateUser, async (req, res) => {
       }
     }
 
-    // Réinitialise l'intention active
     await clearActiveIntent(conversationId);
 
     return res.status(200).json({
@@ -3148,7 +3911,6 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
     
     logger.info({ userId }, "Demande de suppression de compte");
     
-    // 1. Supprimer les sessions WhatsApp
     try {
       const whatsappSession = whatsappManager.sessions.get(userId);
       if (whatsappSession?.sock) {
@@ -3156,7 +3918,6 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
       }
       whatsappManager.sessions.delete(userId);
       
-      // Supprimer les fichiers de session locaux
       const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
       if (fs.existsSync(authDir)) {
         fs.rmSync(authDir, { recursive: true, force: true });
@@ -3165,14 +3926,15 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
       logger.warn({ error: error.message }, "Erreur suppression session WhatsApp");
     }
     
-    // 2. Supprimer les données SQLite
     await dbRun("DELETE FROM messages WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
     await dbRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
     await dbRun("DELETE FROM email_logs WHERE user_id = ? OR firebase_uid = ?", [userId, firebaseUid]);
     await dbRun("DELETE FROM llm_audit_log WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM security_logs WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM user_quotas WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM active_sessions WHERE user_id = ?", [userId]);
     await dbRun("DELETE FROM users WHERE id = ?", [userId]);
     
-    // 3. Supprimer les données Supabase
     if (supabase && firebaseUid) {
       try {
         await supabase.from("messages").delete().eq("firebase_uid", firebaseUid);
@@ -3184,15 +3946,24 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
       }
     }
     
-    // Note : La suppression du compte Firebase nécessite l'Admin SDK
-    // ou une Cloud Function. À implémenter côté frontend ou via une Cloud Function.
+    // Supprimer le compte Firebase si Admin SDK disponible
+    let firebaseAccountDeleted = false;
+    if (firebaseApp && firebaseAdmin) {
+      try {
+        await deleteFirebaseUser(firebaseUid);
+        firebaseAccountDeleted = true;
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur suppression compte Firebase");
+      }
+    }
     
     return res.status(200).json({
       success: true,
       error: false,
-      message: "Compte supprimé avec succès des bases de données.",
+      message: "Compte supprimé avec succès.",
       code: "ACCOUNT_DELETED",
-      note: "La suppression du compte Firebase doit être effectuée côté client"
+      firebaseAccountDeleted,
+      note: firebaseAccountDeleted ? "Compte Firebase supprimé" : "La suppression du compte Firebase doit être effectuée côté client"
     });
   } catch (error) {
     logger.error({ error: error.message }, "Erreur suppression compte");
@@ -3218,11 +3989,15 @@ app.use((req, res, next) => {
       "GET /api/health",
       "POST /api/chat",
       "GET /api/conversations",
+      "GET /api/user/stats",
       "POST /api/tools",
       "POST /api/whatsapp/connect",
       "POST /api/whatsapp/send",
       "POST /api/intent/init",
       "POST /api/memory/clear",
+      "POST /api/session/create",
+      "POST /api/session/revoke",
+      "POST /api/admin/set-role",
       "DELETE /api/account"
     ]
   });
@@ -3252,6 +4027,8 @@ validateEnvironment();
 const server = app.listen(CONFIG.PORT, () => {
   logger.info("Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " démarré sur le port " + CONFIG.PORT);
   console.log("🚀 Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " opérationnel sur le port " + CONFIG.PORT);
+  console.log("🌐 Domaine: " + HOSTING_CONFIG.domain);
+  console.log("🔐 Firebase Admin: " + (firebaseApp ? "activé" : "désactivé (mode API REST)"));
 });
 
 // ==================== ARRÊT PROPRE (GRACEFUL SHUTDOWN) ====================
@@ -3263,7 +4040,6 @@ async function shutdown(signal) {
   console.log("\nSignal " + signal + " reçu. Arrêt propre en cours...");
   logger.info({ signal }, "Arrêt propre du serveur");
 
-  // 1. Fermer le serveur HTTP
   await new Promise((resolve) => {
     server.close(() => {
       console.log("✅ Serveur HTTP fermé");
@@ -3271,7 +4047,6 @@ async function shutdown(signal) {
     });
   });
 
-  // 2. Fermer les connexions WhatsApp
   try {
     await whatsappManager.destroyAll();
     console.log("✅ Connexions WhatsApp fermées");
@@ -3279,7 +4054,6 @@ async function shutdown(signal) {
     logger.error({ error: error.message }, "Erreur fermeture WhatsApp");
   }
 
-  // 3. Fermer les files d'attente
   try {
     await queueManager.close();
     console.log("✅ Files d'attente fermées");
@@ -3287,7 +4061,6 @@ async function shutdown(signal) {
     logger.error({ error: error.message }, "Erreur fermeture files d'attente");
   }
 
-  // 4. Fermer la base de données SQLite
   await new Promise((resolve) => {
     db.close((error) => {
       if (error) {
