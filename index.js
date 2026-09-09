@@ -1,5 +1,5 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 11.0.0 Enterprise (Production Ready - Blindé)
+// Version : 12.0.0 Enterprise (Production Ready - Blindé)
 // Architecture : Modulaire, Microservices-ready, Haute Disponibilité
 // Optimisé pour Render.com
 //
@@ -21,6 +21,8 @@
 // - Agrégation RSS (rss-parser)
 // - Recherche web (duck-duck-scrape)
 // - Scraping (cheerio)
+// - MÉMOIRE CONVERSATIONNELLE PERSISTANTE
+// - SYNCHRONISATION UID UTILISATEUR
 // ================================================================================
 
 require("dotenv").config();
@@ -77,12 +79,13 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "11.0.0",
+  VERSION: "12.0.0",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON Technology",
 
   MAX_MESSAGE_LENGTH: parseInt(process.env.MAX_MESSAGE_LENGTH || "15000", 10),
-  MAX_HISTORY_LENGTH: parseInt(process.env.MAX_HISTORY_LENGTH || "20", 10),
+  MAX_HISTORY_LENGTH: parseInt(process.env.MAX_HISTORY_LENGTH || "50", 10),
+  MAX_CONTEXT_MESSAGES: parseInt(process.env.MAX_CONTEXT_MESSAGES || "20", 10),
   IMAGE_SEARCH_LIMIT: parseInt(process.env.IMAGE_SEARCH_LIMIT || "6", 10),
   MAX_CONTEXT_TOKENS: parseInt(process.env.MAX_CONTEXT_TOKENS || "8000", 10),
   MAX_IMAGE_SIZE_MB: parseInt(process.env.MAX_IMAGE_SIZE_MB || "10", 10),
@@ -113,7 +116,7 @@ const CONFIG = {
   VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free",
 
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/11.0.0"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/12.0.0"
 };
 
 // ==================== CONFIGURATION FIREBASE ====================
@@ -264,6 +267,7 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
+    user_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
     content TEXT NOT NULL,
     tool_calls TEXT,
@@ -274,6 +278,8 @@ db.serialize(() => {
   )`);
 
   db.run("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id DESC)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, created_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_sessions_firebase ON sessions(firebase_uid)");
   db.run("CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages(session_id, role)");
@@ -1258,6 +1264,93 @@ function analyzeIntent(message) {
   return intentMap[classified] || "GENERAL";
 }
 
+// ==================== GESTION DE LA MÉMOIRE CONVERSATIONNELLE ====================
+// Fonction améliorée pour récupérer l'historique complet avec contexte
+async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_CONTEXT_MESSAGES) {
+  try {
+    // Récupérer les messages depuis SQLite avec le user_id
+    let query = "SELECT role, content, created_at FROM messages WHERE session_id = ?";
+    let params = [conversationId];
+    
+    if (userId) {
+      query += " AND (user_id = ? OR user_id IS NULL)";
+      params.push(userId);
+    }
+    
+    query += " ORDER BY id DESC LIMIT ?";
+    params.push(limit);
+    
+    const localRows = await dbAll(query, params);
+    
+    if (localRows.length > 0) {
+      // Inverser pour avoir l'ordre chronologique
+      return localRows.reverse().map(row => ({
+        role: row.role,
+        content: row.content
+      }));
+    }
+    
+    // Fallback vers Supabase si disponible
+    if (supabase) {
+      try {
+        const { data: supabaseMessages, error } = await supabase
+          .from("messages")
+          .select("role, content")
+          .eq("session_id", conversationId)
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        
+        if (supabaseMessages && !error && supabaseMessages.length > 0) {
+          return supabaseMessages.reverse().map(row => ({
+            role: row.role,
+            content: row.content
+          }));
+        }
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur Supabase getFullHistory");
+      }
+    }
+    
+    return [];
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur getFullHistory");
+    return [];
+  }
+}
+
+// Fonction pour sauvegarder un message avec le user_id
+async function saveMessageWithUser(conversationId, role, content, userId = null, firebaseUid = null, metadata = {}) {
+  try {
+    await dbRun(
+      "INSERT INTO messages (session_id, user_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+      [conversationId, userId, role, content, JSON.stringify(metadata)]
+    );
+    
+    await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
+    
+    // Synchronisation Supabase
+    if (supabase && firebaseUid) {
+      try {
+        await supabase.from("messages").insert({
+          session_id: conversationId,
+          firebase_uid: firebaseUid,
+          user_id: userId,
+          role,
+          content,
+          created_at: new Date().toISOString()
+        });
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur sync message Supabase");
+      }
+    }
+    
+    return true;
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur saveMessageWithUser");
+    return false;
+  }
+}
+
 // ==================== ENVOI D'EMAIL ====================
 async function verifyGmailScope(accessToken) {
   try {
@@ -1924,13 +2017,14 @@ class DynamicContextManager {
     return bestMatch;
   }
 
-  buildSystemPrompt(message, basePrompt) {
+  buildSystemPrompt(message, basePrompt, conversationContext = "") {
     const domain = this.analyzeDomain(message);
     const formattingRules = [
       "FORMATAGE STRICT OBLIGATOIRE :",
       "- TOUT code doit être encadré dans des blocs Markdown avec triple backticks",
       "- TOUTE formule mathématique doit être encadrée en LaTeX ($ pour inline, $$ pour display)",
-      "- Les noms de variables, fonctions et fichiers doivent être en backticks simples"
+      "- Les noms de variables, fonctions et fichiers doivent être en backticks simples",
+      "- IMPORTANT : Utilise le contexte de la conversation pour répondre de manière cohérente"
     ].join("\n");
 
     const webCodeRules = [
@@ -1942,9 +2036,14 @@ class DynamicContextManager {
       "- Ne génère du code que si l'utilisateur le demande explicitement"
     ].join("\n");
 
+    let contextSection = "";
+    if (conversationContext) {
+      contextSection = "\n\nCONTEXTE DE LA CONVERSATION PRÉCÉDENTE :\n" + conversationContext + "\n\nINSTRUCTION : Utilise ce contexte pour comprendre les références et maintenir la cohérence de la conversation.";
+    }
+
     return {
       role: "system",
-      content: basePrompt + "\n\nDOMAINE D'EXPERTISE DÉTECTÉ : " + domain.domain.toUpperCase() + "\n" + domain.systemPrompt + "\n\n" + formattingRules + "\n\n" + webCodeRules
+      content: basePrompt + "\n\nDOMAINE D'EXPERTISE DÉTECTÉ : " + domain.domain.toUpperCase() + "\n" + domain.systemPrompt + "\n\n" + formattingRules + "\n\n" + webCodeRules + contextSection
     };
   }
 }
@@ -1959,6 +2058,11 @@ const LUBA_BASE_SYSTEM_PROMPT = [
   "- Tu t'appelles Luba (ou Luba.ia).",
   "- IA développée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
   "- Ton ton est chaleureux, intelligent et proactif.",
+  "",
+  "RÈGLE SUR LA MÉMOIRE CONVERSATIONNELLE :",
+  "- Tu dois TOUJOURS te souvenir du contexte de la conversation.",
+  "- Si l'utilisateur fait référence à quelque chose mentionné précédemment, utilise ce contexte.",
+  "- Exemple : Si on parle du Congo et qu'on demande 'comment s'appellent ses habitants', réponds 'les Congolais'.",
   "",
   "RÈGLE SUR LES DONNÉES (OBLIGATOIRE) :",
   "- Tu ne dois JAMAIS inventer un score sportif, une actualité, un résultat de recherche, une donnée météo.",
@@ -2106,18 +2210,20 @@ const authenticateUser = async (req, res, next) => {
       await recordLoginAttempt(req.ip, user.uid, true);
       await logSecurityEvent(user.uid, 'LOGIN_SUCCESS', { email: user.email }, req.ip, req.headers['user-agent']);
       
-      // Synchronisation utilisateur
-      const userRow = await dbGet("SELECT * FROM users WHERE id = ?", [user.uid]);
+      // Synchronisation utilisateur - SAUVEGARDE UID
+      const userRow = await dbGet("SELECT * FROM users WHERE id = ? OR firebase_uid = ?", [user.uid, user.uid]);
       if (!userRow) {
         await dbRun(
           "INSERT INTO users (id, firebase_uid, email, display_name, role, email_verified, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
           [user.uid, user.uid, user.email, user.displayName || user.uid, req.userRole, user.emailVerified ? 1 : 0]
         );
+        logger.info({ userId: user.uid }, "✅ Nouvel utilisateur créé avec UID");
       } else {
         await dbRun(
-          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, email = COALESCE(?, email), display_name = COALESCE(?, display_name), role = ?, email_verified = ? WHERE id = ?",
-          [user.email, user.displayName, req.userRole, user.emailVerified ? 1 : 0, user.uid]
+          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, email = COALESCE(?, email), display_name = COALESCE(?, display_name), role = ?, email_verified = ?, firebase_uid = ? WHERE id = ?",
+          [user.email, user.displayName, req.userRole, user.emailVerified ? 1 : 0, user.uid, user.uid]
         );
+        logger.info({ userId: user.uid }, "✅ Utilisateur synchronisé avec UID");
       }
       
       if (supabase && user.uid) {
@@ -2157,9 +2263,20 @@ async function syncUserWithSupabase(firebaseUid, email, displayName) {
     const { data: existingUser, error: fetchError } = await supabase.from("users").select("firebase_uid").eq("firebase_uid", firebaseUid).single();
     if (fetchError && fetchError.code !== "PGRST116") return;
     if (!existingUser) {
-      await supabase.from("users").insert({ firebase_uid: firebaseUid, email, display_name: displayName, last_seen_at: new Date().toISOString() });
+      await supabase.from("users").insert({ 
+        id: firebaseUid,
+        firebase_uid: firebaseUid, 
+        email, 
+        display_name: displayName, 
+        last_seen_at: new Date().toISOString() 
+      });
+      logger.info({ firebaseUid }, "✅ Utilisateur créé dans Supabase");
     } else {
-      await supabase.from("users").update({ last_seen_at: new Date().toISOString() }).eq("firebase_uid", firebaseUid);
+      await supabase.from("users").update({ 
+        last_seen_at: new Date().toISOString(),
+        email: email || existingUser.email,
+        display_name: displayName || existingUser.display_name
+      }).eq("firebase_uid", firebaseUid);
     }
   } catch (error) {
     logger.error({ error: error.message }, "Erreur sync Supabase");
@@ -2172,19 +2289,36 @@ async function syncSessionWithSupabase(sessionId, firebaseUid, userId) {
     const { data: existingSession, error: fetchError } = await supabase.from("sessions").select("session_id").eq("session_id", sessionId).single();
     if (fetchError && fetchError.code !== "PGRST116") return;
     if (!existingSession) {
-      await supabase.from("sessions").insert({ session_id: sessionId, firebase_uid: firebaseUid, user_id: userId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+      await supabase.from("sessions").insert({ 
+        session_id: sessionId, 
+        firebase_uid: firebaseUid, 
+        user_id: userId, 
+        created_at: new Date().toISOString(), 
+        updated_at: new Date().toISOString() 
+      });
     } else {
-      await supabase.from("sessions").update({ updated_at: new Date().toISOString() }).eq("session_id", sessionId);
+      await supabase.from("sessions").update({ 
+        updated_at: new Date().toISOString(),
+        user_id: userId,
+        firebase_uid: firebaseUid
+      }).eq("session_id", sessionId);
     }
   } catch (error) {
     logger.error({ error: error.message }, "Erreur sync session Supabase");
   }
 }
 
-async function syncMessageWithSupabase(sessionId, role, content, firebaseUid) {
+async function syncMessageWithSupabase(sessionId, role, content, firebaseUid, userId = null) {
   if (!supabase || !firebaseUid) return;
   try {
-    await supabase.from("messages").insert({ session_id: sessionId, firebase_uid: firebaseUid, role, content, created_at: new Date().toISOString() });
+    await supabase.from("messages").insert({ 
+      session_id: sessionId, 
+      firebase_uid: firebaseUid, 
+      user_id: userId,
+      role, 
+      content, 
+      created_at: new Date().toISOString() 
+    });
   } catch (error) {
     logger.error({ error: error.message }, "Erreur sync message Supabase");
   }
@@ -2215,26 +2349,14 @@ async function getSession(conversationId, userId, firebaseUid = null) {
   return { session_id: conversationId, user_id: userId, firebase_uid: firebaseUid };
 }
 
-async function getHistory(conversationId, limit = CONFIG.MAX_HISTORY_LENGTH) {
-  const localRows = await dbAll("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?", [conversationId, limit]);
-  if (localRows.length > 0) return localRows.reverse();
-  
-  if (supabase) {
-    try {
-      const { data: supabaseMessages, error } = await supabase.from("messages").select("role, content").eq("session_id", conversationId).order("created_at", { ascending: false }).limit(limit);
-      if (supabaseMessages && !error && supabaseMessages.length > 0) return supabaseMessages.reverse();
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur Supabase getHistory");
-    }
-  }
-  
-  return [];
+// Utiliser getFullHistory au lieu de getHistory
+async function getHistory(conversationId, userId = null, limit = CONFIG.MAX_CONTEXT_MESSAGES) {
+  return await getFullHistory(conversationId, userId, limit);
 }
 
-async function saveMessage(conversationId, role, content, firebaseUid = null) {
-  await dbRun("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", [conversationId, role, content]);
-  await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
-  await syncMessageWithSupabase(conversationId, role, content, firebaseUid);
+// Utiliser saveMessageWithUser au lieu de saveMessage
+async function saveMessage(conversationId, role, content, userId = null, firebaseUid = null) {
+  return await saveMessageWithUser(conversationId, role, content, userId, firebaseUid);
 }
 
 // ==================== GESTION DES INTENTIONS ====================
@@ -2266,10 +2388,10 @@ async function assertConversationOwnership(conversationId, userId) {
 }
 
 // ==================== CALL LLM ====================
-async function callLLM_v100(messages, images = null, sessionId = null, userId = null) {
+async function callLLM_v100(messages, images = null, sessionId = null, userId = null, conversationContext = "") {
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   const userText = typeof lastUserMessage?.content === "string" ? lastUserMessage.content : "";
-  const dynamicSystemPrompt = dynamicContextManager.buildSystemPrompt(userText, LUBA_BASE_SYSTEM_PROMPT);
+  const dynamicSystemPrompt = dynamicContextManager.buildSystemPrompt(userText, LUBA_BASE_SYSTEM_PROMPT, conversationContext);
 
   const result = await executeWithRetryAndFallback(
     MODEL_TIERS.v100.providers,
@@ -2284,10 +2406,10 @@ async function callLLM_v100(messages, images = null, sessionId = null, userId = 
   throw new Error("Échec complet du tier v100");
 }
 
-async function callLLM_v250(messages, userMessage, images = null, sessionId = null, userId = null) {
+async function callLLM_v250(messages, userMessage, images = null, sessionId = null, userId = null, conversationContext = "") {
   const tier = MODEL_TIERS.v250;
   const providerChain = [];
-  const dynamicSystemPrompt = dynamicContextManager.buildSystemPrompt(userMessage, LUBA_BASE_SYSTEM_PROMPT);
+  const dynamicSystemPrompt = dynamicContextManager.buildSystemPrompt(userMessage, LUBA_BASE_SYSTEM_PROMPT, conversationContext);
 
   const reasoningMessages = [
     { role: "system", content: dynamicSystemPrompt.content + "\n\nAnalyse ce problème complexe en profondeur." },
@@ -2301,7 +2423,7 @@ async function callLLM_v250(messages, userMessage, images = null, sessionId = nu
   );
 
   if (!reasoningResult.success || !reasoningResult.response || reasoningResult.response.trim().length < 40) {
-    return await degradedFallbackToV100(messages, "reasoning_failed", images);
+    return await degradedFallbackToV100(messages, "reasoning_failed", images, conversationContext);
   }
 
   const reasoningAnalysis = reasoningResult.response;
@@ -2335,7 +2457,7 @@ async function callLLM_v250(messages, userMessage, images = null, sessionId = nu
   );
 
   if (!codeResult.success || !codeResult.response) {
-    return await degradedFallbackToV100(messages, "code_generation_failed", images);
+    return await degradedFallbackToV100(messages, "code_generation_failed", images, conversationContext);
   }
 
   providerChain.push("R2:" + codeResult.providerUsed + "/" + codeResult.modelUsed);
@@ -2350,7 +2472,7 @@ async function callLLM_v250(messages, userMessage, images = null, sessionId = nu
   };
 }
 
-async function callVisionModel(messages, images, sessionId = null, userId = null) {
+async function callVisionModel(messages, images, sessionId = null, userId = null, conversationContext = "") {
   const result = await executeWithRetryAndFallback(
     MODEL_TIERS.vision.providers,
     { messages, images },
@@ -2361,12 +2483,12 @@ async function callVisionModel(messages, images, sessionId = null, userId = null
     return { ...result.response, providerUsed: result.providerUsed, modelUsed: result.modelUsed, visionEnabled: true };
   }
 
-  return await callLLM_v100(messages, null);
+  return await callLLM_v100(messages, null, sessionId, userId, conversationContext);
 }
 
-async function degradedFallbackToV100(messages, reason, images = null) {
+async function degradedFallbackToV100(messages, reason, images = null, conversationContext = "") {
   try {
-    const fallbackResult = await callLLM_v100(messages, images);
+    const fallbackResult = await callLLM_v100(messages, images, null, null, conversationContext);
     return {
       ...fallbackResult,
       providerUsed: "v250_degraded_to_v100",
@@ -2504,7 +2626,7 @@ async function enrichContextWithIntent(intent, userMessage) {
   return enrichment;
 }
 
-// ==================== HANDLE CHAT ====================
+// ==================== HANDLE CHAT - AVEC MÉMOIRE CONVERSATIONNELLE ====================
 async function handleChat({ conversationId, userId, firebaseUid, message, googleAccessToken = null, channel = "web", modelTier = "v100", images = null }) {
   await getSession(conversationId, userId, firebaseUid);
 
@@ -2513,22 +2635,38 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken, firebaseUid });
   }
 
-  await saveMessage(conversationId, "user", message, firebaseUid);
+  // Sauvegarder le message utilisateur avec le user_id
+  await saveMessageWithUser(conversationId, "user", message, userId, firebaseUid);
 
-  const history = await getHistory(conversationId);
+  // Récupérer l'historique complet avec le contexte
+  const history = await getFullHistory(conversationId, userId);
+  
+  // Construire le contexte de conversation pour le LLM
+  let conversationContext = "";
+  if (history.length > 0) {
+    const recentHistory = history.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
+    conversationContext = recentHistory.map(msg => 
+      `${msg.role === "user" ? "Utilisateur" : "Assistant"}: ${msg.content.slice(0, 500)}`
+    ).join("\n");
+  }
   
   // Phase 1 : Analyse d'intention
   const intent = analyzeIntent(message);
-  logger.info({ intent, conversationId }, "Intention détectée");
+  logger.info({ intent, conversationId, historyLength: history.length }, "Intention détectée");
   
   // Phase 2 : Enrichissement de contexte
   const enrichment = await enrichContextWithIntent(intent, message);
   
-  let messages = [...history, { role: "user", content: message }];
+  // Construire les messages pour le LLM avec l'historique complet
+  let messages = [];
+  
+  // Inclure l'historique limité pour le contexte
+  const contextHistory = history.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
+  messages = [...contextHistory, { role: "user", content: message }];
   
   // Injection du contexte enrichi si disponible
   if (enrichment.contextData) {
-    messages = [...history, { 
+    messages = [...contextHistory, { 
       role: "user", 
       content: message + "\n\n[CONTEXTE ENRICHISSÉ - NE PAS CITER CES SOURCES DANS TA RÉPONSE]\n" + enrichment.contextData 
     }];
@@ -2543,12 +2681,12 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
 
   try {
     if (images && images.length > 0) {
-      const visionResult = await callVisionModel(messages, images, conversationId, userId);
+      const visionResult = await callVisionModel(messages, images, conversationId, userId, conversationContext);
       finalResponse = visionResult.replyText || "Je n'ai pas pu analyser l'image.";
       suggestions = Array.isArray(visionResult.suggestions) ? visionResult.suggestions.slice(0, 4) : [];
       providerUsed = visionResult.providerUsed || "vision";
     } else if (modelTier === "v250") {
-      const result = await callLLM_v250(messages, message, null, conversationId, userId);
+      const result = await callLLM_v250(messages, message, null, conversationId, userId, conversationContext);
       finalResponse = result.replyText || "Je n'ai pas pu générer une réponse.";
       suggestions = Array.isArray(result.suggestions) ? result.suggestions.slice(0, 4) : [];
       providerUsed = result.providerUsed || "pipeline_v250";
@@ -2561,7 +2699,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
         maxLoops--;
         let llmResponse;
         try {
-          llmResponse = await callLLM_v100(messages, null, conversationId, userId);
+          llmResponse = await callLLM_v100(messages, null, conversationId, userId, conversationContext);
           providerUsed = llmResponse.providerUsed;
           degraded = llmResponse.degraded || false;
         } catch (error) {
@@ -2593,7 +2731,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
 
           messages.push({
             role: "user",
-            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi. Respecte strictement le formatage LaTeX pour les mathématiques."
+            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi. Respecte strictement le formatage LaTeX pour les mathématiques. Utilise le contexte de la conversation pour répondre."
           });
           enrichment.toolCalls = [];
           keepRunning = true;
@@ -2621,7 +2759,8 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       if (sourceLines.length > 0) finalResponse += "\n\n---\n\n**Sources :** " + sourceLines.join(" · ");
     }
 
-    await saveMessage(conversationId, "assistant", finalResponse, firebaseUid);
+    // Sauvegarder la réponse de l'assistant avec le user_id
+    await saveMessageWithUser(conversationId, "assistant", finalResponse, userId, firebaseUid, { providerUsed, intent });
 
     return {
       reply: finalResponse,
@@ -2633,7 +2772,8 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       visionEnabled: Boolean(images && images.length > 0),
       suggestions,
       sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean),
-      intent
+      intent,
+      contextLength: history.length
     };
   } catch (error) {
     logger.error({ error: error.message }, "Erreur critique handleChat");
@@ -2651,7 +2791,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     };
 
     try {
-      await saveMessage(conversationId, "assistant", fallbackResponse.reply, firebaseUid);
+      await saveMessageWithUser(conversationId, "assistant", fallbackResponse.reply, userId, firebaseUid);
     } catch (saveError) {
       logger.error({ error: saveError.message }, "Erreur sauvegarde message de secours");
     }
@@ -2748,7 +2888,9 @@ app.get("/api/health", async (req, res) => {
           mathEngine: true,
           rssAggregation: true,
           webSearch: true,
-          scraping: true
+          scraping: true,
+          conversationMemory: true,
+          uidSync: true
         }
       }
     });
@@ -2812,6 +2954,36 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
   }
 });
 
+// Route pour récupérer l'historique complet d'une conversation
+app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    
+    if (!conversationId) {
+      return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
+    }
+    
+    try {
+      await assertConversationOwnership(conversationId, req.userId);
+    } catch (error) {
+      return res.status(403).json({ success: false, error: true, reply: error.message, code: "CONVERSATION_OWNERSHIP" });
+    }
+    
+    const messages = await getFullHistory(conversationId, req.userId, CONFIG.MAX_HISTORY_LENGTH);
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      conversationId,
+      messages,
+      count: messages.length
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur récupération historique");
+    return res.status(500).json({ success: false, error: true, code: "HISTORY_FETCH_ERROR" });
+  }
+});
+
 app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const rows = await dbAll("SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? OR firebase_uid = ? ORDER BY updated_at DESC LIMIT 50", [req.userId, req.firebaseUid]);
@@ -2844,7 +3016,9 @@ app.get("/api/user/stats", authenticateUser, async (req, res) => {
       data: {
         quotas: quotaRow || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 },
         role: req.userRole || 'FREE',
-        limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE
+        limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE,
+        userId: req.userId,
+        firebaseUid: req.firebaseUid
       }
     });
   } catch (error) {
@@ -3060,6 +3234,7 @@ app.use((req, res) => {
     code: "NOT_FOUND",
     availableRoutes: [
       "GET /", "GET /api/health", "POST /api/chat", "GET /api/conversations",
+      "GET /api/conversation/:conversationId/messages",
       "GET /api/user/stats", "POST /api/tools", "POST /api/whatsapp/connect",
       "POST /api/whatsapp/send", "POST /api/intent/init", "POST /api/memory/clear",
       "POST /api/session/create", "POST /api/session/revoke", "POST /api/admin/set-role",
@@ -3086,6 +3261,8 @@ const server = app.listen(CONFIG.PORT, () => {
   console.log("📰 RSS Parser: activé");
   console.log("🔍 Web Search (DuckDuckGo): activé");
   console.log("📄 Scraping (Cheerio): activé");
+  console.log("💾 Mémoire Conversationnelle: activée");
+  console.log("👤 Synchronisation UID: activée");
 });
 
 // ==================== ARRÊT PROPRE ====================
