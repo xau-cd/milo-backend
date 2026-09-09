@@ -1,5 +1,5 @@
 // ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 10.0.0 Enterprise (Production Ready - Blindé)
+// Version : 11.0.0 Enterprise (Production Ready - Blindé)
 // Architecture : Modulaire, Microservices-ready, Haute Disponibilité
 // Optimisé pour Render.com
 //
@@ -16,6 +16,11 @@
 // - Pipeline LLM v100/v250 avec failover
 // - Vision par IA
 // - RGPD (suppression de compte)
+// - Moteur d'intention NLP (natural)
+// - Calcul formel (mathjs)
+// - Agrégation RSS (rss-parser)
+// - Recherche web (duck-duck-scrape)
+// - Scraping (cheerio)
 // ================================================================================
 
 require("dotenv").config();
@@ -36,6 +41,12 @@ const pino = require("pino");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const { EventEmitter } = require("events");
+const { Groq } = require("@groq/sdk");
+const math = require("mathjs");
+const Parser = require("rss-parser");
+const { search } = require("duck-duck-scrape");
+const cheerio = require("cheerio");
+const natural = require("natural");
 
 // ==================== IMPORTS FIREBASE ADMIN ====================
 let firebaseAdmin = null;
@@ -66,7 +77,7 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "10.0.0",
+  VERSION: "11.0.0",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON Technology",
 
@@ -102,7 +113,7 @@ const CONFIG = {
   VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free",
 
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/10.0.0"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/11.0.0"
 };
 
 // ==================== CONFIGURATION FIREBASE ====================
@@ -347,6 +358,17 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
+  db.run(`CREATE TABLE IF NOT EXISTS news_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    title TEXT,
+    link TEXT,
+    pub_date TEXT,
+    description TEXT,
+    source TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
   db.run("CREATE INDEX IF NOT EXISTS idx_user_quotas_user_date ON user_quotas(user_id, date)");
   db.run("CREATE INDEX IF NOT EXISTS idx_security_logs_user ON security_logs(user_id, created_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_llm_audit_user ON llm_audit_log(user_id, created_at DESC)");
@@ -354,6 +376,7 @@ db.serialize(() => {
   db.run("CREATE INDEX IF NOT EXISTS idx_active_sessions_user ON active_sessions(user_id, created_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address, created_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip ON blocked_ips(ip_address)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_news_cache_category ON news_cache(category, created_at DESC)");
 });
 
 logger.info("✅ Schéma SQLite initialisé");
@@ -405,6 +428,51 @@ const upload = multer({
     }
   }
 });
+
+// ==================== INITIALISATION GROQ SDK ====================
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY || ""
+});
+
+// ==================== INITIALISATION RSS PARSER ====================
+const rssParser = new Parser({
+  timeout: 10000,
+  headers: {
+    "User-Agent": CONFIG.HTTP_USER_AGENT
+  }
+});
+
+// ==================== INITIALISATION NATURAL NLP ====================
+const tokenizer = new natural.WordTokenizer();
+const classifier = new natural.BayesClassifier();
+
+// Entraînement du classifieur d'intention
+classifier.addDocument("calcule 2+2", "MATHS");
+classifier.addDocument("résous cette équation x^2 + 3x + 2 = 0", "MATHS");
+classifier.addDocument("intégrale de sin(x)", "MATHS");
+classifier.addDocument("dérivée de x^2", "MATHS");
+classifier.addDocument("factorielle de 10", "MATHS");
+classifier.addDocument("matrice inverse", "MATHS");
+
+classifier.addDocument("quelles sont les dernières actualités", "ACTUALITÉ");
+classifier.addDocument("informations sur la politique", "ACTUALITÉ");
+classifier.addDocument("news du jour", "ACTUALITÉ");
+classifier.addDocument("dernières nouvelles internationales", "ACTUALITÉ");
+classifier.addDocument("que se passe-t-il dans le monde", "ACTUALITÉ");
+
+classifier.addDocument("score du match de football", "SPORT");
+classifier.addDocument("résultat du PSG", "SPORT");
+classifier.addDocument("classement ligue 1", "SPORT");
+classifier.addDocument("dernier match de tennis", "SPORT");
+classifier.addDocument("résultats NBA", "SPORT");
+
+classifier.addDocument("écris un code en javascript", "CODE");
+classifier.addDocument("fonction python pour trier", "CODE");
+classifier.addDocument("debug ce script", "CODE");
+classifier.addDocument("crée une API REST", "CODE");
+classifier.addDocument("requête SQL", "CODE");
+
+classifier.train();
 
 // ==================== UTILITAIRES ====================
 function convertImageToBase64(buffer, mimetype) {
@@ -945,7 +1013,8 @@ async function searchNews(query) {
       const title = (block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "";
       const link = (block.match(/<link>([\s\S]*?)<\/link>/) || [])[1] || "";
       const pubDate = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || "";
-      if (title) items.push({ title: decodeXmlEntities(title), link: link.trim(), pubDate });
+      const description = (block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "";
+      if (title) items.push({ title: decodeXmlEntities(title), link: link.trim(), pubDate, description: decodeXmlEntities(description) });
     }
     return { articles: items };
   } catch (error) {
@@ -956,18 +1025,73 @@ async function searchNews(query) {
 
 async function searchWeb(query) {
   if (!query || typeof query !== "string") return { results: [], sourcesUsed: [] };
-  const [wiki, news] = await Promise.all([searchWikipediaSummary(query), searchNews(query)]);
+  const [wiki, news, ddgResults] = await Promise.all([
+    searchWikipediaSummary(query),
+    searchNews(query),
+    searchDuckDuckGo(query)
+  ]);
   const results = [];
   const sourcesUsed = [];
+  
   if (wiki.summary) {
-    results.push({ title: wiki.title, snippet: wiki.summary, url: wiki.url });
+    results.push({ title: wiki.title, snippet: wiki.summary, url: wiki.url, type: "wiki" });
     sourcesUsed.push("wikipedia");
   }
+  
+  if (ddgResults.length > 0) {
+    for (const r of ddgResults) {
+      results.push({ title: r.title, snippet: r.snippet, url: r.url, type: "web" });
+    }
+  }
+  
   if (news.articles?.length > 0) {
-    news.articles.slice(0, 3).forEach((a) => results.push({ title: a.title, url: a.link, pubDate: a.pubDate }));
+    news.articles.slice(0, 3).forEach((a) => results.push({ title: a.title, url: a.link, pubDate: a.pubDate, type: "news" }));
     sourcesUsed.push("googlenews");
   }
+  
   return { results, sourcesUsed };
+}
+
+async function searchDuckDuckGo(query) {
+  try {
+    const results = await search(query, {
+      safeSearch: "OFF",
+      locale: "fr-fr",
+      maxResults: 5
+    });
+    return results.map(r => ({
+      title: r.title,
+      snippet: r.description,
+      url: r.url,
+      source: r.source
+    }));
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur recherche DuckDuckGo");
+    return [];
+  }
+}
+
+async function scrapeArticleContent(url) {
+  try {
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: { "User-Agent": CONFIG.HTTP_USER_AGENT }
+    });
+    const $ = cheerio.load(response.data);
+    const title = $("title").text().trim();
+    const paragraphs = [];
+    $("p").each((i, el) => {
+      const text = $(el).text().trim();
+      if (text.length > 50) paragraphs.push(text);
+    });
+    return {
+      title,
+      content: paragraphs.slice(0, 5).join("\n\n").slice(0, 2000),
+      url
+    };
+  } catch (error) {
+    return { error: error.message, url };
+  }
 }
 
 async function searchSportsScores(query) {
@@ -1048,6 +1172,90 @@ async function getWeather(location) {
   } catch (error) {
     return { error: error.message };
   }
+}
+
+// ==================== MOTEUR MATHÉMATIQUE ====================
+function executeMathExpression(expression) {
+  try {
+    const result = math.evaluate(expression);
+    return {
+      success: true,
+      expression,
+      result: result,
+      formatted: math.format(result, { precision: 14 })
+    };
+  } catch (error) {
+    return {
+      success: false,
+      expression,
+      error: error.message
+    };
+  }
+}
+
+function detectMathExpressions(message) {
+  const patterns = [
+    /(\d+[\d\s\*\+\-\/\(\)\.]+\d+)/g,
+    /(?:calcule|calcul|résous|resous|solve|compute)\s*:?\s*([^\n]+)/i,
+    /(\d+\s*[\+\-\*\/\^]\s*\d+)/g,
+    /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)\s*(?:de|of)?\s*:?\s*([^\n]+)/i,
+    /(?:sqrt|sin|cos|tan|log|exp|abs|floor|ceil|round)\s*\([^)]+\)/g
+  ];
+  
+  const expressions = [];
+  for (const pattern of patterns) {
+    const matches = message.match(pattern);
+    if (matches) {
+      expressions.push(...matches);
+    }
+  }
+  
+  return expressions;
+}
+
+// ==================== ANALYSE D'INTENTION ====================
+function analyzeIntent(message) {
+  const lowerMessage = message.toLowerCase();
+  
+  // Vérification mathématique via patterns
+  const mathPatterns = [
+    /[\d\s\*\+\-\/\(\)\.]{3,}[\d\)]/, 
+    /(?:calcule|calcul|résous|resous|solve|compute|equation|équation)/i,
+    /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)/i,
+    /(?:sqrt|sin\(|cos\(|tan\(|log\(|exp\()/i,
+    /[\^]{1,2}\d/
+  ];
+  const hasMath = mathPatterns.some(p => p.test(message));
+  
+  // Vérification actualités
+  const newsWords = ["actualité", "actualites", "actualité", "news", "dernières nouvelles", "journal", "politique", "économie", "monde", "international", "breaking", "info"];
+  const hasNews = newsWords.some(w => lowerMessage.includes(w));
+  
+  // Vérification sport
+  const sportWords = ["sport", "match", "football", "basket", "tennis", "score", "résultat", "resultat", "classement", "ligue", "championnat", "nba", "psg", "om", "real madrid", "barca"];
+  const hasSport = sportWords.some(w => lowerMessage.includes(w));
+  
+  // Vérification code
+  const codeWords = ["code", "coder", "programmation", "programme", "javascript", "python", "java", "c++", "typescript", "react", "vue", "angular", "node", "api", "debug", "fonction", "function", "classe", "class", "algorithme", "sql", "html", "css"];
+  const hasCode = codeWords.some(w => lowerMessage.includes(w));
+  
+  if (hasMath) return "MATHS";
+  if (hasSport) return "SPORT";
+  if (hasNews) return "ACTUALITÉ";
+  if (hasCode) return "CODE";
+  
+  // Utilisation du classifieur NLP
+  const classified = classifier.classify(lowerMessage);
+  
+  // Mapping des intentions
+  const intentMap = {
+    "MATHS": "MATHS",
+    "ACTUALITÉ": "ACTUALITÉ",
+    "SPORT": "SPORT",
+    "CODE": "CODE"
+  };
+  
+  return intentMap[classified] || "GENERAL";
 }
 
 // ==================== ENVOI D'EMAIL ====================
@@ -1421,7 +1629,7 @@ const MODEL_TIERS = {
   v100: {
     name: "Mwamba",
     providers: [
-      { provider: "groq", model: process.env.GROQ_MODEL_V100 || "openai/gpt-oss-120b", maxTokens: 4000, timeout: 45000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
+      { provider: "groq", model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile", maxTokens: 4000, timeout: 45000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
       { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "qwen/qwen-2.5-coder-32b-instruct:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 1 },
       { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "meta-llama/llama-3.3-70b-instruct:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 2 },
       { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_3 || "microsoft/phi-4:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 3 }
@@ -1433,13 +1641,13 @@ const MODEL_TIERS = {
       providers: [
         { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
         { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "deepseek/deepseek-r1-distill-llama-70b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1 },
-        { provider: "groq", model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "openai/gpt-oss-120b", maxTokens: 6000, timeout: 45000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
+        { provider: "groq", model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 6000, timeout: 45000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
       ]
     },
     code: {
       providers: [
         { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free", maxTokens: 8000, timeout: 90000, temperature: 0.5, jsonMode: true, failoverPriority: 0 },
-        { provider: "groq", model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "openai/gpt-oss-120b", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 1 },
+        { provider: "groq", model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 1 },
         { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE_FALLBACK_2 || "meta-llama/llama-3.3-70b-instruct:free", maxTokens: 8000, timeout: 60000, temperature: 0.5, jsonMode: true, failoverPriority: 2 }
       ]
     },
@@ -1683,7 +1891,7 @@ class DynamicContextManager {
       {
         domain: "development",
         keywords: ["code", "coder", "programmation", "programming", "développement", "development", "javascript", "python", "java", "c++", "rust", "go", "typescript", "react", "vue", "angular", "node", "express", "api", "database", "sql", "nosql", "backend", "frontend", "bug", "debug", "fonction", "function", "classe", "class", "algorithme", "framework", "library", "package", "npm", "git", "docker", "kubernetes", "html", "css"],
-        systemPrompt: "Tu es un expert en développement logiciel. Fournis du code de production complet et fonctionnel."
+        systemPrompt: "Tu es un expert en développement logiciel. Fournis du code de production complet et fonctionnel. Ne génère du code que si l'utilisateur le demande explicitement."
       },
       {
         domain: "data_science",
@@ -1730,7 +1938,8 @@ class DynamicContextManager {
       "- Tout code HTML doit être encadré par un bloc Markdown ```html suivi de ```",
       "- Tout code CSS doit utiliser UNIQUEMENT la syntaxe /* ... */",
       "- Tout code JavaScript doit être encadré par un bloc Markdown ```javascript suivi de ```",
-      "- Le code livré doit TOUJOURS être complet et syntaxiquement valide"
+      "- Le code livré doit TOUJOURS être complet et syntaxiquement valide",
+      "- Ne génère du code que si l'utilisateur le demande explicitement"
     ].join("\n");
 
     return {
@@ -1762,6 +1971,14 @@ const LUBA_BASE_SYSTEM_PROMPT = [
   "RÈGLE SUR LES SUGGESTIONS :",
   "- Le champ suggestions doit TOUJOURS contenir 3 à 4 questions de suivi.",
   "",
+  "RÈGLE SUR LE CODE :",
+  "- Tu ne génères JAMAIS de code (Python, JavaScript, etc.) spontanément.",
+  "- Tu ne génères du code QUE si l'utilisateur le demande explicitement.",
+  "",
+  "RÈGLE SUR LES MATHÉMATIQUES :",
+  "- Pour tout calcul, utilise le résultat exact fourni par le moteur mathématique.",
+  "- Formate les équations en LaTeX ($...$ en ligne, $$...$$ en bloc).",
+  "",
   "FORMAT DE RÉPONSE OBLIGATOIRE (JSON strict) :",
   "{",
   '  "replyText": "Ta réponse complète en Markdown",',
@@ -1778,7 +1995,8 @@ const LUBA_BASE_SYSTEM_PROMPT = [
   "- search_social : Discussions réseaux sociaux",
   "- get_weather : Météo actuelle",
   "- send_email : Envoyer un email",
-  "- send_whatsapp_message : Envoyer un message WhatsApp"
+  "- send_whatsapp_message : Envoyer un message WhatsApp",
+  "- execute_math : Calcul mathématique exact"
 ].join("\n");
 
 // ==================== INITIALISATION EXPRESS ====================
@@ -2101,7 +2319,8 @@ async function callLLM_v250(messages, userMessage, images = null, sessionId = nu
     "- Code HTML dans un bloc ```html ... ```",
     "- Code CSS dans un bloc ```css ... ``` avec UNIQUEMENT des commentaires /* ... */",
     "- Code JavaScript dans un bloc ```javascript ... ```",
-    "- Code complet, jamais tronqué"
+    "- Code complet, jamais tronqué",
+    "- Formules mathématiques en LaTeX ($...$ en ligne, $$...$$ en bloc)"
   ].join("\n");
 
   const codeMessages = [
@@ -2206,6 +2425,10 @@ async function executeTool(toolName, args = {}, context = {}) {
       result = await getWeather(args.location || args.query);
       if (!result.error) sourceKeys.push("openmeteo");
       break;
+    case "execute_math":
+    case "calculate":
+      result = executeMathExpression(args.expression || args.query);
+      break;
     case "send_email":
       result = await dispatchSendEmail({
         googleAccessToken,
@@ -2226,6 +2449,61 @@ async function executeTool(toolName, args = {}, context = {}) {
   return { result, sourceKeys };
 }
 
+// ==================== ENRICHISSEMENT DE CONTEXTE ====================
+async function enrichContextWithIntent(intent, userMessage) {
+  const enrichment = {
+    contextData: "",
+    toolCalls: [],
+    sourceKeys: []
+  };
+
+  switch (intent) {
+    case "MATHS": {
+      const expressions = detectMathExpressions(userMessage);
+      if (expressions.length > 0) {
+        for (const expr of expressions.slice(0, 3)) {
+          const mathResult = executeMathExpression(expr);
+          if (mathResult.success) {
+            enrichment.contextData += `\n[Calcul exact] ${expr} = ${mathResult.formatted}\n`;
+          }
+        }
+        enrichment.toolCalls.push({ name: "execute_math", arguments: { expression: expressions[0] } });
+      }
+      break;
+    }
+    case "ACTUALITÉ": {
+      const newsResult = await searchNews(userMessage);
+      if (newsResult.articles && newsResult.articles.length > 0) {
+        enrichment.contextData += "\n[ACTUALITÉS RÉCENTES]\n";
+        newsResult.articles.slice(0, 5).forEach((a, i) => {
+          enrichment.contextData += `${i + 1}. ${a.title} (${a.pubDate})\n   ${a.link}\n   ${a.description ? a.description.slice(0, 200) : ""}\n\n`;
+        });
+        enrichment.sourceKeys.push("googlenews");
+        enrichment.toolCalls.push({ name: "search_news", arguments: { query: userMessage } });
+      }
+      break;
+    }
+    case "SPORT": {
+      const sportResult = await searchSportsScores(userMessage);
+      if (sportResult.events && sportResult.events.length > 0) {
+        enrichment.contextData += `\n[RÉSULTATS SPORTIFS - ${sportResult.team || ""}]\n`;
+        sportResult.events.forEach((e) => {
+          enrichment.contextData += `${e.match} (${e.date}) - ${e.league}\n`;
+        });
+        enrichment.sourceKeys.push("thesportsdb");
+        enrichment.toolCalls.push({ name: "search_sports_scores", arguments: { query: userMessage } });
+      }
+      break;
+    }
+    case "CODE": {
+      enrichment.contextData += "\n[MODE CODE ACTIVÉ]\nL'utilisateur demande explicitement du code. Fournis une réponse complète avec des blocs de code Markdown.";
+      break;
+    }
+  }
+
+  return enrichment;
+}
+
 // ==================== HANDLE CHAT ====================
 async function handleChat({ conversationId, userId, firebaseUid, message, googleAccessToken = null, channel = "web", modelTier = "v100", images = null }) {
   await getSession(conversationId, userId, firebaseUid);
@@ -2238,13 +2516,29 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
   await saveMessage(conversationId, "user", message, firebaseUid);
 
   const history = await getHistory(conversationId);
-  const messages = [...history, { role: "user", content: message }];
+  
+  // Phase 1 : Analyse d'intention
+  const intent = analyzeIntent(message);
+  logger.info({ intent, conversationId }, "Intention détectée");
+  
+  // Phase 2 : Enrichissement de contexte
+  const enrichment = await enrichContextWithIntent(intent, message);
+  
+  let messages = [...history, { role: "user", content: message }];
+  
+  // Injection du contexte enrichi si disponible
+  if (enrichment.contextData) {
+    messages = [...history, { 
+      role: "user", 
+      content: message + "\n\n[CONTEXTE ENRICHISSÉ - NE PAS CITER CES SOURCES DANS TA RÉPONSE]\n" + enrichment.contextData 
+    }];
+  }
 
   let finalResponse = null;
   let imageUrls = [];
   let providerUsed = "unknown";
   let suggestions = [];
-  const usedSources = new Set();
+  const usedSources = new Set(enrichment.sourceKeys);
   let degraded = false;
 
   try {
@@ -2278,8 +2572,10 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
           break;
         }
 
-        if (llmResponse.toolCalls && llmResponse.toolCalls.length > 0) {
-          for (const toolCall of llmResponse.toolCalls) {
+        const allToolCalls = [...(llmResponse.toolCalls || []), ...enrichment.toolCalls];
+        
+        if (allToolCalls.length > 0) {
+          for (const toolCall of allToolCalls) {
             let toolResult;
             try {
               const { result, sourceKeys } = await executeTool(toolCall.name, toolCall.arguments || {}, { userId, googleAccessToken });
@@ -2297,8 +2593,9 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
 
           messages.push({
             role: "user",
-            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi."
+            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi. Respecte strictement le formatage LaTeX pour les mathématiques."
           });
+          enrichment.toolCalls = [];
           keepRunning = true;
         } else {
           finalResponse = llmResponse.replyText || "Je n'ai pas pu générer une réponse.";
@@ -2335,7 +2632,8 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       degraded,
       visionEnabled: Boolean(images && images.length > 0),
       suggestions,
-      sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean)
+      sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean),
+      intent
     };
   } catch (error) {
     logger.error({ error: error.message }, "Erreur critique handleChat");
@@ -2348,7 +2646,8 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       modelTier,
       degraded: true,
       suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"],
-      sources: []
+      sources: [],
+      intent
     };
 
     try {
@@ -2436,6 +2735,7 @@ app.get("/api/health", async (req, res) => {
         database: dbOk ? "ok" : "erreur",
         supabase: Boolean(supabase),
         firebaseAuth: firebaseApp ? "admin_sdk" : "api_rest",
+        groq: Boolean(process.env.GROQ_API_KEY),
         version: CONFIG.VERSION,
         features: {
           vision: true,
@@ -2443,7 +2743,12 @@ app.get("/api/health", async (req, res) => {
           securityLogs: true,
           firebaseAdmin: Boolean(firebaseApp),
           sessionManagement: true,
-          ipBlocking: true
+          ipBlocking: true,
+          nlpIntent: true,
+          mathEngine: true,
+          rssAggregation: true,
+          webSearch: true,
+          scraping: true
         }
       }
     });
@@ -2776,6 +3081,11 @@ const server = app.listen(CONFIG.PORT, () => {
   console.log("🚀 Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " opérationnel sur le port " + CONFIG.PORT);
   console.log("🌐 Domaine: " + HOSTING_CONFIG.domain);
   console.log("🔐 Firebase Admin: " + (firebaseApp ? "activé" : "désactivé (mode API REST)"));
+  console.log("🧠 NLP Intent Engine: activé");
+  console.log("📐 MathJS Engine: activé");
+  console.log("📰 RSS Parser: activé");
+  console.log("🔍 Web Search (DuckDuckGo): activé");
+  console.log("📄 Scraping (Cheerio): activé");
 });
 
 // ==================== ARRÊT PROPRE ====================
