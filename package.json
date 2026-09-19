@@ -1,49 +1,41 @@
 {
-  "name": "milo-backend",
-  "version": "13.1.0",
-  "description": "Luba.ia — Cerveau IA HIKLON Technology (Production Grade)",
+  "name": "luba-ia-backend",
+  "version": "12.1.0",
+  "description": "Backend Node.js/Express de Luba (Luba.ia) — HIKLON Technology. Assistant IA façon Jarvis : chat multi-fournisseurs avec rotation de clés, mémoire conversationnelle persistante (Supabase), recherche web/images/actualités/sport/science, automatisation de tâches et d'emploi du temps, recherche et lecture de vidéos YouTube, WhatsApp via Baileys, email, sécurité et anti-fraude renforcées.",
   "main": "index.js",
+  "license": "UNLICENSED",
+  "private": true,
   "engines": {
-    "node": "20.x"
+    "node": ">=18.18.0 <21.0.0"
   },
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development node index.js",
-    "test": "jest --runInBand --detectOpenHandles",
-    "test:watch": "jest --watch",
-    "health": "node scripts/health-check.js",
-    "migrate": "node scripts/migrate.js"
-  },
-  "jest": {
-    "testEnvironment": "node",
-    "testMatch": ["**/tests/**/*.test.js"],
-    "verbose": true
+    "check": "node --check index.js"
   },
   "dependencies": {
+    "@groq/sdk": "^0.9.0",
     "@supabase/supabase-js": "^2.45.4",
     "@whiskeysockets/baileys": "^6.7.9",
     "axios": "^1.7.7",
-    "bullmq": "^5.21.2",
+    "bullmq": "^5.13.2",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "duck-duck-scrape": "^2.2.7",
-    "express": "^4.21.1",
+    "duck-duck-scrape": "^2.2.5",
+    "express": "^4.21.0",
     "express-rate-limit": "^7.4.1",
-    "firebase-admin": "^12.6.0",
-    "helmet": "^8.0.0",
+    "firebase-admin": "^12.5.0",
+    "helmet": "^7.1.0",
     "ioredis": "^5.4.1",
-    "mathjs": "^13.2.2",
+    "mathjs": "^13.1.1",
     "multer": "^1.4.5-lts.1",
-    "natural": "^8.0.1",
-    "nodemailer": "^6.9.16",
-    "pino": "^9.5.0",
-    "pino-pretty": "^13.0.0",
+    "natural": "^7.1.0",
+    "nodemailer": "^6.9.15",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.2",
     "qrcode": "^1.5.4",
     "rss-parser": "^3.13.0",
     "sqlite3": "^5.1.7"
-  },
-  "devDependencies": {
-    "jest": "^29.7.0"
   }
 }
