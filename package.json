@@ -1,14 +1,23 @@
 {
   "name": "milo-backend",
-  "version": "13.0.0",
-  "description": "Luba.ia — Cerveau IA HIKLON Technology (Jarvis Edition)",
+  "version": "13.1.0",
+  "description": "Luba.ia — Cerveau IA HIKLON Technology (Production Grade)",
   "main": "index.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": "20.x"
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js"
+    "dev": "NODE_ENV=development node index.js",
+    "test": "jest --runInBand --detectOpenHandles",
+    "test:watch": "jest --watch",
+    "health": "node scripts/health-check.js",
+    "migrate": "node scripts/migrate.js"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"],
+    "verbose": true
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
@@ -33,5 +42,8 @@
     "qrcode": "^1.5.4",
     "rss-parser": "^3.13.0",
     "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   }
 }
