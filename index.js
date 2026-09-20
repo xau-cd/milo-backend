@@ -2531,3 +2531,1571 @@ const LUBA_BASE_SYSTEM_PROMPT = [
   "- Tu ne dois JAMAIS inventer un score sportif, une actualité, un résultat de recherche, une donnée météo, une vidéo YouTube ou une tâche.",
   "- Utilise TOUJOURS l'outil approprié pour obtenir une donnée réelle.",
   "- Si un outil échoue, dis-le honnête
+  "",
+  "RÈGLE STRICTE SUR LES IMAGES :",
+  "- Dès que tu décris, présentes ou identifies une personnalité (personne réelle, sportif, artiste), un lieu ou un objet précis, utilise TOUJOURS search_images pour illustrer ta réponse avec une vraie photo.",
+  "",
+  "RÈGLE SUR L'AUTOMATISATION DE TÂCHES (MODULE JARVIS) :",
+  "- Si l'utilisateur demande de chercher/regarder/écouter un clip, une vidéo ou une chanson, utilise search_youtube et propose directement la vidéo trouvée (elle sera intégrée et lisible dans l'interface).",
+  "- Si l'utilisateur demande de créer un rappel, une tâche, ou de planifier quelque chose, utilise create_task avec un titre clair et, si mentionnée, une date/heure (due_at au format ISO 8601).",
+  "- Si l'utilisateur demande de voir ses tâches/son emploi du temps, utilise list_tasks.",
+  "- Si l'utilisateur dit qu'une tâche est terminée, utilise complete_task ; s'il veut la supprimer, utilise delete_task.",
+  "",
+  "RÈGLE SUR LES SUGGESTIONS :",
+  "- Le champ suggestions doit TOUJOURS contenir 3 à 4 questions de suivi.",
+  "",
+  "RÈGLE SUR LE CODE :",
+  "- Tu ne génères JAMAIS de code (Python, JavaScript, etc.) spontanément.",
+  "- Tu ne génères du code QUE si l'utilisateur le demande explicitement.",
+  "",
+  "RÈGLE SUR LES MATHÉMATIQUES :",
+  "- Pour tout calcul, utilise le résultat exact fourni par le moteur mathématique.",
+  "- Formate les équations en LaTeX ($...$ en ligne, $$...$$ en bloc).",
+  "",
+  "FORMAT DE RÉPONSE OBLIGATOIRE (JSON strict) :",
+  "{",
+  '  "replyText": "Ta réponse complète en Markdown, avec un titre en **gras** et des sous-titres bien séparés si besoin",',
+  '  "toolCalls": [],',
+  '  "suggestions": ["Question 1 ?", "Question 2 ?", "Question 3 ?"]',
+  "}",
+  "",
+  "OUTILS DISPONIBLES :",
+  "- search_images : Rechercher des images",
+  "- search_web : Recherche générale",
+  "- search_news : Actualités récentes",
+  "- search_sports_scores : Scores sportifs",
+  "- search_science : Articles scientifiques",
+  "- search_social : Discussions réseaux sociaux",
+  "- get_weather : Météo actuelle",
+  "- send_email : Envoyer un email",
+  "- send_whatsapp_message : Envoyer un message WhatsApp",
+  "- execute_math : Calcul mathématique exact",
+  "- search_youtube : Rechercher une vidéo YouTube (clip, chanson) à afficher/lire dans l'interface",
+  "- create_task : Créer une tâche/un rappel (title, notes optionnel, due_at optionnel en ISO 8601)",
+  "- list_tasks : Lister les tâches de l'utilisateur (status optionnel : pending/done)",
+  "- complete_task : Marquer une tâche comme terminée (task_id)",
+  "- delete_task : Supprimer une tâche (task_id)"
+].join("\n");
+
+// ==================== INITIALISATION EXPRESS ====================
+const app = express();
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+
+// ==================== CORS ====================
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || HOSTING_CONFIG.allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      logger.warn({ origin }, "Origine CORS refusée");
+      callback(new Error("Origine non autorisée"));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id", "X-Google-Access-Token", "X-Session-Token"],
+  credentials: true,
+  maxAge: 86400
+}));
+
+// ==================== SECURITY ====================
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://apis.google.com", "https://www.gstatic.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://fonts.googleapis.com"],
+      imgSrc: ["'self'", "data:", "blob:", "https://*", "http://*"],
+      connectSrc: ["'self'", "https://api.groq.com", "https://openrouter.ai", "https://*.firebaseio.com", "https://*.supabase.co", "wss://*.firebaseio.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+      objectSrc: ["'none'"],
+      frameSrc: ["https://*.firebaseapp.com", "https://*.web.app", "https://www.youtube.com", "https://youtube.com"],
+      workerSrc: ["'self'", "blob:"],
+      upgradeInsecureRequests: []
+    }
+  },
+  hsts: { maxAge: 63072000, includeSubDomains: true, preload: true },
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  noSniff: true,
+  frameguard: { action: "deny" }
+}));
+
+// Force HTTPS en production (Render termine le TLS en amont et fournit x-forwarded-proto).
+app.use((req, res, next) => {
+  if (CONFIG.ENV === "production" && req.headers["x-forwarded-proto"] && req.headers["x-forwarded-proto"] !== "https") {
+    return res.redirect(301, "https://" + req.headers.host + req.originalUrl);
+  }
+  next();
+});
+
+// ==================== BODY PARSERS ====================
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// ==================== RATE LIMITERS ====================
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ success: false, error: true, reply: "Trop de requêtes. Réessayez dans 15 minutes.", code: "RATE_LIMIT" });
+  }
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ success: false, error: true, reply: "Limite de requêtes atteinte.", code: "RATE_LIMIT_STRICT" });
+  }
+});
+
+// ==================== LOGGING MIDDLEWARE ====================
+app.use((req, res, next) => {
+  const requestId = generateRequestId();
+  const start = Date.now();
+  req.requestId = requestId;
+  res.on("finish", () => {
+    logger.info({ requestId, status: res.statusCode, duration: Date.now() - start }, "Réponse envoyée");
+  });
+  next();
+});
+
+// ==================== AUTHENTIFICATION ====================
+// IDENTIFIANT UNIQUE UNIFIÉ : req.userId = req.firebaseUid = uid Firebase, TOUJOURS la même valeur
+// pour un utilisateur web authentifié. C'est cet identifiant unique qui sert à la fois pour :
+// - la gestion des conversations/discussions (sessions.user_id / messages.user_id)
+// - la mémoire du modèle IA (contexte, historique)
+// - la gestion générale (quotas, rôles, sécurité, WhatsApp, tâches Jarvis)
+// Pour le canal WhatsApp (non authentifié via Firebase), l'identifiant est `whatsapp_<numéro>`,
+// un espace d'identité séparé et assumé (utilisateur non connecté à un compte Luba).
+const authenticateUser = async (req, res, next) => {
+  try {
+    const isBlocked = await isIPBlocked(req.ip);
+    if (isBlocked) {
+      return res.status(403).json({ success: false, error: true, reply: "Accès refusé. IP bloquée.", code: "IP_BLOCKED" });
+    }
+    
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    const bearerToken = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+    
+    if (!bearerToken) {
+      await recordLoginAttempt(req.ip, null, false, "Token manquant");
+      return res.status(401).json({ success: false, error: true, reply: "Authentification requise.", code: "MISSING_TOKEN" });
+    }
+    
+    try {
+      const user = await verifyFirebaseToken(bearerToken);
+      if (!user) {
+        await recordLoginAttempt(req.ip, null, false, "Token invalide");
+        return res.status(401).json({ success: false, error: true, reply: "Session invalide.", code: "INVALID_TOKEN" });
+      }
+      
+      // Identifiant unique unifié : une seule variable "uid" utilisée partout dans la requête.
+      const uid = user.uid;
+      req.uid = uid;
+      req.userId = uid;
+      req.firebaseUid = uid;
+      req.verifiedIdentity = true;
+      req.userRole = user.role || 'FREE';
+      req.emailVerified = user.emailVerified;
+      
+      await recordLoginAttempt(req.ip, uid, true);
+      await logSecurityEvent(uid, 'LOGIN_SUCCESS', { email: user.email }, req.ip, req.headers['user-agent']);
+      await detectAndLogNewDevice(uid, req.ip, req.headers['user-agent']);
+      
+      // Synchronisation utilisateur - SAUVEGARDE UID (id = firebase_uid = uid partout)
+      const userRow = await dbGet("SELECT * FROM users WHERE id = ?", [uid]);
+      if (!userRow) {
+        await dbRun(
+          "INSERT INTO users (id, firebase_uid, email, display_name, role, email_verified, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+          [uid, uid, user.email, user.displayName || uid, req.userRole, user.emailVerified ? 1 : 0]
+        );
+        logger.info({ userId: uid }, "✅ Nouvel utilisateur créé avec UID unifié");
+      } else {
+        await dbRun(
+          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, email = COALESCE(?, email), display_name = COALESCE(?, display_name), role = ?, email_verified = ?, firebase_uid = ? WHERE id = ?",
+          [user.email, user.displayName, req.userRole, user.emailVerified ? 1 : 0, uid, uid]
+        );
+        logger.info({ userId: uid }, "✅ Utilisateur synchronisé avec UID unifié");
+      }
+      
+      if (supabase) {
+        await syncUserWithSupabase(uid, user.email, user.displayName);
+      }
+      
+      next();
+    } catch (error) {
+      await recordLoginAttempt(req.ip, null, false, error.message);
+      const loginCheck = await checkLoginAttempts(req.ip);
+      return res.status(401).json({
+        success: false,
+        error: true,
+        reply: loginCheck.blocked ? loginCheck.message : "Session invalide.",
+        code: loginCheck.blocked ? "IP_BLOCKED" : "INVALID_TOKEN"
+      });
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur authentification");
+    return res.status(500).json({ success: false, error: true, reply: "Erreur interne.", code: "AUTH_INTERNAL_ERROR" });
+  }
+};
+
+const requireRole = (allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.userRole || (!allowedRoles.includes(req.userRole) && req.userRole !== 'ADMIN')) {
+      return res.status(403).json({ success: false, error: true, reply: "Accès refusé.", code: "INSUFFICIENT_ROLE" });
+    }
+    next();
+  };
+};
+
+// ==================== SYNCHRONISATION SUPABASE ====================
+async function syncUserWithSupabase(firebaseUid, email, displayName) {
+  if (!supabase || !firebaseUid) return;
+  try {
+    const { data: existingUser, error: fetchError } = await supabase.from("users").select("firebase_uid").eq("firebase_uid", firebaseUid).single();
+    if (fetchError && fetchError.code !== "PGRST116") return;
+    if (!existingUser) {
+      await supabase.from("users").insert({ 
+        id: firebaseUid,
+        firebase_uid: firebaseUid, 
+        email, 
+        display_name: displayName, 
+        last_seen_at: new Date().toISOString() 
+      });
+      logger.info({ firebaseUid }, "✅ Utilisateur créé dans Supabase");
+    } else {
+      await supabase.from("users").update({ 
+        last_seen_at: new Date().toISOString(),
+        email: email || existingUser.email,
+        display_name: displayName || existingUser.display_name
+      }).eq("firebase_uid", firebaseUid);
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur sync Supabase");
+  }
+}
+
+async function syncSessionWithSupabase(sessionId, firebaseUid, userId) {
+  if (!supabase) return;
+  try {
+    const { data: existingSession, error: fetchError } = await supabase.from("sessions").select("session_id").eq("session_id", sessionId).single();
+    if (fetchError && fetchError.code !== "PGRST116") return;
+    if (!existingSession) {
+      await supabase.from("sessions").insert({ 
+        session_id: sessionId, 
+        firebase_uid: firebaseUid || userId, 
+        user_id: userId, 
+        created_at: new Date().toISOString(), 
+        updated_at: new Date().toISOString() 
+      });
+    } else {
+      await supabase.from("sessions").update({ 
+        updated_at: new Date().toISOString(),
+        user_id: userId,
+        firebase_uid: firebaseUid || userId
+      }).eq("session_id", sessionId);
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur sync session Supabase");
+  }
+}
+
+// ==================== GESTION DES SESSIONS ====================
+// Supabase est consulté EN PREMIER (source de vérité persistante) pour retrouver une conversation
+// existante ; SQLite sert de cache local et de repli si Supabase est indisponible.
+async function getSession(conversationId, userId, firebaseUid = null) {
+  if (supabase) {
+    try {
+      const { data: supabaseSession, error } = await supabase.from("sessions").select("session_id, user_id, firebase_uid").eq("session_id", conversationId).single();
+      if (supabaseSession && !error) {
+        await dbRun("INSERT OR IGNORE INTO sessions (session_id, user_id, firebase_uid) VALUES (?, ?, ?)", [conversationId, supabaseSession.user_id || userId, supabaseSession.firebase_uid || firebaseUid]);
+        await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
+        await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
+        return { session_id: conversationId, user_id: supabaseSession.user_id || userId, firebase_uid: supabaseSession.firebase_uid || firebaseUid };
+      }
+    } catch (error) {
+      logger.error({ error: error.message }, "Erreur Supabase getSession, repli sur SQLite");
+    }
+  }
+
+  const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
+  if (session) {
+    await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
+    await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
+    return session;
+  }
+
+  await dbRun("INSERT INTO sessions (session_id, user_id, firebase_uid) VALUES (?, ?, ?)", [conversationId, userId, firebaseUid]);
+  await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
+  return { session_id: conversationId, user_id: userId, firebase_uid: firebaseUid };
+}
+
+// Utiliser getFullHistory au lieu de getHistory
+async function getHistory(conversationId, userId = null, limit = CONFIG.MAX_CONTEXT_MESSAGES) {
+  return await getFullHistory(conversationId, userId, limit);
+}
+
+// Utiliser saveMessageWithUser au lieu de saveMessage
+async function saveMessage(conversationId, role, content, userId = null, firebaseUid = null) {
+  return await saveMessageWithUser(conversationId, role, content, userId, firebaseUid);
+}
+
+// ==================== GESTION DES INTENTIONS ====================
+async function setActiveIntent(conversationId, intentType, intentData = {}) {
+  await dbRun("UPDATE sessions SET active_intent = ?, intent_data = ? WHERE session_id = ?", [intentType, JSON.stringify(intentData), conversationId]);
+}
+
+async function getActiveIntent(conversationId) {
+  const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [conversationId]);
+  if (!row || !row.active_intent) return null;
+  try {
+    return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function clearActiveIntent(conversationId) {
+  await dbRun("UPDATE sessions SET active_intent = NULL, intent_data = NULL WHERE session_id = ?", [conversationId]);
+}
+
+async function assertConversationOwnership(conversationId, userId) {
+  const existing = await dbGet("SELECT user_id, firebase_uid FROM sessions WHERE session_id = ?", [conversationId]);
+  if (existing && existing.user_id && existing.user_id !== userId && existing.firebase_uid !== userId) {
+    const err = new Error("Cette conversation n'appartient pas à cet utilisateur.");
+    err.code = "CONVERSATION_OWNERSHIP";
+    throw err;
+  }
+}
+
+// ==================== CALL LLM ====================
+async function callLLM_v100(messages, images = null, sessionId = null, userId = null, conversationContext = "") {
+  const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
+  const userText = typeof lastUserMessage?.content === "string" ? lastUserMessage.content : "";
+  const dynamicSystemPrompt = dynamicContextManager.buildSystemPrompt(userText, LUBA_BASE_SYSTEM_PROMPT, conversationContext);
+
+  const result = await executeWithRetryAndFallback(
+    MODEL_TIERS.v100.providers,
+    { messages: [dynamicSystemPrompt, ...messages], images },
+    { maxRetriesPerProvider: CONFIG.MAX_RETRY_ATTEMPTS, sessionId, userId, tier: "v100" }
+  );
+
+  if (result.success) {
+    return { ...result.response, providerUsed: result.providerUsed, modelUsed: result.modelUsed, degraded: result.providerPriority > 0 };
+  }
+
+  throw new Error("Échec complet du tier v100");
+}
+
+async function callLLM_v250(messages, userMessage, images = null, sessionId = null, userId = null, conversationContext = "") {
+  const tier = MODEL_TIERS.v250;
+  const providerChain = [];
+  const dynamicSystemPrompt = dynamicContextManager.buildSystemPrompt(userMessage, LUBA_BASE_SYSTEM_PROMPT, conversationContext);
+
+  const reasoningMessages = [
+    { role: "system", content: dynamicSystemPrompt.content + "\n\nAnalyse ce problème complexe en profondeur." },
+    ...messages
+  ];
+
+  const reasoningResult = await executeWithRetryAndFallback(
+    tier.reasoning.providers,
+    { messages: reasoningMessages, images },
+    { maxRetriesPerProvider: tier.maxRetries, sessionId, userId, tier: "v250_reasoning" }
+  );
+
+  if (!reasoningResult.success || !reasoningResult.response || reasoningResult.response.trim().length < 40) {
+    return await degradedFallbackToV100(messages, "reasoning_failed", images, conversationContext);
+  }
+
+  const reasoningAnalysis = reasoningResult.response;
+  providerChain.push("R1:" + reasoningResult.providerUsed + "/" + reasoningResult.modelUsed);
+
+  const formattingDirective = [
+    "Tu DOIS répondre au format JSON strict :",
+    "{",
+    '  "replyText": "réponse complète en Markdown",',
+    '  "toolCalls": [],',
+    '  "suggestions": ["question 1 ?", "question 2 ?", "question 3 ?"]',
+    "}",
+    "",
+    "FORMATAGE STRICT :",
+    "- Code HTML dans un bloc ```html ... ```",
+    "- Code CSS dans un bloc ```css ... ``` avec UNIQUEMENT des commentaires /* ... */",
+    "- Code JavaScript dans un bloc ```javascript ... ```",
+    "- Code complet, jamais tronqué",
+    "- Formules mathématiques en LaTeX ($...$ en ligne, $$...$$ en bloc)"
+  ].join("\n");
+
+  const codeMessages = [
+    { role: "system", content: "Génère le code de production complet basé sur le plan ci-dessous.\n\nPLAN :\n" + reasoningAnalysis + "\n\n" + formattingDirective },
+    { role: "user", content: userMessage }
+  ];
+
+  const codeResult = await executeWithRetryAndFallback(
+    tier.code.providers,
+    { messages: codeMessages, images },
+    { maxRetriesPerProvider: tier.maxRetries, sessionId, userId, tier: "v250_code" }
+  );
+
+  if (!codeResult.success || !codeResult.response) {
+    return await degradedFallbackToV100(messages, "code_generation_failed", images, conversationContext);
+  }
+
+  providerChain.push("R2:" + codeResult.providerUsed + "/" + codeResult.modelUsed);
+
+  return {
+    ...codeResult.response,
+    providerUsed: "pipeline_v250",
+    modelUsed: providerChain.join(" -> "),
+    degraded: false,
+    providerChain,
+    reasoningProviderUsed: reasoningResult.providerUsed
+  };
+}
+
+async function callVisionModel(messages, images, sessionId = null, userId = null, conversationContext = "") {
+  const result = await executeWithRetryAndFallback(
+    MODEL_TIERS.vision.providers,
+    { messages, images },
+    { maxRetriesPerProvider: 2, sessionId, userId, tier: "vision" }
+  );
+
+  if (result.success) {
+    return { ...result.response, providerUsed: result.providerUsed, modelUsed: result.modelUsed, visionEnabled: true };
+  }
+
+  return await callLLM_v100(messages, null, sessionId, userId, conversationContext);
+}
+
+async function degradedFallbackToV100(messages, reason, images = null, conversationContext = "") {
+  try {
+    const fallbackResult = await callLLM_v100(messages, images, null, null, conversationContext);
+    return {
+      ...fallbackResult,
+      providerUsed: "v250_degraded_to_v100",
+      modelUsed: fallbackResult.providerUsed + "/" + fallbackResult.modelUsed,
+      degraded: true,
+      degradationReason: reason,
+      originalTier: "v250",
+      actualTier: "v100"
+    };
+  } catch (fallbackError) {
+    return {
+      replyText: "Je rencontre actuellement des difficultés techniques. Veuillez réessayer.",
+      toolCalls: [],
+      suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"],
+      providerUsed: "error_graceful_degradation",
+      modelUsed: "none",
+      degraded: true,
+      error: true
+    };
+  }
+}
+
+// ==================== DISPATCHER D'OUTILS ====================
+async function executeTool(toolName, args = {}, context = {}) {
+  const { userId, googleAccessToken } = context;
+  let result;
+  let sourceKeys = [];
+
+  switch (toolName) {
+    case "search_images":
+    case "search_image":
+      result = await searchImagesWithFallback(args.query);
+      if (result.images?.length > 0) sourceKeys.push("wikimediacommons");
+      break;
+    case "search_web":
+      result = await searchWeb(args.query);
+      sourceKeys = result.sourcesUsed || [];
+      break;
+    case "search_news":
+      result = await searchNews(args.query);
+      if (result.articles?.length > 0) sourceKeys.push("googlenews");
+      break;
+    case "search_sports_scores":
+      result = await searchSportsScores(args.query || args.team);
+      if (result.events?.length > 0) sourceKeys.push("thesportsdb");
+      break;
+    case "search_science":
+      result = await searchScience(args.query);
+      if (result.papers?.length > 0) sourceKeys.push("arxiv");
+      break;
+    case "search_social":
+      result = await searchSocial(args.query);
+      if (result.posts?.length > 0) sourceKeys.push("reddit");
+      break;
+    case "get_weather":
+      result = await getWeather(args.location || args.query);
+      if (!result.error) sourceKeys.push("openmeteo");
+      break;
+    case "execute_math":
+    case "calculate":
+      result = executeMathExpression(args.expression || args.query);
+      break;
+    case "send_email":
+      result = await dispatchSendEmail({
+        googleAccessToken,
+        recipient: args.recipient || args.to,
+        subject: args.subject,
+        body: args.body,
+        userId
+      });
+      break;
+    case "send_whatsapp_message":
+    case "send_whatsapp":
+      result = await sendWhatsAppSmart(userId, args.phone_number || args.to, args.message);
+      break;
+    case "search_youtube":
+      result = await searchYouTube(args.query);
+      if (result.videos?.length > 0) sourceKeys.push("youtube");
+      break;
+    case "create_task":
+      result = await createTask(userId, { title: args.title, notes: args.notes, dueAt: args.due_at || args.dueAt });
+      break;
+    case "list_tasks":
+      result = await listTasks(userId, { status: args.status || null });
+      break;
+    case "complete_task":
+      result = await updateTaskStatus(userId, args.task_id || args.taskId, "done");
+      break;
+    case "delete_task":
+      result = await deleteTask(userId, args.task_id || args.taskId);
+      break;
+    default:
+      result = { success: false, error: "Outil inconnu : " + toolName };
+  }
+
+  return { result, sourceKeys };
+}
+
+// ==================== ENRICHISSEMENT DE CONTEXTE ====================
+async function enrichContextWithIntent(intent, userMessage) {
+  const enrichment = {
+    contextData: "",
+    toolCalls: [],
+    sourceKeys: [],
+    media: { images: [], videos: [] }
+  };
+
+  switch (intent) {
+    case "MATHS": {
+      const expressions = detectMathExpressions(userMessage);
+      if (expressions.length > 0) {
+        for (const expr of expressions.slice(0, 3)) {
+          const mathResult = executeMathExpression(expr);
+          if (mathResult.success) {
+            enrichment.contextData += `\n[Calcul exact] ${expr} = ${mathResult.formatted}\n`;
+          }
+        }
+        enrichment.toolCalls.push({ name: "execute_math", arguments: { expression: expressions[0] } });
+      }
+      break;
+    }
+    case "ACTUALITÉ": {
+      const newsResult = await searchNews(userMessage);
+      if (newsResult.articles && newsResult.articles.length > 0) {
+        enrichment.contextData += "\n[ACTUALITÉS RÉCENTES]\n";
+        newsResult.articles.slice(0, 5).forEach((a, i) => {
+          enrichment.contextData += `${i + 1}. ${a.title} (${a.pubDate})\n   ${a.link}\n   ${a.description ? a.description.slice(0, 200) : ""}\n\n`;
+        });
+        enrichment.sourceKeys.push("googlenews");
+        enrichment.toolCalls.push({ name: "search_news", arguments: { query: userMessage } });
+      }
+      break;
+    }
+    case "SPORT": {
+      const sportResult = await searchSportsScores(userMessage);
+      if (sportResult.events && sportResult.events.length > 0) {
+        enrichment.contextData += `\n[RÉSULTATS SPORTIFS - ${sportResult.team || ""}]\n`;
+        sportResult.events.forEach((e) => {
+          enrichment.contextData += `${e.match} (${e.date}) - ${e.league}\n`;
+        });
+        enrichment.sourceKeys.push("thesportsdb");
+        enrichment.toolCalls.push({ name: "search_sports_scores", arguments: { query: userMessage } });
+      }
+      break;
+    }
+    case "CODE": {
+      enrichment.contextData += "\n[MODE CODE ACTIVÉ]\nL'utilisateur demande explicitement du code. Fournis une réponse complète avec des blocs de code Markdown.";
+      break;
+    }
+    case "PERSONNE": {
+      // Déclenche systématiquement une recherche d'image quand l'utilisateur mentionne/interroge
+      // une personnalité, pour corriger le bug d'images qui ne s'affichaient pas toujours.
+      const imgResult = await searchImagesWithFallback(userMessage);
+      if (imgResult.images && imgResult.images.length > 0) {
+        enrichment.media.images = imgResult.images.slice(0, 3);
+        enrichment.contextData += `\n[IMAGE TROUVÉE - à mentionner mais NE PAS citer l'URL brute, l'image sera déjà affichée dans l'interface]\n`;
+        enrichment.sourceKeys.push("wikimediacommons");
+        enrichment.toolCalls.push({ name: "search_images", arguments: { query: userMessage } });
+      }
+      break;
+    }
+    case "VIDEO": {
+      const videoResult = await searchYouTube(userMessage);
+      if (videoResult.videos && videoResult.videos.length > 0) {
+        enrichment.media.videos = videoResult.videos.slice(0, 3);
+        enrichment.contextData += `\n[VIDÉOS YOUTUBE TROUVÉES]\n` + videoResult.videos.slice(0, 3).map((v) => `- ${v.title} (${v.url})`).join("\n") + `\n`;
+        enrichment.sourceKeys.push("youtube");
+        enrichment.toolCalls.push({ name: "search_youtube", arguments: { query: userMessage } });
+      }
+      break;
+    }
+    case "TASK": {
+      enrichment.contextData += "\n[MODULE JARVIS - TÂCHES] L'utilisateur veut gérer une tâche/un rappel/son emploi du temps. Utilise create_task, list_tasks, complete_task ou delete_task selon la demande.";
+      break;
+    }
+  }
+
+  return enrichment;
+}
+
+// ==================== HANDLE CHAT - AVEC MÉMOIRE CONVERSATIONNELLE ====================
+async function handleChat({ conversationId, userId, firebaseUid, message, googleAccessToken = null, channel = "web", modelTier = "v100", images = null }) {
+  await getSession(conversationId, userId, firebaseUid);
+
+  const activeIntent = await getActiveIntent(conversationId);
+  if (activeIntent) {
+    return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken, firebaseUid });
+  }
+
+  // Sauvegarder le message utilisateur avec l'identifiant unifié
+  await saveMessageWithUser(conversationId, "user", message, userId, firebaseUid);
+
+  // Récupérer l'historique complet avec le contexte (Supabase en priorité, cf. getFullHistory)
+  const history = await getFullHistory(conversationId, userId);
+
+  // Mémoire long terme : suit l'utilisateur au-delà de cette seule conversation, même des mois
+  // plus tard dans un tout nouveau fil de discussion (reconnaissance utilisateur persistante).
+  const longTermMemory = await getUserMemory(userId);
+  
+  // Construire le contexte de conversation pour le LLM
+  let conversationContext = "";
+  if (longTermMemory) {
+    conversationContext += `[MÉMOIRE LONG TERME SUR CET UTILISATEUR - à utiliser naturellement, ne jamais la citer telle quelle]\n${longTermMemory}\n\n`;
+  }
+  if (history.length > 0) {
+    const recentHistory = history.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
+    conversationContext += recentHistory.map(msg => 
+      `${msg.role === "user" ? "Utilisateur" : "Assistant"}: ${msg.content.slice(0, 500)}`
+    ).join("\n");
+  }
+  
+  // Phase 1 : Analyse d'intention
+  const intent = analyzeIntent(message);
+  logger.info({ intent, conversationId, historyLength: history.length }, "Intention détectée");
+  
+  // Phase 2 : Enrichissement de contexte (inclut désormais média : images/vidéos, cf. module Jarvis)
+  const enrichment = await enrichContextWithIntent(intent, message);
+  
+  // Construire les messages pour le LLM avec l'historique complet
+  // Note : l'historique inclut déjà le message utilisateur courant (on vient de le sauvegarder),
+  // donc on retire le tout dernier tour "user" de l'historique pour éviter de le dupliquer.
+  const historyWithoutCurrent = history.length > 0 && history[history.length - 1].role === "user"
+    ? history.slice(0, -1)
+    : history;
+  const contextHistory = historyWithoutCurrent.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
+  let messages = [...contextHistory, { role: "user", content: message }];
+  
+  // Injection du contexte enrichi si disponible
+  if (enrichment.contextData) {
+    messages = [...contextHistory, { 
+      role: "user", 
+      content: message + "\n\n[CONTEXTE ENRICHISSÉ - NE PAS CITER CES SOURCES DANS TA RÉPONSE]\n" + enrichment.contextData 
+    }];
+  }
+
+  let finalResponse = null;
+  let imageUrls = [];
+  let videoResults = enrichment.media.videos.length > 0 ? [...enrichment.media.videos] : [];
+  if (enrichment.media.images.length > 0) {
+    imageUrls = enrichment.media.images.map((img) => img.url);
+  }
+  let providerUsed = "unknown";
+  let suggestions = [];
+  const usedSources = new Set(enrichment.sourceKeys);
+  let degraded = false;
+
+  try {
+    if (images && images.length > 0) {
+      const visionResult = await callVisionModel(messages, images, conversationId, userId, conversationContext);
+      finalResponse = visionResult.replyText || "Je n'ai pas pu analyser l'image.";
+      suggestions = Array.isArray(visionResult.suggestions) ? visionResult.suggestions.slice(0, 4) : [];
+      providerUsed = visionResult.providerUsed || "vision";
+    } else if (modelTier === "v250") {
+      const result = await callLLM_v250(messages, message, null, conversationId, userId, conversationContext);
+      finalResponse = result.replyText || "Je n'ai pas pu générer une réponse.";
+      suggestions = Array.isArray(result.suggestions) ? result.suggestions.slice(0, 4) : [];
+      providerUsed = result.providerUsed || "pipeline_v250";
+      degraded = result.degraded || false;
+    } else {
+      let keepRunning = true;
+      let maxLoops = 8;
+
+      while (keepRunning && maxLoops > 0) {
+        maxLoops--;
+        let llmResponse;
+        try {
+          llmResponse = await callLLM_v100(messages, null, conversationId, userId, conversationContext);
+          providerUsed = llmResponse.providerUsed;
+          degraded = llmResponse.degraded || false;
+        } catch (error) {
+          finalResponse = "Je suis momentanément indisponible. Veuillez réessayer.";
+          suggestions = ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"];
+          providerUsed = "error_graceful_degradation";
+          degraded = true;
+          break;
+        }
+
+        const allToolCalls = [...(llmResponse.toolCalls || []), ...enrichment.toolCalls];
+        
+        if (allToolCalls.length > 0) {
+          for (const toolCall of allToolCalls) {
+            let toolResult;
+            try {
+              const { result, sourceKeys } = await executeTool(toolCall.name, toolCall.arguments || {}, { userId, googleAccessToken });
+              toolResult = result;
+              sourceKeys.forEach((k) => usedSources.add(k));
+              if ((toolCall.name === "search_images" || toolCall.name === "search_image") && toolResult.images) {
+                imageUrls = imageUrls.concat(toolResult.images.map((img) => img.url));
+              }
+              if (toolCall.name === "search_youtube" && toolResult.videos) {
+                videoResults = videoResults.concat(toolResult.videos);
+              }
+            } catch (toolError) {
+              toolResult = { success: false, error: toolError.message };
+            }
+
+            messages.push({ role: "assistant", content: "Résultat de l'outil " + toolCall.name + " : " + JSON.stringify(toolResult) });
+          }
+
+          messages.push({
+            role: "user",
+            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi. Respecte strictement le formatage (titre en gras, sous-titres, listes) et le LaTeX pour les mathématiques. Utilise le contexte de la conversation pour répondre. Ne redécris pas les images/vidéos en détail, elles seront affichées séparément dans l'interface."
+          });
+          enrichment.toolCalls = [];
+          keepRunning = true;
+        } else {
+          finalResponse = llmResponse.replyText || "Je n'ai pas pu générer une réponse.";
+          suggestions = Array.isArray(llmResponse.suggestions) ? llmResponse.suggestions.slice(0, 4) : [];
+          keepRunning = false;
+        }
+      }
+
+      if (!finalResponse) finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
+    }
+
+    // Dédoublonnage des images
+    imageUrls = [...new Set(imageUrls.filter(Boolean))];
+    // Dédoublonnage des vidéos par videoId
+    const seenVideoIds = new Set();
+    videoResults = videoResults.filter((v) => {
+      if (!v?.videoId || seenVideoIds.has(v.videoId)) return false;
+      seenVideoIds.add(v.videoId);
+      return true;
+    });
+
+    if (imageUrls.length > 0) {
+      const imageMarkdown = imageUrls.map((url, index) => "![Image " + (index + 1) + "](" + url + ")").join("\n\n");
+      finalResponse += "\n\n---\n\n**Illustrations :**\n\n" + imageMarkdown;
+      usedSources.add("wikimediacommons");
+    }
+
+    if (usedSources.size > 0) {
+      const sourceLines = Array.from(usedSources)
+        .map((key) => OPEN_SOURCES[key])
+        .filter(Boolean)
+        .map((src) => "[" + src.name + "](" + src.url + ")");
+      if (sourceLines.length > 0) finalResponse += "\n\n---\n\n**Sources :** " + sourceLines.join(" · ");
+    }
+
+    // Sauvegarder la réponse de l'assistant avec l'identifiant unifié
+    await saveMessageWithUser(conversationId, "assistant", finalResponse, userId, firebaseUid, { providerUsed, intent });
+
+    // Mise à jour périodique (tous les N messages) de la mémoire long terme cross-conversations.
+    // Ne bloque pas la réponse à l'utilisateur : lancée en tâche de fond.
+    maybeUpdateUserMemory(userId, message, finalResponse).catch((error) => {
+      logger.error({ error: error.message }, "Erreur tâche de fond mémoire long terme");
+    });
+
+    return {
+      reply: finalResponse,
+      images: imageUrls,
+      // "media" : structure dédiée pour que le frontend affiche des cartes riches (lecteur vidéo
+      // YouTube intégré cliquable, cartes image) plutôt que du simple Markdown à parser.
+      media: {
+        images: imageUrls,
+        videos: videoResults.map((v) => ({
+          videoId: v.videoId,
+          title: v.title,
+          channel: v.channel,
+          thumbnail: v.thumbnail,
+          url: v.url,
+          embedUrl: `https://www.youtube.com/embed/${v.videoId}`
+        }))
+      },
+      error: providerUsed.startsWith("error"),
+      providerUsed,
+      modelTier,
+      degraded,
+      visionEnabled: Boolean(images && images.length > 0),
+      suggestions,
+      sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean),
+      intent,
+      userId,
+      contextLength: history.length
+    };
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur critique handleChat");
+
+    const fallbackResponse = {
+      reply: "Je suis momentanément indisponible. Nos équipes techniques travaillent à résoudre le problème.",
+      images: [],
+      media: { images: [], videos: [] },
+      error: true,
+      providerUsed: "error_critical",
+      modelTier,
+      degraded: true,
+      suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"],
+      sources: [],
+      intent,
+      userId
+    };
+
+    try {
+      await saveMessageWithUser(conversationId, "assistant", fallbackResponse.reply, userId, firebaseUid);
+    } catch (saveError) {
+      logger.error({ error: saveError.message }, "Erreur sauvegarde message de secours");
+    }
+
+    return fallbackResponse;
+  }
+}
+
+// ==================== GESTION DES INTENTIONS ====================
+async function handleActiveIntent(conversationId, activeIntent, userMessage, context = {}) {
+  const { userId, googleAccessToken } = context;
+
+  switch (activeIntent.type) {
+    case "WHATSAPP": {
+      const data = activeIntent.data;
+      if (data.step === "NEED_NUMBER") {
+        const phoneRegex = /^(\+?\d{1,3}[-.\s]?)?\d{9,15}$/;
+        if (phoneRegex.test(userMessage.trim())) {
+          await setActiveIntent(conversationId, "WHATSAPP", { step: "NEED_MESSAGE", recipient: userMessage.trim() });
+          return { reply: "Numéro enregistré. Quel message voulez-vous envoyer à " + userMessage.trim() + " ?", error: false };
+        }
+        return { reply: "Numéro invalide.", error: true };
+      }
+      if (data.step === "NEED_MESSAGE") {
+        try {
+          await sendWhatsAppSmart(userId, data.recipient, userMessage);
+          await clearActiveIntent(conversationId);
+          return { reply: "Message WhatsApp mis en file d'envoi vers " + data.recipient + " !", error: false };
+        } catch (error) {
+          return { reply: "Erreur d'envoi : " + error.message, error: true };
+        }
+      }
+      break;
+    }
+    case "EMAIL": {
+      const data = activeIntent.data;
+      if (data.step === "NEED_RECIPIENT") {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (emailRegex.test(userMessage.trim())) {
+          await setActiveIntent(conversationId, "EMAIL", { step: "NEED_SUBJECT", recipient: userMessage.trim() });
+          return { reply: "Destinataire enregistré. Quel est le sujet de l'email ?", error: false };
+        }
+        return { reply: "Adresse email invalide.", error: true };
+      }
+      if (data.step === "NEED_SUBJECT") {
+        await setActiveIntent(conversationId, "EMAIL", { step: "NEED_BODY", recipient: data.recipient, subject: userMessage });
+        return { reply: "Sujet enregistré. Quel est le contenu de l'email ?", error: false };
+      }
+      if (data.step === "NEED_BODY") {
+        const result = await dispatchSendEmail({ googleAccessToken, recipient: data.recipient, subject: data.subject, body: userMessage, userId });
+        await clearActiveIntent(conversationId);
+        if (result.success) return { reply: "Email envoyé à " + data.recipient + " (via " + result.provider + ") !", error: false };
+        return { reply: "Erreur : " + result.error, error: true };
+      }
+      break;
+    }
+  }
+
+  await clearActiveIntent(conversationId);
+  return { reply: "Je ne comprends plus l'action. Recommençons.", error: true };
+}
+
+// ==================== ROUTES ====================
+app.get("/", (req, res) => {
+  res.json({ success: true, error: false, reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel", version: CONFIG.VERSION, company: CONFIG.COMPANY });
+});
+
+app.get("/api/health", async (req, res) => {
+  try {
+    let dbOk = true;
+    try { await dbGet("SELECT 1"); } catch (e) { dbOk = false; }
+
+    res.json({
+      success: !dbOk,
+      error: !dbOk,
+      reply: "Serveur " + CONFIG.AGENT_NAME + " en bonne santé",
+      data: {
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
+        database: dbOk ? "ok" : "erreur",
+        supabase: Boolean(supabase),
+        firebaseAuth: firebaseApp ? "admin_sdk" : "api_rest",
+        groq: Boolean(process.env.GROQ_API_KEY),
+        version: CONFIG.VERSION,
+        features: {
+          vision: true,
+          quotas: true,
+          securityLogs: true,
+          firebaseAdmin: Boolean(firebaseApp),
+          sessionManagement: true,
+          ipBlocking: true,
+          nlpIntent: true,
+          mathEngine: true,
+          rssAggregation: true,
+          webSearch: true,
+          scraping: true,
+          conversationMemory: true,
+          uidSync: true,
+          jarvisTasks: true,
+          jarvisYoutube: true,
+          persistentStoreIsSupabase: Boolean(supabase)
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: true, reply: "Erreur interne" });
+  }
+});
+
+// Route explicite pour que le frontend récupère l'identifiant unique canonique de l'utilisateur
+// (à utiliser pour TOUT : discussions, mémoire, tâches). Évite toute ambiguïté côté frontend.
+app.get("/api/user/whoami", authenticateUser, (req, res) => {
+  return res.status(200).json({ success: true, error: false, userId: req.userId, role: req.userRole });
+});
+
+// ==================== RESTAURATION COMPLÈTE À LA CONNEXION ====================
+// Un seul appel au moment où l'utilisateur se connecte : renvoie tout ce dont le frontend a
+// besoin pour reconstruire l'état complet (conversations récentes, tâches en attente, quotas,
+// statut WhatsApp) sans multiplier les allers-retours et sans jamais perdre l'historique.
+app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const today = new Date().toISOString().split("T")[0];
+
+    let conversations = [];
+    if (supabase) {
+      try {
+        const { data: supaSessions, error } = await supabase
+          .from("sessions")
+          .select("session_id, created_at, updated_at")
+          .eq("user_id", userId)
+          .order("updated_at", { ascending: false })
+          .limit(50);
+        if (!error && supaSessions) {
+          conversations = await Promise.all(supaSessions.map(async (conv) => {
+            const { data: lastMsgRows } = await supabase
+              .from("messages")
+              .select("role, content")
+              .eq("session_id", conv.session_id)
+              .order("created_at", { ascending: false })
+              .limit(1);
+            const lastMessage = lastMsgRows?.[0] || null;
+            return {
+              conversationId: conv.session_id,
+              createdAt: conv.created_at,
+              updatedAt: conv.updated_at,
+              lastMessageRole: lastMessage?.role || null,
+              lastMessagePreview: lastMessage?.content ? lastMessage.content.slice(0, 140) : null
+            };
+          }));
+        }
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur bootstrap conversations Supabase, repli SQLite");
+      }
+    }
+    if (conversations.length === 0) {
+      const rows = await dbAll("SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50", [userId]);
+      conversations = await Promise.all(rows.map(async (conv) => {
+        const lastMessage = await dbGet("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", [conv.session_id]);
+        return {
+          conversationId: conv.session_id,
+          createdAt: conv.created_at,
+          updatedAt: conv.updated_at,
+          lastMessageRole: lastMessage?.role || null,
+          lastMessagePreview: lastMessage?.content ? lastMessage.content.slice(0, 140) : null
+        };
+      }));
+    }
+
+    const quotaRow = await dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [userId, today]);
+    const tasksResult = await listTasks(userId, { status: "pending" });
+    const userRow = await dbGet("SELECT whatsapp_connected FROM users WHERE id = ?", [userId]);
+
+    return res.status(200).json({
+      success: true,
+      error: false,
+      userId,
+      role: req.userRole,
+      conversations,
+      pendingTasks: tasksResult.tasks,
+      quotas: quotaRow || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 },
+      limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE,
+      whatsappConnected: Boolean(userRow?.whatsapp_connected)
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur bootstrap session");
+    return res.status(500).json({ success: false, error: true, code: "BOOTSTRAP_ERROR" });
+  }
+});
+
+app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFIG.MAX_IMAGES_PER_REQUEST), async (req, res) => {
+  try {
+    const message = req.body.message;
+    let conversationId = req.body.conversationId || req.body.conversation_id;
+    let isNewConversation = false;
+    const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
+
+    const quotaCheck = await checkUserQuota(req.userId, 'message', req.userRole);
+    if (!quotaCheck.allowed) {
+      return res.status(429).json({ success: false, error: true, reply: quotaCheck.message || "Limite atteinte.", code: "QUOTA_EXCEEDED" });
+    }
+
+    if (!message || typeof message !== "string" || message.trim().length === 0) {
+      return res.status(400).json({ success: false, error: true, reply: "Le paramètre 'message' est obligatoire.", code: "MISSING_MESSAGE" });
+    }
+
+    const sanitizedMessage = sanitizeUserText(message);
+    if (!sanitizedMessage) {
+      return res.status(400).json({ success: false, error: true, reply: "Message invalide après nettoyage.", code: "INVALID_MESSAGE" });
+    }
+
+    // conversationId ne doit jamais être fourni librement par le client au-delà d'un format
+    // attendu, pour éviter qu'un utilisateur ne devine/force l'ID d'une conversation tierce.
+    if (conversationId && !/^[a-zA-Z0-9_-]{6,80}$/.test(conversationId)) {
+      return res.status(400).json({ success: false, error: true, reply: "Identifiant de conversation invalide.", code: "INVALID_CONVERSATION_ID" });
+    }
+
+    if (!conversationId || typeof conversationId !== "string") {
+      conversationId = generateConversationId();
+      isNewConversation = true;
+    }
+
+    try {
+      await assertConversationOwnership(conversationId, req.userId);
+    } catch (error) {
+      return res.status(403).json({ success: false, error: true, reply: error.message, code: "CONVERSATION_OWNERSHIP" });
+    }
+
+    const googleAccessToken = req.headers["x-google-access-token"] || null;
+
+    let images = null;
+    if (req.files && req.files.length > 0) {
+      images = req.files.map((file) => convertImageToBase64(file.buffer, file.mimetype));
+      await incrementUserQuota(req.userId, 'image');
+    }
+
+    const result = await handleChat({
+      conversationId,
+      userId: req.userId,
+      firebaseUid: req.firebaseUid,
+      message: sanitizedMessage,
+      googleAccessToken,
+      channel: "web",
+      modelTier,
+      images
+    });
+
+    await incrementUserQuota(req.userId, 'message');
+
+    return res.status(200).json({ ...result, conversationId, isNewConversation });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur API/Chat");
+    return res.status(500).json({ success: false, error: true, reply: "Une erreur est survenue.", code: "CHAT_ERROR" });
+  }
+});
+
+// Route pour récupérer l'historique complet d'une conversation
+app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    
+    if (!conversationId) {
+      return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
+    }
+    
+    try {
+      await assertConversationOwnership(conversationId, req.userId);
+    } catch (error) {
+      return res.status(403).json({ success: false, error: true, reply: error.message, code: "CONVERSATION_OWNERSHIP" });
+    }
+    
+    // ?full=true permet au frontend de tout récupérer d'un coup à la connexion (plafonné à 500
+    // messages pour rester raisonnable) ; sinon on garde le comportement paginé habituel.
+    const wantsFull = req.query.full === "true";
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const limit = wantsFull ? 500 : (Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 200) : CONFIG.MAX_HISTORY_LENGTH);
+
+    const messages = await getFullHistory(conversationId, req.userId, limit);
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      conversationId,
+      messages,
+      count: messages.length
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur récupération historique");
+    return res.status(500).json({ success: false, error: true, code: "HISTORY_FETCH_ERROR" });
+  }
+});
+
+// Liste des conversations récentes (dashboard). Supabase en priorité (source de vérité
+// persistante) pour corriger le bug où les discussions récentes ne s'affichaient pas.
+app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    if (supabase) {
+      try {
+        const { data: supaSessions, error } = await supabase
+          .from("sessions")
+          .select("session_id, created_at, updated_at")
+          .eq("user_id", req.userId)
+          .order("updated_at", { ascending: false })
+          .limit(50);
+
+        if (!error && supaSessions) {
+          const enriched = await Promise.all(supaSessions.map(async (conv) => {
+            const { data: lastMsgRows } = await supabase
+              .from("messages")
+              .select("role, content")
+              .eq("session_id", conv.session_id)
+              .order("created_at", { ascending: false })
+              .limit(1);
+            const lastMessage = lastMsgRows?.[0] || null;
+            return {
+              conversationId: conv.session_id,
+              createdAt: conv.created_at,
+              updatedAt: conv.updated_at,
+              lastMessageRole: lastMessage?.role || null,
+              lastMessagePreview: lastMessage?.content ? lastMessage.content.slice(0, 140) : null
+            };
+          }));
+          return res.status(200).json({ success: true, error: false, conversations: enriched });
+        }
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur /api/conversations via Supabase, repli SQLite");
+      }
+    }
+
+    const rows = await dbAll("SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50", [req.userId]);
+    
+    const enrichedConversations = await Promise.all(rows.map(async (conv) => {
+      const lastMessage = await dbGet("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", [conv.session_id]);
+      return {
+        conversationId: conv.session_id,
+        createdAt: conv.created_at,
+        updatedAt: conv.updated_at,
+        lastMessageRole: lastMessage?.role || null,
+        lastMessagePreview: lastMessage?.content ? lastMessage.content.slice(0, 140) : null
+      };
+    }));
+
+    return res.status(200).json({ success: true, error: false, conversations: enrichedConversations });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, conversations: [] });
+  }
+});
+
+app.get("/api/user/stats", authenticateUser, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const quotaRow = await dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [req.userId, today]);
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      data: {
+        quotas: quotaRow || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 },
+        role: req.userRole || 'FREE',
+        limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE,
+        userId: req.userId,
+        firebaseUid: req.firebaseUid
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "STATS_ERROR" });
+  }
+});
+
+app.post("/api/session/create", authenticateUser, async (req, res) => {
+  try {
+    const sessionToken = await createActiveSession(req.userId, req.ip, req.headers['user-agent']);
+    return res.status(200).json({ success: true, error: false, data: { sessionToken, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() } });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "SESSION_CREATE_ERROR" });
+  }
+});
+
+app.post("/api/session/revoke", authenticateUser, async (req, res) => {
+  try {
+    const { sessionToken } = req.body;
+    if (sessionToken) {
+      await revokeSession(req.userId, sessionToken);
+    } else {
+      await revokeAllSessions(req.userId);
+    }
+    return res.status(200).json({ success: true, error: false, message: sessionToken ? "Session révoquée." : "Toutes les sessions révoquées." });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "SESSION_REVOKE_ERROR" });
+  }
+});
+
+app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(['ADMIN']), async (req, res) => {
+  try {
+    const { uid, role } = req.body;
+    if (!uid || !role || !['FREE', 'PREMIUM', 'ADMIN'].includes(role)) {
+      return res.status(400).json({ success: false, error: true, code: "INVALID_PARAMS" });
+    }
+    const result = await setUserRole(uid, role);
+    return res.status(200).json({ success: true, error: false, data: result });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "ROLE_UPDATE_ERROR" });
+  }
+});
+
+app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const toolName = req.body.toolName || req.body.action;
+    const params = req.body.params || req.body.arguments || req.body.data || {};
+    
+    if (!toolName) {
+      return res.status(400).json({ success: false, error: true, code: "MISSING_TOOL_NAME" });
+    }
+    
+    const googleAccessToken = req.headers["x-google-access-token"] || null;
+    const { result, sourceKeys } = await executeTool(toolName, params, { userId: req.userId, googleAccessToken });
+    const sources = sourceKeys.map((k) => OPEN_SOURCES[k]).filter(Boolean);
+    
+    return res.status(200).json({ success: true, error: false, toolName, result, sources });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "TOOL_EXECUTION_ERROR" });
+  }
+});
+
+// ==================== ROUTES MODULE JARVIS : TÂCHES / EMPLOI DU TEMPS ====================
+app.get("/api/tasks", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const result = await listTasks(req.userId, { status: req.query.status || null });
+    return res.status(200).json({ success: true, error: false, tasks: result.tasks });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "TASKS_FETCH_ERROR" });
+  }
+});
+
+app.post("/api/tasks", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const { title, notes, dueAt } = req.body;
+    const result = await createTask(req.userId, { title, notes, dueAt });
+    if (!result.success) return res.status(400).json({ success: false, error: true, reply: result.error, code: "TASK_CREATE_INVALID" });
+    return res.status(201).json({ success: true, error: false, task: result.task });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "TASK_CREATE_ERROR" });
+  }
+});
+
+app.put("/api/tasks/:taskId/status", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["pending", "done"].includes(status)) {
+      return res.status(400).json({ success: false, error: true, code: "INVALID_STATUS" });
+    }
+    const result = await updateTaskStatus(req.userId, req.params.taskId, status);
+    if (!result.success) return res.status(404).json({ success: false, error: true, code: "TASK_NOT_FOUND" });
+    return res.status(200).json({ success: true, error: false, task: result.task });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "TASK_UPDATE_ERROR" });
+  }
+});
+
+app.delete("/api/tasks/:taskId", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    await deleteTask(req.userId, req.params.taskId);
+    return res.status(200).json({ success: true, error: false });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "TASK_DELETE_ERROR" });
+  }
+});
+
+// ==================== ROUTE MODULE JARVIS : RECHERCHE YOUTUBE DIRECTE ====================
+app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const query = req.query.q;
+    if (!query) return res.status(400).json({ success: false, error: true, code: "MISSING_QUERY" });
+    const result = await searchYouTube(query);
+    return res.status(200).json({ success: true, error: false, videos: result.videos });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "YOUTUBE_SEARCH_ERROR" });
+  }
+});
+
+app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
+  try {
+    const result = await whatsappManager.initClient(req.userId);
+    
+    if (result.connected) {
+      return res.status(200).json({ success: true, error: false, message: "WhatsApp déjà connecté.", data: { qrCode: null, qrCodeBase64: null } });
+    }
+    
+    let qrCode = null;
+    const startTime = Date.now();
+    while (!qrCode && Date.now() - startTime < CONFIG.WHATSAPP_QR_TIMEOUT) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      qrCode = whatsappManager.getQRCode(req.userId);
+    }
+    
+    if (qrCode) {
+      return res.status(200).json({ success: true, error: false, message: "Connexion initiée", data: { qrCode, qrCodeBase64: qrCode }, qr: qrCode });
+    }
+    
+    return res.status(408).json({ success: false, error: true, message: "Délai dépassé.", code: "QR_TIMEOUT" });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "WHATSAPP_CONNECT_ERROR" });
+  }
+});
+
+app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res) => {
+  try {
+    if (!req.body.to || !req.body.message) {
+      return res.status(400).json({ success: false, error: true, code: "MISSING_PARAMS" });
+    }
+    
+    const quotaCheck = await checkUserQuota(req.userId, 'whatsapp', req.userRole);
+    if (!quotaCheck.allowed) {
+      return res.status(429).json({ success: false, error: true, code: "WHATSAPP_QUOTA_EXCEEDED" });
+    }
+    
+    const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
+    await incrementUserQuota(req.userId, 'whatsapp');
+    
+    return res.status(200).json({ success: true, error: false, data: result });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "WHATSAPP_SEND_ERROR" });
+  }
+});
+
+app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
+  try {
+    const { intentType, conversationId } = req.body;
+    const convId = conversationId || req.body.conversation_id;
+
+    if (!convId) {
+      return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
+    }
+
+    await getSession(convId, req.userId, req.firebaseUid);
+
+    if (intentType === "WHATSAPP") {
+      await setActiveIntent(convId, "WHATSAPP", { step: "NEED_NUMBER" });
+      return res.status(200).json({ success: true, error: false, reply: "Envoi WhatsApp initié. Quel est le numéro ?" });
+    }
+    if (intentType === "EMAIL") {
+      await setActiveIntent(convId, "EMAIL", { step: "NEED_RECIPIENT" });
+      return res.status(200).json({ success: true, error: false, reply: "Envoi d'email initié. Quelle est l'adresse ?" });
+    }
+    return res.status(400).json({ success: false, error: true, code: "UNKNOWN_INTENT" });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "INTENT_ERROR" });
+  }
+});
+
+app.post("/api/memory/clear", authenticateUser, async (req, res) => {
+  try {
+    const conversationId = req.body.conversationId || req.body.conversation_id;
+
+    if (!conversationId) {
+      return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
+    }
+
+    await dbRun("DELETE FROM messages WHERE session_id = ?", [conversationId]);
+    await clearActiveIntent(conversationId);
+
+    if (supabase) {
+      try {
+        await supabase.from("messages").delete().eq("session_id", conversationId);
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur effacement mémoire Supabase");
+      }
+    }
+
+    return res.status(200).json({ success: true, error: false, reply: "Mémoire effacée." });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "MEMORY_CLEAR_ERROR" });
+  }
+});
+
+app.delete("/api/account", authenticateUser, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const firebaseUid = req.firebaseUid;
+    
+    try {
+      const whatsappSession = whatsappManager.sessions.get(userId);
+      if (whatsappSession?.sock) whatsappSession.sock.end(undefined);
+      whatsappManager.sessions.delete(userId);
+      const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
+      if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
+    } catch (error) {
+      logger.warn({ error: error.message }, "Erreur suppression session WhatsApp");
+    }
+    
+    await dbRun("DELETE FROM messages WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
+    await dbRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM email_logs WHERE user_id = ? OR firebase_uid = ?", [userId, firebaseUid]);
+    await dbRun("DELETE FROM llm_audit_log WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM security_logs WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM user_quotas WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM active_sessions WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM user_tasks WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM user_memory WHERE user_id = ?", [userId]);
+    await dbRun("DELETE FROM users WHERE id = ?", [userId]);
+    
+    if (supabase) {
+      try {
+        await supabase.from("messages").delete().eq("user_id", userId);
+        await supabase.from("sessions").delete().eq("user_id", userId);
+        await supabase.from("user_tasks").delete().eq("user_id", userId);
+        await supabase.from("user_memory").delete().eq("user_id", userId);
+        await supabase.from("whatsapp_credentials").delete().eq("user_id", userId);
+        await supabase.from("users").delete().eq("firebase_uid", firebaseUid);
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur suppression Supabase");
+      }
+    }
+    
+    let firebaseAccountDeleted = false;
+    if (firebaseApp && firebaseAdmin) {
+      try {
+        await firebaseAdmin.auth(firebaseApp).deleteUser(firebaseUid);
+        firebaseAccountDeleted = true;
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur suppression compte Firebase");
+      }
+    }
+    
+    return res.status(200).json({
+      success: true,
+      error: false,
+      message: "Compte supprimé avec succès.",
+      code: "ACCOUNT_DELETED",
+      firebaseAccountDeleted
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "ACCOUNT_DELETION_ERROR" });
+  }
+});
+
+// ==================== ROUTE 404 ====================
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: true,
+    reply: "Route non trouvée",
+    code: "NOT_FOUND",
+    availableRoutes: [
+      "GET /", "GET /api/health", "GET /api/user/whoami", "POST /api/chat", "GET /api/conversations",
+      "GET /api/conversation/:conversationId/messages",
+      "GET /api/user/stats", "POST /api/tools", "POST /api/whatsapp/connect",
+      "POST /api/whatsapp/send", "POST /api/intent/init", "POST /api/memory/clear",
+      "POST /api/session/create", "POST /api/session/revoke", "POST /api/admin/set-role",
+      "GET /api/tasks", "POST /api/tasks", "PUT /api/tasks/:taskId/status", "DELETE /api/tasks/:taskId",
+      "GET /api/youtube/search",
+      "DELETE /api/account"
+    ]
+  });
+});
+
+// ==================== MIDDLEWARE D'ERREUR ====================
+app.use((error, req, res, next) => {
+  logger.error({ error: error.message, stack: error.stack }, "Erreur non gérée");
+  if (res.headersSent) return next(error);
+  return res.status(500).json({ success: false, error: true, reply: "Une erreur interne est survenue.", code: "INTERNAL_ERROR" });
+});
+
+// ==================== HYGIÈNE PRODUCTION : NETTOYAGE PÉRIODIQUE ====================
+// Purge les entrées de sécurité expirées pour éviter une croissance illimitée des tables et
+// garder les vérifications anti-fraude rapides même après des mois de production.
+async function runSecurityHousekeeping() {
+  try {
+    await dbRun(`DELETE FROM blocked_ips WHERE blocked_until < CURRENT_TIMESTAMP`);
+    await dbRun(`DELETE FROM login_attempts WHERE created_at < datetime('now', '-30 days')`);
+    await dbRun(`DELETE FROM security_logs WHERE created_at < datetime('now', '-90 days')`);
+    await dbRun(`DELETE FROM active_sessions WHERE expires_at < datetime('now', '-7 days')`);
+    await dbRun(`DELETE FROM llm_audit_log WHERE created_at < datetime('now', '-30 days')`);
+    logger.info("🧹 Nettoyage périodique de sécurité effectué");
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur nettoyage périodique de sécurité");
+  }
+}
+const HOUSEKEEPING_INTERVAL_MS = parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
+setInterval(runSecurityHousekeeping, HOUSEKEEPING_INTERVAL_MS);
+
+// ==================== DÉMARRAGE ====================
+const server = app.listen(CONFIG.PORT, () => {
+  logger.info("Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " démarré sur le port " + CONFIG.PORT);
+  console.log("🚀 Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " opérationnel sur le port " + CONFIG.PORT);
+  console.log("🌐 Domaine: " + HOSTING_CONFIG.domain);
+  console.log("🔐 Firebase Admin: " + (firebaseApp ? "activé" : "désactivé (mode API REST)"));
+  console.log("🧠 NLP Intent Engine: activé");
+  console.log("📐 MathJS Engine: activé");
+  console.log("📰 RSS Parser: activé");
+  console.log("🔍 Web Search (DuckDuckGo): activé");
+  console.log("📄 Scraping (Cheerio): activé");
+  console.log("💾 Mémoire Conversationnelle: activée (source de vérité: " + (supabase ? "Supabase" : "SQLite local, non persistant sur Render") + ")");
+  console.log("👤 Synchronisation UID unifiée: activée");
+  console.log("🤖 Module Jarvis (tâches + YouTube): activé");
+});
+
+// ==================== ARRÊT PROPRE ====================
+let isShuttingDown = false;
+
+async function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  logger.info({ signal }, "Arrêt propre du serveur");
+
+  await new Promise((resolve) => server.close(resolve));
+  
+  try { await whatsappManager.destroyAll(); } catch (error) { logger.error({ error: error.message }, "Erreur fermeture WhatsApp"); }
+  try { await queueManager.close(); } catch (error) { logger.error({ error: error.message }, "Erreur fermeture files"); }
+  
+  await new Promise((resolve) => db.close(() => resolve()));
+  
+  console.log("✅ Arrêt propre terminé");
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", (error) => {
+  logger.error({ error: error.message, stack: error.stack }, "uncaughtException");
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error({ reason: String(reason) }, "unhandledRejection");
+});
+
+module.exports = { app, db, queueManager, whatsappManager };
+
