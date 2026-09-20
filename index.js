@@ -2530,7 +2530,7 @@ const LUBA_BASE_SYSTEM_PROMPT = [
   "RÈGLE SUR LES DONNÉES (OBLIGATOIRE) :",
   "- Tu ne dois JAMAIS inventer un score sportif, une actualité, un résultat de recherche, une donnée météo, une vidéo YouTube ou une tâche.",
   "- Utilise TOUJOURS l'outil approprié pour obtenir une donnée réelle.",
-  "- Si un outil échoue, dis-le honnête
+  "- Si un outil échoue, dis-le honnêtement.",
   "",
   "RÈGLE STRICTE SUR LES IMAGES :",
   "- Dès que tu décris, présentes ou identifies une personnalité (personne réelle, sportif, artiste), un lieu ou un objet précis, utilise TOUJOURS search_images pour illustrer ta réponse avec une vraie photo.",
@@ -4098,4 +4098,3 @@ process.on("unhandledRejection", (reason) => {
 });
 
 module.exports = { app, db, queueManager, whatsappManager };
-
