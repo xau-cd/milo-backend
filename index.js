@@ -43,7 +43,8 @@ const pino = require("pino");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const { EventEmitter } = require("events");
-const { Groq } = require("@groq/sdk");
+// Note : les appels au fournisseur Groq passent par des requêtes HTTP directes (axios) dans
+// callProviderRaw, pas par un SDK dédié — évite une dépendance externe superflue.
 const math = require("mathjs");
 const Parser = require("rss-parser");
 const { search } = require("duck-duck-scrape");
@@ -450,10 +451,7 @@ const upload = multer({
   }
 });
 
-// ==================== INITIALISATION GROQ SDK ====================
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY || ""
-});
+// ==================== (SDK GROQ RETIRÉ — appels HTTP directs uniquement) ====================
 
 // ==================== INITIALISATION RSS PARSER ====================
 const rssParser = new Parser({
@@ -2539,6 +2537,4 @@ const authenticateUser = async (req, res, next) => {
     
     try {
       const user = await verifyFirebaseToken(bearerToken);
-      if (!user) {
-        await recordLoginAttempt(req.ip, null, false, "Token invalide");
-        return 
+      if (!u
