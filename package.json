@@ -1,41 +1,82 @@
 {
-  "name": "luba-ia-backend",
-  "version": "12.1.0",
-  "description": "Backend Node.js/Express de Luba (Luba.ia) — HIKLON Technology. Assistant IA façon Jarvis : chat multi-fournisseurs avec rotation de clés, mémoire conversationnelle persistante (Supabase), recherche web/images/actualités/sport/science, automatisation de tâches et d'emploi du temps, recherche et lecture de vidéos YouTube, WhatsApp via Baileys, email, sécurité et anti-fraude renforcées.",
+  "name": "luba-backend",
+  "version": "13.0.0",
+  "description": "Luba.ia — Assistant IA Enterprise par HIKLON TECHNOLOGIES (Kinshasa, RDC)",
   "main": "index.js",
+  "author": "HIKLON TECHNOLOGIES <contact@hiklon.com>",
   "license": "UNLICENSED",
   "private": true,
   "engines": {
-    "node": ">=18.18.0 <21.0.0"
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js",
-    "check": "node --check index.js"
+    "dev": "NODE_ENV=development nodemon index.js",
+    "prod": "NODE_ENV=production node index.js",
+    "lint": "eslint index.js",
+    "audit": "npm audit --production",
+    "audit:fix": "npm audit fix",
+    "clean": "rm -rf node_modules package-lock.json data sessions uploads",
+    "reinstall": "npm run clean && npm install",
+    "health": "curl -s http://localhost:3000/api/health | jq",
+    "test:models": "node -e \"require('dotenv').config(); require('./index.js')\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "^6.7.0",
     "axios": "^1.7.7",
-    "bullmq": "^5.13.2",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "duck-duck-scrape": "^2.2.5",
-    "express": "^4.21.0",
+    "duck-duck-scrape": "^2.2.6",
+    "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
-    "firebase-admin": "^12.5.0",
-    "form-data": "^4.0.0",
-    "helmet": "^7.1.0",
-    "ioredis": "^5.4.1",
-    "mathjs": "^13.1.1",
+    "firebase-admin": "^12.6.0",
+    "form-data": "^4.0.1",
+    "helmet": "^8.0.0",
+    "mathjs": "^13.2.0",
     "multer": "^1.4.5-lts.1",
-    "natural": "^7.1.0",
+    "natural": "^8.0.1",
     "nodemailer": "^6.9.15",
-    "pino": "^9.4.0",
-    "pino-pretty": "^11.2.2",
+    "pino": "^9.5.0",
     "qrcode": "^1.5.4",
     "rss-parser": "^3.13.0",
     "sqlite3": "^5.1.7"
-  }
+  },
+  "optionalDependencies": {
+    "bullmq": "^5.21.2",
+    "ioredis": "^5.4.1",
+    "pino-pretty": "^11.3.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.13.0",
+    "nodemon": "^3.1.7"
+  },
+  "overrides": {
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "luba",
+    "hiklon",
+    "ai",
+    "assistant",
+    "jarvis",
+    "kinshasa",
+    "rdc",
+    "firebase",
+    "supabase",
+    "groq",
+    "openrouter",
+    "whatsapp",
+    "baileys"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hiklon/luba-backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hiklon/luba-backend/issues"
+  },
+  "homepage": "https://luba.web.app"
 }
