@@ -48,6 +48,7 @@ const { EventEmitter } = require("events");
 const math = require("mathjs");
 const Parser = require("rss-parser");
 const { search } = require("duck-duck-scrape");
+const FormData = require("form-data");
 const cheerio = require("cheerio");
 const natural = require("natural");
 
@@ -82,7 +83,7 @@ const CONFIG = {
   ENV: process.env.NODE_ENV || "production",
   VERSION: "12.0.0",
   AGENT_NAME: "Luba",
-  COMPANY: "HIKLON Technology",
+  COMPANY: "HIKLON TECHNOLOGIES",
 
   MAX_MESSAGE_LENGTH: parseInt(process.env.MAX_MESSAGE_LENGTH || "15000", 10),
   MAX_HISTORY_LENGTH: parseInt(process.env.MAX_HISTORY_LENGTH || "50", 10),
@@ -113,7 +114,7 @@ const CONFIG = {
   SESSIONS_PATH: path.join(__dirname, "sessions"),
   UPLOADS_PATH: path.join(__dirname, "uploads"),
 
-  VISION_MODEL_GROQ: process.env.VISION_MODEL_GROQ || "openai/gpt-4o-mini",
+  VISION_MODEL_GROQ: process.env.VISION_MODEL_GROQ || "llama-3.2-90b-vision-preview",
   VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free",
 
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
@@ -456,6 +457,17 @@ const upload = multer({
     } else {
       cb(new Error(`Type de fichier non supporté. Types autorisés: ${CONFIG.ALLOWED_IMAGE_TYPES.join(", ")}`));
     }
+  }
+});
+
+// Upload audio dédié à la transcription vocale ("écrit OU vocal", façon Jarvis).
+const ALLOWED_AUDIO_TYPES = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/webm", "audio/ogg", "audio/m4a", "audio/x-m4a", "audio/aac"];
+const uploadAudio = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_AUDIO_TYPES.includes(file.mimetype)) cb(null, true);
+    else cb(new Error(`Type audio non supporté. Types autorisés: ${ALLOWED_AUDIO_TYPES.join(", ")}`));
   }
 });
 
@@ -1413,6 +1425,40 @@ async function searchYouTube(query) {
   }
 }
 
+// ==================== MODULE JARVIS : TRANSCRIPTION VOCALE (ÉCRIT OU VOCAL) ====================
+// Whisper (large-v3) via Groq est gratuit et très rapide. Comme pour le texte, on essaie chaque
+// clé Groq du pool avant d'abandonner, pour rester cohérent avec la stratégie de rotation.
+async function transcribeAudioGroq(buffer, filename, mimetype) {
+  if (!LLM_PROVIDERS.GROQ.keyPool || LLM_PROVIDERS.GROQ.keyPool.length === 0) {
+    return { success: false, error: "Aucune clé Groq configurée pour la transcription" };
+  }
+
+  let lastError = null;
+  for (const keyEntry of LLM_PROVIDERS.GROQ.keyPool) {
+    try {
+      const form = new FormData();
+      form.append("file", buffer, { filename: filename || "audio.webm", contentType: mimetype || "audio/webm" });
+      form.append("model", process.env.GROQ_WHISPER_MODEL || "whisper-large-v3");
+      form.append("language", "fr");
+      form.append("response_format", "json");
+
+      const response = await axios.post("https://api.groq.com/openai/v1/audio/transcriptions", form, {
+        headers: { ...form.getHeaders(), Authorization: "Bearer " + keyEntry.apiKey },
+        timeout: 30000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity
+      });
+
+      return { success: true, text: response.data?.text || "" };
+    } catch (error) {
+      lastError = error;
+      logger.warn({ error: error.message, keyLabel: keyEntry.label }, "Échec transcription vocale avec cette clé, rotation");
+    }
+  }
+
+  return { success: false, error: lastError?.response?.data?.error?.message || lastError?.message || "Échec de la transcription" };
+}
+
 // ==================== MODULE JARVIS : GESTION DES TÂCHES / EMPLOI DU TEMPS ====================
 async function createTask(userId, { title, notes = null, dueAt = null }) {
   if (!title || typeof title !== "string" || !title.trim()) {
@@ -2150,6 +2196,81 @@ if (LLM_PROVIDERS.GROQ.keyPool.length === 0) {
   logger.warn("⚠️ Aucune clé GROQ_API_KEY configurée");
 }
 
+// ==================== VÉRIFICATION AUTOMATIQUE DES MODÈLES (DÉTECTION MODÈLE PAYANT/DISPARU) ====================
+// Les catalogues de modèles gratuits changent souvent sans préavis (un modèle ":free" peut
+// disparaître ou devenir payant du jour au lendemain). Plutôt que deviner, on interroge le VRAI
+// catalogue au démarrage et on journalise clairement tout modèle configuré qui n'est plus gratuit
+// ou plus disponible — visible aussi via GET /api/health (champ modelAvailability).
+let modelAvailabilityReport = { checkedAt: null, issues: [], ok: true };
+
+function collectConfiguredOpenRouterModels() {
+  const models = new Set();
+  for (const p of MODEL_TIERS.v100.providers) if (p.provider === "openrouter") models.add(p.model);
+  for (const p of MODEL_TIERS.v250.reasoning.providers) if (p.provider === "openrouter") models.add(p.model);
+  for (const p of MODEL_TIERS.v250.code.providers) if (p.provider === "openrouter") models.add(p.model);
+  if (MODEL_TIERS.vision.providers.find((p) => p.provider === "openrouter")) models.add(CONFIG.VISION_MODEL_OPENROUTER);
+  return [...models];
+}
+
+async function checkModelAvailability() {
+  const issues = [];
+  try {
+    // Catalogue OpenRouter : endpoint public, pas besoin de clé.
+    const response = await axios.get("https://openrouter.ai/api/v1/models", { timeout: 10000 });
+    const catalog = response.data?.data || [];
+    const freeIds = new Set(
+      catalog
+        .filter((m) => m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0"))
+        .map((m) => m.id)
+    );
+    const allIds = new Set(catalog.map((m) => m.id));
+
+    for (const model of collectConfiguredOpenRouterModels()) {
+      if (!allIds.has(model)) {
+        issues.push({ provider: "openrouter", model, problem: "INTROUVABLE (retiré du catalogue OpenRouter)" });
+      } else if (!freeIds.has(model)) {
+        issues.push({ provider: "openrouter", model, problem: "PAYANT (n'est plus/pas un modèle gratuit)" });
+      }
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Impossible de vérifier le catalogue OpenRouter au démarrage");
+  }
+
+  try {
+    if (LLM_PROVIDERS.GROQ.keyPool.length > 0) {
+      const response = await axios.get("https://api.groq.com/openai/v1/models", {
+        timeout: 10000,
+        headers: { Authorization: "Bearer " + LLM_PROVIDERS.GROQ.keyPool[0].apiKey }
+      });
+      const groqIds = new Set((response.data?.data || []).map((m) => m.id));
+      const configuredGroqModels = new Set([
+        ...MODEL_TIERS.v100.providers.filter((p) => p.provider === "groq").map((p) => p.model),
+        ...MODEL_TIERS.v250.reasoning.providers.filter((p) => p.provider === "groq").map((p) => p.model),
+        ...MODEL_TIERS.v250.code.providers.filter((p) => p.provider === "groq").map((p) => p.model),
+        CONFIG.VISION_MODEL_GROQ
+      ]);
+      for (const model of configuredGroqModels) {
+        if (!groqIds.has(model)) {
+          issues.push({ provider: "groq", model, problem: "INTROUVABLE sur le compte Groq (retiré ou jamais existé)" });
+        }
+      }
+    }
+  } catch (error) {
+    logger.warn({ error: error.message }, "Impossible de vérifier le catalogue Groq au démarrage (clé invalide ?)");
+  }
+
+  modelAvailabilityReport = { checkedAt: new Date().toISOString(), issues, ok: issues.length === 0 };
+
+  if (issues.length > 0) {
+    logger.warn({ issues }, "🚨 MODÈLES CONFIGURÉS PROBLÉMATIQUES DÉTECTÉS — voir GET /api/health");
+    issues.forEach((i) => logger.warn(`   ↳ [${i.provider}] ${i.model} → ${i.problem}`));
+  } else {
+    logger.info("✅ Tous les modèles configurés sont vérifiés gratuits et disponibles");
+  }
+}
+
+// (l'appel réel de checkModelAvailability() est fait plus bas, une fois MODEL_TIERS déclaré)
+
 const MODEL_TIERS = {
   v100: {
     name: "Mwamba",
@@ -2164,8 +2285,8 @@ const MODEL_TIERS = {
     name: "Ngandu",
     reasoning: {
       providers: [
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "deepseek/deepseek-r1-distill-llama-70b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1 },
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-chat-v3.1:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "qwen/qwen3-14b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1 },
         { provider: "groq", model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 6000, timeout: 45000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
       ]
     },
@@ -2187,6 +2308,10 @@ const MODEL_TIERS = {
     ]
   }
 };
+
+// Vérifie au démarrage (une fois MODEL_TIERS déclaré), puis toutes les 6h.
+checkModelAvailability();
+setInterval(checkModelAvailability, 6 * 60 * 60 * 1000);
 
 function validateAndSanitizeOpenRouterModel(model) {
   if (!model || typeof model !== "string") return null;
@@ -3473,7 +3598,8 @@ app.get("/api/health", async (req, res) => {
           jarvisTasks: true,
           jarvisYoutube: true,
           persistentStoreIsSupabase: Boolean(supabase)
-        }
+        },
+        modelAvailability: modelAvailabilityReport
       }
     });
   } catch (error) {
@@ -3543,13 +3669,49 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
 
     const quotaRow = await dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [userId, today]);
     const tasksResult = await listTasks(userId, { status: "pending" });
-    const userRow = await dbGet("SELECT whatsapp_connected FROM users WHERE id = ?", [userId]);
+    const userRow = await dbGet("SELECT whatsapp_connected, display_name FROM users WHERE id = ?", [userId]);
+
+    // Accueil personnalisé façon Jarvis : Luba "reconnaît" l'utilisateur dès la connexion, en
+    // s'appuyant sur sa mémoire long terme et son activité récente — pas un simple "Bonjour".
+    // Un seul appel LLM léger, jamais bloquant : si ça échoue, on renvoie simplement `null` et
+    // le frontend garde son message d'accueil par défaut.
+    let greeting = null;
+    try {
+      const longTermMemory = await getUserMemory(userId);
+      const greetMessages = [
+        {
+          role: "system",
+          content: [
+            "Tu es Luba, assistant IA façon Jarvis, développé par HIKLON Technology.",
+            "Rédige UNE SEULE phrase d'accueil, courte, calme et sûre d'elle (jamais servile, jamais exagérément enthousiaste) — le ton de Jarvis qui accueille son utilisateur.",
+            "Si une mémoire long terme existe, montre discrètement que tu reconnais l'utilisateur (sans réciter la mémoire mot pour mot). Si l'utilisateur a des tâches en attente, tu peux le mentionner en une poignée de mots.",
+            "Si aucune mémoire n'existe (nouvel utilisateur), un accueil neutre et professionnel suffit.",
+            "Réponds STRICTEMENT au format JSON : {\"greeting\": \"...\"}"
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: `MÉMOIRE LONG TERME : ${longTermMemory || "(aucune — nouvel utilisateur)"}\nTâches en attente : ${tasksResult.tasks.length}\nDernier échange connu : ${conversations[0]?.lastMessagePreview || "(aucun)"}`
+        }
+      ];
+      const greetResult = await executeWithRetryAndFallback(
+        MODEL_TIERS.v100.providers,
+        { messages: greetMessages },
+        { maxRetriesPerProvider: 1, tier: "greeting" }
+      );
+      if (greetResult.success && typeof greetResult.response?.greeting === "string") {
+        greeting = greetResult.response.greeting.slice(0, 300).trim();
+      }
+    } catch (error) {
+      logger.warn({ error: error.message }, "Accueil personnalisé non généré (non bloquant)");
+    }
 
     return res.status(200).json({
       success: true,
       error: false,
       userId,
       role: req.userRole,
+      greeting,
       conversations,
       pendingTasks: tasksResult.tasks,
       quotas: quotaRow || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 },
@@ -3852,6 +4014,33 @@ app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) =>
   }
 });
 
+// ==================== ROUTE MODULE JARVIS : ENTRÉE VOCALE ====================
+// Le frontend enregistre un message vocal, l'envoie ici, récupère le texte transcrit, puis
+// l'envoie normalement à /api/chat — Luba répond alors "par écrit ou par vocal" indifféremment.
+app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.single("audio"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: true, reply: "Aucun fichier audio reçu.", code: "MISSING_AUDIO" });
+    }
+
+    const quotaCheck = await checkUserQuota(req.userId, "message", req.userRole);
+    if (!quotaCheck.allowed) {
+      return res.status(429).json({ success: false, error: true, reply: quotaCheck.message || "Limite atteinte.", code: "QUOTA_EXCEEDED" });
+    }
+
+    const result = await transcribeAudioGroq(req.file.buffer, req.file.originalname, req.file.mimetype);
+    if (!result.success) {
+      return res.status(502).json({ success: false, error: true, reply: "Impossible de transcrire l'audio : " + result.error, code: "TRANSCRIPTION_FAILED" });
+    }
+
+    const cleanText = sanitizeUserText(result.text, 5000);
+    return res.status(200).json({ success: true, error: false, text: cleanText });
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur transcription vocale");
+    return res.status(500).json({ success: false, error: true, code: "VOICE_TRANSCRIBE_ERROR" });
+  }
+});
+
 app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
   try {
     const result = await whatsappManager.initClient(req.userId);
@@ -4022,7 +4211,7 @@ app.use((req, res) => {
       "POST /api/whatsapp/send", "POST /api/intent/init", "POST /api/memory/clear",
       "POST /api/session/create", "POST /api/session/revoke", "POST /api/admin/set-role",
       "GET /api/tasks", "POST /api/tasks", "PUT /api/tasks/:taskId/status", "DELETE /api/tasks/:taskId",
-      "GET /api/youtube/search",
+      "GET /api/youtube/search", "POST /api/voice/transcribe",
       "DELETE /api/account"
     ]
   });
