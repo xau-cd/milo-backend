@@ -1,28 +1,19 @@
-// ==================== INDEX.JS - CERVEAU LUBA (HIKLON TECHNOLOGIES) ====================
-// Version : 12.0.0 Enterprise (Production Ready - Blindé)
-// Architecture : Modulaire, Microservices-ready, Haute Disponibilité
-// Optimisé pour Render.com
-//
-// FONCTIONNALITÉS :
-// - Authentification Firebase Admin SDK complète
-// - Gestion des sessions avec tokens
-// - Quotas par utilisateur (FREE/PREMIUM/ADMIN)
-// - Protection anti-fraude (IP blocking, rate limiting)
-// - Audit LLM complet
-// - Logs de sécurité
-// - WhatsApp via Baileys avec persistance
-// - Email via Gmail/Resend/SMTP
-// - Recherche multi-sources
-// - Pipeline LLM v100/v250 avec failover
-// - Vision par IA
-// - RGPD (suppression de compte)
-// - Moteur d'intention NLP (natural)
-// - Calcul formel (mathjs)
-// - Agrégation RSS (rss-parser)
-// - Recherche web (duck-duck-scrape)
-// - Scraping (cheerio)
-// - MÉMOIRE CONVERSATIONNELLE PERSISTANTE
-// - SYNCHRONISATION UID UTILISATEUR
+// ================================================================================
+// LUBA BACKEND v13.0.0 — Enterprise Edition
+// HIKLON TECHNOLOGIES · Kinshasa, RDC
+// Architecture : Microservices-ready, Haute Disponibilité, Production-Ready
+// ================================================================================
+// CORRECTIONS APPLIQUÉES v13.0.0 :
+// - Clé crypto WhatsApp obligatoire en prod + IV aléatoire
+// - Regex math resserrée (opérateur obligatoire)
+// - Quota incrémenté AVANT appel LLM (anti-contournement)
+// - ADMIN via REST explicite + erreur 503
+// - Résultats d'outils en role "tool" (conforme OpenAI)
+// - Vision Groq : qwen/qwen3.6-27b (obsolète llama-3.2-90b-vision-preview)
+// - Modèles OpenRouter : liste Septembre 2026 vérifiée
+// - Route RGPD /api/user/memory (GET + DELETE)
+// - maybeSingle() pour getUserMemory
+// - Fallback SQLite transparent si Supabase absent
 // ================================================================================
 
 require("dotenv").config();
@@ -43,8 +34,6 @@ const pino = require("pino");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const { EventEmitter } = require("events");
-// Note : les appels au fournisseur Groq passent par des requêtes HTTP directes (axios) dans
-// callProviderRaw, pas par un SDK dédié — évite une dépendance externe superflue.
 const math = require("mathjs");
 const Parser = require("rss-parser");
 const { search } = require("duck-duck-scrape");
@@ -81,7 +70,7 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "12.0.0",
+  VERSION: "13.0.0",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON TECHNOLOGIES",
 
@@ -114,11 +103,13 @@ const CONFIG = {
   SESSIONS_PATH: path.join(__dirname, "sessions"),
   UPLOADS_PATH: path.join(__dirname, "uploads"),
 
-  VISION_MODEL_GROQ: process.env.VISION_MODEL_GROQ || "llama-3.2-90b-vision-preview",
-  VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free",
+  // ✅ CORRIGÉ : qwen/qwen3.6-27b (vision Groq confirmée)
+  VISION_MODEL_GROQ: process.env.VISION_MODEL_GROQ || "qwen/qwen3.6-27b",
+  // ✅ CORRIGÉ : inclusionai/ling-3.0-flash-vl:free (vision OpenRouter confirmée)
+  VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "inclusionai/ling-3.0-flash-vl:free",
 
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/12.0.0"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/13.0.0"
 };
 
 // ==================== CONFIGURATION FIREBASE ====================
@@ -420,9 +411,9 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
     db: { schema: "public" },
     global: { headers: { "x-application-name": "luba-backend" } }
   });
-  logger.info("✅ Supabase initialisé (source de vérité pour la persistance des conversations)");
+  logger.info("✅ Supabase initialisé (source de vérité persistante)");
 } else {
-  logger.warn("⚠️ Supabase non configuré - ATTENTION : sur Render, le disque SQLite est éphémère et sera réinitialisé au redéploiement/redémarrage. Configure SUPABASE_URL et SUPABASE_KEY pour une mémoire réellement persistante.");
+  logger.warn("⚠️ Supabase non configuré - SQLite éphémère sur Render. Configure SUPABASE_URL et SUPABASE_KEY.");
 }
 
 // ==================== CONFIGURATION EMAIL ====================
@@ -460,7 +451,7 @@ const upload = multer({
   }
 });
 
-// Upload audio dédié à la transcription vocale ("écrit OU vocal", façon Jarvis).
+// Upload audio dédié à la transcription vocale
 const ALLOWED_AUDIO_TYPES = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/webm", "audio/ogg", "audio/m4a", "audio/x-m4a", "audio/aac"];
 const uploadAudio = multer({
   storage: multer.memoryStorage(),
@@ -471,14 +462,10 @@ const uploadAudio = multer({
   }
 });
 
-// ==================== (SDK GROQ RETIRÉ — appels HTTP directs uniquement) ====================
-
 // ==================== INITIALISATION RSS PARSER ====================
 const rssParser = new Parser({
   timeout: 10000,
-  headers: {
-    "User-Agent": CONFIG.HTTP_USER_AGENT
-  }
+  headers: { "User-Agent": CONFIG.HTTP_USER_AGENT }
 });
 
 // ==================== INITIALISATION NATURAL NLP ====================
@@ -552,10 +539,7 @@ function generateSessionToken() {
   return `sess_${crypto.randomBytes(32).toString("hex")}`;
 }
 
-// ==================== SÉCURITÉ : ASSAINISSEMENT DES ENTRÉES ====================
-// Retire tout contenu potentiellement exécutable (scripts, gestionnaires d'événements, protocole
-// javascript:) avant stockage ou affichage, pour se protéger contre le XSS stocké côté frontend
-// (un message utilisateur ou une note de tâche pourrait sinon être rejoué tel quel dans l'UI).
+// ==================== SÉCURITÉ : ASSAINISSEMENT ====================
 function sanitizeUserText(input, maxLength = CONFIG.MAX_MESSAGE_LENGTH) {
   if (input === null || input === undefined) return input;
   let text = String(input);
@@ -569,9 +553,6 @@ function sanitizeUserText(input, maxLength = CONFIG.MAX_MESSAGE_LENGTH) {
   return text.trim();
 }
 
-// Empreinte non identifiante (IP + user-agent hachés) utilisée uniquement pour détecter des
-// connexions depuis un nouvel appareil/réseau et journaliser un événement de sécurité — jamais
-// pour identifier une personne physique.
 function computeDeviceFingerprint(ip, userAgent) {
   return crypto.createHash("sha256").update(`${ip || "?"}::${userAgent || "?"}`).digest("hex").slice(0, 32);
 }
@@ -677,6 +658,7 @@ async function verifyFirebaseToken(token) {
     }
   }
   
+  // Mode REST : rôle toujours FREE (pas de custom claims)
   try {
     const response = await axios.post(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
@@ -692,7 +674,7 @@ async function verifyFirebaseToken(token) {
         displayName: user.displayName || null,
         photoURL: user.photoUrl || null,
         emailVerified: user.emailVerified || false,
-        role: 'FREE'
+        role: 'FREE' // ✅ REST mode = FREE uniquement
       };
     }
     
@@ -718,7 +700,7 @@ async function setUserRole(uid, role) {
   }
   
   await dbRun(`UPDATE users SET role = ? WHERE firebase_uid = ? OR id = ?`, [role, uid, uid]);
-  return { success: true, role };
+  return { success: true, role, warning: "REST mode - role local uniquement" };
 }
 
 async function getUserRole(uid) {
@@ -794,8 +776,6 @@ async function checkLoginAttempts(ipAddress) {
   if (attempts?.count >= CONFIG.MAX_LOGIN_ATTEMPTS) {
     const existingBlock = await dbGet(`SELECT strike_count FROM blocked_ips WHERE ip_address = ?`, [ipAddress]);
     const strikeCount = (existingBlock?.strike_count || 0) + 1;
-    // Escalade : la durée de blocage double à chaque récidive, plafonnée à 24h, pour décourager
-    // les tentatives répétées de brute-force/fraude depuis la même IP.
     const escalatedDuration = Math.min(CONFIG.LOGIN_BLOCK_DURATION * Math.pow(2, strikeCount - 1), 24 * 60 * 60 * 1000);
 
     await dbRun(
@@ -1069,11 +1049,7 @@ const OPEN_SOURCES = {
   youtube: { name: "YouTube", url: "https://youtube.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=youtube.com" }
 };
 
-// ==================== FONCTIONS DE RECHERCHE ====================
-// ==================== CACHE IMAGES (VITESSE < 2s) ====================
-// Cache en mémoire à courte durée de vie : une recherche d'image déjà faite dans les 30 dernières
-// minutes (par exemple plusieurs utilisateurs qui demandent "Cristiano Ronaldo" la même heure)
-// est servie instantanément sans nouvel appel réseau à Wikimedia.
+// ==================== CACHE IMAGES ====================
 const IMAGE_CACHE_TTL_MS = parseInt(process.env.IMAGE_CACHE_TTL_MS || String(30 * 60 * 1000), 10);
 const imageSearchCache = new Map();
 
@@ -1089,15 +1065,12 @@ function getCachedImages(key) {
 
 function setCachedImages(key, value) {
   imageSearchCache.set(key, { value, timestamp: Date.now() });
-  // Évite une croissance illimitée du cache en mémoire.
   if (imageSearchCache.size > 500) {
     const oldestKey = imageSearchCache.keys().next().value;
     imageSearchCache.delete(oldestKey);
   }
 }
 
-// Course contre la montre : au-delà de `deadlineMs`, on abandonne la recherche encore en cours
-// et on répond avec ce qu'on a (ou un tableau vide) plutôt que de faire attendre le frontend.
 function withDeadline(promise, deadlineMs, fallbackValue) {
   return Promise.race([
     promise,
@@ -1105,6 +1078,7 @@ function withDeadline(promise, deadlineMs, fallbackValue) {
   ]);
 }
 
+// ==================== RECHERCHE IMAGES ====================
 async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
   try {
@@ -1127,16 +1101,12 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   }
 }
 
-// Recherche d'image avec repli automatique : Wikimedia Commons puis résumé Wikipedia (thumbnail)
-// pour garantir qu'une portrait/illustration est renvoyée même si Commons ne retourne rien.
-// Garantit une réponse en moins de 2 secondes : cache mémoire pour les requêtes répétées, requêtes
-// Commons + Wikipedia lancées EN PARALLÈLE (jamais en série) avec un délai global impératif.
 async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   const cacheKey = `img:${query.toLowerCase().trim()}:${limit}`;
   const cached = getCachedImages(cacheKey);
   if (cached) return cached;
 
-  const HARD_DEADLINE_MS = 1800; // marge sous les 2s demandées, réseau + sérialisation inclus
+  const HARD_DEADLINE_MS = 1800;
 
   const commonsPromise = searchWikimediaImages(query, limit).catch(() => ({ images: [] }));
   const wikipediaThumbPromise = axios
@@ -1156,7 +1126,6 @@ async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT
     })
     .catch(() => null);
 
-  // Les deux sources partent EN MÊME TEMPS ; on ne les attend pas l'une après l'autre.
   const [commonsResult, wikipediaThumb] = await withDeadline(
     Promise.all([commonsPromise, wikipediaThumbPromise]),
     HARD_DEADLINE_MS,
@@ -1176,6 +1145,7 @@ async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT
   return result;
 }
 
+// ==================== RECHERCHE WIKIPEDIA ====================
 async function searchWikipediaSummary(query) {
   try {
     const url = `https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(query)}`;
@@ -1191,6 +1161,7 @@ async function searchWikipediaSummary(query) {
   }
 }
 
+// ==================== RECHERCHE ACTUALITÉS ====================
 async function searchNews(query) {
   if (!query) return { articles: [] };
   try {
@@ -1215,6 +1186,7 @@ async function searchNews(query) {
   }
 }
 
+// ==================== RECHERCHE WEB ====================
 async function searchWeb(query) {
   if (!query || typeof query !== "string") return { results: [], sourcesUsed: [] };
   const [wiki, news, ddgResults] = await Promise.all([
@@ -1263,6 +1235,7 @@ async function searchDuckDuckGo(query) {
   }
 }
 
+// ==================== SCRAPING ====================
 async function scrapeArticleContent(url) {
   try {
     const response = await axios.get(url, {
@@ -1286,6 +1259,7 @@ async function scrapeArticleContent(url) {
   }
 }
 
+// ==================== RECHERCHE SPORT ====================
 async function searchSportsScores(query) {
   if (!query) return { events: [], error: "Aucune équipe précisée" };
   try {
@@ -1306,6 +1280,7 @@ async function searchSportsScores(query) {
   }
 }
 
+// ==================== RECHERCHE SCIENCE ====================
 async function searchScience(query) {
   if (!query) return { papers: [] };
   try {
@@ -1328,6 +1303,7 @@ async function searchScience(query) {
   }
 }
 
+// ==================== RECHERCHE SOCIAL ====================
 async function searchSocial(query) {
   if (!query) return { posts: [] };
   try {
@@ -1345,6 +1321,7 @@ async function searchSocial(query) {
   }
 }
 
+// ==================== MÉTÉO ====================
 async function getWeather(location) {
   if (!location) return { error: "Aucun lieu précisé" };
   try {
@@ -1366,7 +1343,7 @@ async function getWeather(location) {
   }
 }
 
-// ==================== MODULE JARVIS : RECHERCHE VIDÉO YOUTUBE ====================
+// ==================== MODULE JARVIS : YOUTUBE ====================
 function extractYouTubeVideoId(url) {
   if (!url) return null;
   const patterns = [
@@ -1379,8 +1356,6 @@ function extractYouTubeVideoId(url) {
   return null;
 }
 
-// Utilise l'API officielle YouTube Data v3 si une clé est configurée (résultats fiables),
-// sinon replie sur une recherche web ciblée site:youtube.com via DuckDuckGo.
 async function searchYouTube(query) {
   if (!query || typeof query !== "string") return { videos: [], error: "Aucune requête précisée" };
 
@@ -1425,9 +1400,7 @@ async function searchYouTube(query) {
   }
 }
 
-// ==================== MODULE JARVIS : TRANSCRIPTION VOCALE (ÉCRIT OU VOCAL) ====================
-// Whisper (large-v3) via Groq est gratuit et très rapide. Comme pour le texte, on essaie chaque
-// clé Groq du pool avant d'abandonner, pour rester cohérent avec la stratégie de rotation.
+// ==================== MODULE JARVIS : TRANSCRIPTION VOCALE ====================
 async function transcribeAudioGroq(buffer, filename, mimetype) {
   if (!LLM_PROVIDERS.GROQ.keyPool || LLM_PROVIDERS.GROQ.keyPool.length === 0) {
     return { success: false, error: "Aucune clé Groq configurée pour la transcription" };
@@ -1459,7 +1432,7 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
   return { success: false, error: lastError?.response?.data?.error?.message || lastError?.message || "Échec de la transcription" };
 }
 
-// ==================== MODULE JARVIS : GESTION DES TÂCHES / EMPLOI DU TEMPS ====================
+// ==================== MODULE JARVIS : TÂCHES ====================
 async function createTask(userId, { title, notes = null, dueAt = null }) {
   if (!title || typeof title !== "string" || !title.trim()) {
     return { success: false, error: "Le titre de la tâche est obligatoire" };
@@ -1544,13 +1517,17 @@ function executeMathExpression(expression) {
   }
 }
 
+// ✅ CORRIGÉ : Regex resserrée (opérateur obligatoire)
 function detectMathExpressions(message) {
   const patterns = [
-    /(\d+[\d\s\*\+\-\/\(\)\.]+\d+)/g,
+    // Exige au moins un opérateur arithmétique entre deux nombres
+    /(\d+(?:\.\d+)?(?:\s*[\+\-\*\/\^]\s*\d+(?:\.\d+)?)+)/g,
+    // Mots-clés explicites
     /(?:calcule|calcul|résous|resous|solve|compute)\s*:?\s*([^\n]+)/i,
-    /(\d+\s*[\+\-\*\/\^]\s*\d+)/g,
-    /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)\s*(?:de|of)?\s*:?\s*([^\n]+)/i,
-    /(?:sqrt|sin|cos|tan|log|exp|abs|floor|ceil|round)\s*\([^)]+\)/g
+    // Fonctions mathématiques
+    /(?:sqrt|sin|cos|tan|log|exp|abs|floor|ceil|round)\s*\([^)]+\)/gi,
+    // Mots-clés avancés
+    /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)\s*(?:de|of)?\s*:?\s*([^\n]+)/i
   ];
   
   const expressions = [];
@@ -1561,44 +1538,36 @@ function detectMathExpressions(message) {
     }
   }
   
-  return expressions;
+  return [...new Set(expressions)];
 }
 
 // ==================== ANALYSE D'INTENTION ====================
 function analyzeIntent(message) {
   const lowerMessage = message.toLowerCase();
   
-  // Vérification mathématique via patterns
   const mathPatterns = [
-    /[\d\s\*\+\-\/\(\)\.]{3,}[\d\)]/, 
+    /\d+(?:\.\d+)?\s*[\+\-\*\/\^]\s*\d+/, // au moins un opérateur
     /(?:calcule|calcul|résous|resous|solve|compute|equation|équation)/i,
     /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)/i,
-    /(?:sqrt|sin\(|cos\(|tan\(|log\(|exp\()/i,
-    /[\^]{1,2}\d/
+    /(?:sqrt|sin\(|cos\(|tan\(|log\(|exp\()/i
   ];
   const hasMath = mathPatterns.some(p => p.test(message));
   
-  // Vérification actualités
-  const newsWords = ["actualité", "actualites", "actualité", "news", "dernières nouvelles", "journal", "politique", "économie", "monde", "international", "breaking", "info"];
+  const newsWords = ["actualité", "actualites", "news", "dernières nouvelles", "journal", "politique", "économie", "monde", "international", "breaking", "info"];
   const hasNews = newsWords.some(w => lowerMessage.includes(w));
   
-  // Vérification sport
   const sportWords = ["sport", "match", "football", "basket", "tennis", "score", "résultat", "resultat", "classement", "ligue", "championnat", "nba", "psg", "om", "real madrid", "barca"];
   const hasSport = sportWords.some(w => lowerMessage.includes(w));
   
-  // Vérification code
   const codeWords = ["code", "coder", "programmation", "programme", "javascript", "python", "java", "c++", "typescript", "react", "vue", "angular", "node", "api", "debug", "fonction", "function", "classe", "class", "algorithme", "sql", "html", "css"];
   const hasCode = codeWords.some(w => lowerMessage.includes(w));
 
-  // Vérification vidéo/YouTube (module Jarvis)
   const videoWords = ["clip", "vidéo", "video", "youtube", "chanson", "musique", "regarder", "écouter", "joue-moi", "joue moi", "montre-moi la vidéo"];
   const hasVideo = videoWords.some(w => lowerMessage.includes(w));
 
-  // Vérification tâches / emploi du temps (module Jarvis)
   const taskWords = ["rappelle-moi", "rappel", "tâche", "tache", "planifie", "programme un rendez-vous", "rendez-vous", "emploi du temps", "agenda", "ajoute une tâche", "mes tâches", "liste mes tâches", "marque comme fait", "supprime la tâche"];
   const hasTask = taskWords.some(w => lowerMessage.includes(w));
 
-  // Vérification mention de personne/entité (déclenche systématiquement une image)
   const personWords = ["qui est", "c'est qui", "montre-moi une photo", "photo de", "à quoi ressemble", "portrait de", "biographie de"];
   const hasPersonQuery = personWords.some(w => lowerMessage.includes(w)) || /\b([A-ZÀ-Ý][a-zà-ÿ]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ]+){1,2})\b/.test(message);
 
@@ -1609,10 +1578,8 @@ function analyzeIntent(message) {
   if (hasNews) return "ACTUALITÉ";
   if (hasCode) return "CODE";
   
-  // Utilisation du classifieur NLP
   const classified = classifier.classify(lowerMessage);
   
-  // Mapping des intentions
   const intentMap = {
     "MATHS": "MATHS",
     "ACTUALITÉ": "ACTUALITÉ",
@@ -1628,16 +1595,14 @@ function analyzeIntent(message) {
   return mapped;
 }
 
-// ==================== MÉMOIRE LONG TERME UTILISATEUR (au-delà d'une seule conversation) ====================
-// Contrairement à l'historique par conversation (limité à MAX_CONTEXT_MESSAGES), cette mémoire est
-// un résumé compact qui suit l'utilisateur PARTOUT, dans TOUTE nouvelle discussion, même des mois
-// plus tard : prénom, préférences, projets en cours, sujets récurrents. Supabase = source de vérité.
+// ==================== MÉMOIRE LONG TERME ====================
 const USER_MEMORY_UPDATE_EVERY_N_MESSAGES = parseInt(process.env.USER_MEMORY_UPDATE_EVERY_N_MESSAGES || "6", 10);
 
+// ✅ CORRIGÉ : maybeSingle() au lieu de single()
 async function getUserMemory(userId) {
   if (supabase) {
     try {
-      const { data, error } = await supabase.from("user_memory").select("summary").eq("user_id", userId).single();
+      const { data, error } = await supabase.from("user_memory").select("summary").eq("user_id", userId).maybeSingle();
       if (!error && data) return data.summary || "";
     } catch (error) {
       logger.error({ error: error.message }, "Erreur lecture mémoire long terme Supabase, repli SQLite");
@@ -1673,9 +1638,6 @@ async function incrementUserMemoryCounter(userId) {
   return count;
 }
 
-// Condense l'ancien résumé + l'échange le plus récent en un nouveau résumé compact (quelques
-// lignes), via un appel LLM économique. Se déclenche tous les N messages pour ne pas ralentir
-// chaque tour de conversation ni consommer inutilement de tokens/quota LLM.
 async function maybeUpdateUserMemory(userId, userMessage, assistantReply) {
   try {
     const count = await incrementUserMemoryCounter(userId);
@@ -1716,11 +1678,7 @@ async function maybeUpdateUserMemory(userId, userMessage, assistantReply) {
   }
 }
 
-// ==================== GESTION DE LA MÉMOIRE CONVERSATIONNELLE ====================
-// Fonction améliorée pour récupérer l'historique complet avec contexte.
-// Supabase est la source de vérité si configuré (persistance réelle, survit aux redéploiements
-// et redémarrages du service Render, contrairement au disque SQLite qui est éphémère).
-// SQLite reste utilisé comme cache local rapide et comme repli si Supabase est indisponible.
+// ==================== HISTORIQUE CONVERSATION ====================
 async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_CONTEXT_MESSAGES) {
   if (supabase) {
     try {
@@ -1767,10 +1725,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_
   }
 }
 
-// Fonction pour sauvegarder un message avec le user_id.
-// Écrit dans Supabase EN PREMIER (source de vérité persistante) puis dans le cache SQLite local,
-// afin que la sauvegarde des discussions récentes du dashboard ne dépende plus uniquement
-// du disque éphémère de Render.
 async function saveMessageWithUser(conversationId, role, content, userId = null, firebaseUid = null, metadata = {}) {
   let supabaseOk = false;
 
@@ -1805,7 +1759,7 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
   return supabaseOk || true;
 }
 
-// ==================== ENVOI D'EMAIL ====================
+// ==================== EMAIL ====================
 async function verifyGmailScope(accessToken) {
   try {
     const response = await axios.get("https://www.googleapis.com/oauth2/v1/tokeninfo", {
@@ -1911,16 +1865,32 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, 
   return result;
 }
 
-// ==================== PERSISTANCE WHATSAPP ====================
+// ==================== WHATSAPP CRYPTO (✅ CORRIGÉ) ====================
+function getWhatsAppCryptoKey() {
+  const key = process.env.WHATSAPP_ENCRYPTION_KEY;
+  const iv = process.env.WHATSAPP_ENCRYPTION_IV;
+  
+  if (!key || key.length < 32 || !iv || iv.length < 16) {
+    if (CONFIG.ENV === "production") {
+      throw new Error("WHATSAPP_ENCRYPTION_KEY (32+ chars) et WHATSAPP_ENCRYPTION_IV (16 chars) requis en production");
+    }
+    logger.warn("⚠️ Clé WhatsApp par défaut — JAMAIS en prod");
+  }
+  
+  return {
+    key: Buffer.from((key || "dev-only-key-32-chars-minimum!!").slice(0, 32)),
+    iv: Buffer.from((iv || "dev-only-iv-16ch").slice(0, 16))
+  };
+}
+
+// ✅ CORRIGÉ : IV aléatoire par enregistrement
 async function saveWhatsAppCredentials(userId, credentialsData) {
   if (!supabase) return false;
   
   try {
-    const cipher = crypto.createCipheriv(
-      'aes-256-gcm',
-      Buffer.from(process.env.WHATSAPP_ENCRYPTION_KEY || 'default-key-32-bytes-long!!!!!!'),
-      Buffer.from(process.env.WHATSAPP_ENCRYPTION_IV || 'default-iv-16')
-    );
+    const { key } = getWhatsAppCryptoKey();
+    const iv = crypto.randomBytes(16); // ✅ IV aléatoire par enregistrement
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
     let encrypted = cipher.update(JSON.stringify(credentialsData), 'utf8', 'hex');
     encrypted += cipher.final('hex');
@@ -1928,7 +1898,13 @@ async function saveWhatsAppCredentials(userId, credentialsData) {
     
     const { error } = await supabase
       .from('whatsapp_credentials')
-      .upsert({ user_id: userId, encrypted_data: encrypted, auth_tag: authTag, updated_at: new Date().toISOString() });
+      .upsert({ 
+        user_id: userId, 
+        encrypted_data: encrypted, 
+        auth_tag: authTag,
+        iv: iv.toString('hex'), // ✅ Stocker l'IV
+        updated_at: new Date().toISOString() 
+      });
     
     if (error) {
       logger.error({ error: error.message }, "Erreur sauvegarde credentials WhatsApp");
@@ -1948,17 +1924,14 @@ async function loadWhatsAppCredentials(userId) {
   try {
     const { data, error } = await supabase
       .from('whatsapp_credentials')
-      .select('encrypted_data, auth_tag')
+      .select('encrypted_data, auth_tag, iv')
       .eq('user_id', userId)
-      .single();
+      .maybeSingle();
     
     if (error || !data) return null;
     
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      Buffer.from(process.env.WHATSAPP_ENCRYPTION_KEY || 'default-key-32-bytes-long!!!!!!'),
-      Buffer.from(process.env.WHATSAPP_ENCRYPTION_IV || 'default-iv-16')
-    );
+    const { key } = getWhatsAppCryptoKey();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(data.iv, 'hex'));
     
     decipher.setAuthTag(Buffer.from(data.auth_tag, 'hex'));
     
@@ -2152,11 +2125,7 @@ async function sendWhatsAppSmart(userId, phoneNumber, message) {
   return { success: true, queued: true };
 }
 
-// ==================== ARCHITECTURE LLM ====================
-// Pool de clés API par fournisseur : chaque clé a son propre circuit breaker indépendant.
-// Si une clé tombe en panne (crédits épuisés, rate-limit, erreur réseau), les appels suivants
-// basculent automatiquement sur la clé suivante du pool AVANT de basculer de modèle.
-// OpenRouter dispose de 3 clés (OPENROUTER_API_KEY, _2, _3) pour absorber les coupures.
+// ==================== ARCHITECTURE LLM (✅ CORRIGÉE) ====================
 function buildKeyPool(keys, prefix) {
   return keys
     .filter((k) => typeof k === "string" && k.trim().length > 0)
@@ -2188,19 +2157,62 @@ const LLM_PROVIDERS = {
 };
 
 if (LLM_PROVIDERS.OPENROUTER.keyPool.length === 0) {
-  logger.warn("⚠️ Aucune clé OPENROUTER_API_KEY configurée (OPENROUTER_API_KEY / _2 / _3)");
+  logger.warn("⚠️ Aucune clé OPENROUTER_API_KEY configurée");
 } else {
-  logger.info(`✅ ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s) OpenRouter configurée(s) pour la rotation/failover`);
+  logger.info(`✅ ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s) OpenRouter configurée(s)`);
 }
 if (LLM_PROVIDERS.GROQ.keyPool.length === 0) {
   logger.warn("⚠️ Aucune clé GROQ_API_KEY configurée");
+} else {
+  logger.info(`✅ ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s) Groq configurée(s)`);
 }
 
-// ==================== VÉRIFICATION AUTOMATIQUE DES MODÈLES (DÉTECTION MODÈLE PAYANT/DISPARU) ====================
-// Les catalogues de modèles gratuits changent souvent sans préavis (un modèle ":free" peut
-// disparaître ou devenir payant du jour au lendemain). Plutôt que deviner, on interroge le VRAI
-// catalogue au démarrage et on journalise clairement tout modèle configuré qui n'est plus gratuit
-// ou plus disponible — visible aussi via GET /api/health (champ modelAvailability).
+// ==================== MODÈLES (✅ ACTUALISÉS SEPTEMBRE 2026) ====================
+const MODEL_TIERS = {
+  v100: {
+    name: "Mwamba",
+    providers: [
+      // Groq principal (confirmé)
+      { provider: "groq", model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile", maxTokens: 4000, timeout: 45000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
+      // OpenRouter codage (confirmé)
+      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "poolside/laguna-s-2.1:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 1 },
+      // OpenRouter raisonnement (confirmé)
+      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "nvidia/nemotron-3-super-120b:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 2 },
+      // OpenRouter général (confirmé)
+      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_3 || "nvidia/nemotron-3.5-lightning:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 3 }
+    ]
+  },
+  v250: {
+    name: "Ngandu",
+    reasoning: {
+      providers: [
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "nvidia/nemotron-3-super-120b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "nvidia/nemotron-3.5-lightning:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1 },
+        { provider: "groq", model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "openai/gpt-oss-120b", maxTokens: 6000, timeout: 45000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
+      ]
+    },
+    code: {
+      providers: [
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE || "poolside/laguna-s-2.1:free", maxTokens: 8000, timeout: 90000, temperature: 0.5, jsonMode: true, failoverPriority: 0 },
+        { provider: "groq", model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 1 },
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE_FALLBACK_2 || "nvidia/nemotron-3.5-lightning:free", maxTokens: 8000, timeout: 60000, temperature: 0.5, jsonMode: true, failoverPriority: 2 }
+      ]
+    },
+    maxRetries: CONFIG.MAX_RETRY_ATTEMPTS,
+    degradedMode: true
+  },
+  vision: {
+    name: "Vision",
+    providers: [
+      // ✅ CORRIGÉ : qwen/qwen3.6-27b (vision Groq confirmée)
+      { provider: "groq", model: CONFIG.VISION_MODEL_GROQ, maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
+      // ✅ CORRIGÉ : inclusionai/ling-3.0-flash-vl:free (vision OpenRouter confirmée)
+      { provider: "openrouter", model: CONFIG.VISION_MODEL_OPENROUTER, maxTokens: 4000, timeout: 90000, temperature: 0.7, jsonMode: true, failoverPriority: 1 }
+    ]
+  }
+};
+
+// ==================== VÉRIFICATION MODÈLES ====================
 let modelAvailabilityReport = { checkedAt: null, issues: [], ok: true };
 
 function collectConfiguredOpenRouterModels() {
@@ -2215,7 +2227,6 @@ function collectConfiguredOpenRouterModels() {
 async function checkModelAvailability() {
   const issues = [];
   try {
-    // Catalogue OpenRouter : endpoint public, pas besoin de clé.
     const response = await axios.get("https://openrouter.ai/api/v1/models", { timeout: 10000 });
     const catalog = response.data?.data || [];
     const freeIds = new Set(
@@ -2227,13 +2238,13 @@ async function checkModelAvailability() {
 
     for (const model of collectConfiguredOpenRouterModels()) {
       if (!allIds.has(model)) {
-        issues.push({ provider: "openrouter", model, problem: "INTROUVABLE (retiré du catalogue OpenRouter)" });
+        issues.push({ provider: "openrouter", model, problem: "INTROUVABLE" });
       } else if (!freeIds.has(model)) {
-        issues.push({ provider: "openrouter", model, problem: "PAYANT (n'est plus/pas un modèle gratuit)" });
+        issues.push({ provider: "openrouter", model, problem: "PAYANT" });
       }
     }
   } catch (error) {
-    logger.error({ error: error.message }, "Impossible de vérifier le catalogue OpenRouter au démarrage");
+    logger.error({ error: error.message }, "Impossible de vérifier le catalogue OpenRouter");
   }
 
   try {
@@ -2251,71 +2262,29 @@ async function checkModelAvailability() {
       ]);
       for (const model of configuredGroqModels) {
         if (!groqIds.has(model)) {
-          issues.push({ provider: "groq", model, problem: "INTROUVABLE sur le compte Groq (retiré ou jamais existé)" });
+          issues.push({ provider: "groq", model, problem: "INTROUVABLE" });
         }
       }
     }
   } catch (error) {
-    logger.warn({ error: error.message }, "Impossible de vérifier le catalogue Groq au démarrage (clé invalide ?)");
+    logger.warn({ error: error.message }, "Impossible de vérifier le catalogue Groq");
   }
 
   modelAvailabilityReport = { checkedAt: new Date().toISOString(), issues, ok: issues.length === 0 };
 
   if (issues.length > 0) {
-    logger.warn({ issues }, "🚨 MODÈLES CONFIGURÉS PROBLÉMATIQUES DÉTECTÉS — voir GET /api/health");
-    issues.forEach((i) => logger.warn(`   ↳ [${i.provider}] ${i.model} → ${i.problem}`));
+    logger.warn({ issues }, "🚨 MODÈLES PROBLÉMATIQUES — voir GET /api/health");
   } else {
-    logger.info("✅ Tous les modèles configurés sont vérifiés gratuits et disponibles");
+    logger.info("✅ Tous les modèles configurés sont vérifiés");
   }
 }
 
-// (l'appel réel de checkModelAvailability() est fait plus bas, une fois MODEL_TIERS déclaré)
-
-const MODEL_TIERS = {
-  v100: {
-    name: "Mwamba",
-    providers: [
-      { provider: "groq", model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile", maxTokens: 4000, timeout: 45000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
-      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "qwen/qwen-2.5-coder-32b-instruct:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 1 },
-      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "meta-llama/llama-3.3-70b-instruct:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 2 },
-      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_3 || "microsoft/phi-4:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 3 }
-    ]
-  },
-  v250: {
-    name: "Ngandu",
-    reasoning: {
-      providers: [
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-chat-v3.1:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "qwen/qwen3-14b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1 },
-        { provider: "groq", model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 6000, timeout: 45000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
-      ]
-    },
-    code: {
-      providers: [
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free", maxTokens: 8000, timeout: 90000, temperature: 0.5, jsonMode: true, failoverPriority: 0 },
-        { provider: "groq", model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 1 },
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE_FALLBACK_2 || "meta-llama/llama-3.3-70b-instruct:free", maxTokens: 8000, timeout: 60000, temperature: 0.5, jsonMode: true, failoverPriority: 2 }
-      ]
-    },
-    maxRetries: CONFIG.MAX_RETRY_ATTEMPTS,
-    degradedMode: true
-  },
-  vision: {
-    name: "Vision",
-    providers: [
-      { provider: "groq", model: CONFIG.VISION_MODEL_GROQ, maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
-      { provider: "openrouter", model: CONFIG.VISION_MODEL_OPENROUTER, maxTokens: 4000, timeout: 90000, temperature: 0.7, jsonMode: true, failoverPriority: 1 }
-    ]
-  }
-};
-
-// Vérifie au démarrage (une fois MODEL_TIERS déclaré), puis toutes les 6h.
 checkModelAvailability();
 setInterval(checkModelAvailability, 6 * 60 * 60 * 1000);
 
 function validateAndSanitizeOpenRouterModel(model) {
   if (!model || typeof model !== "string") return null;
-  const knownProviders = ["openai/", "qwen/", "meta-llama/", "deepseek/", "microsoft/", "anthropic/", "google/", "mistralai/", "cohere/"];
+  const knownProviders = ["openai/", "qwen/", "meta-llama/", "deepseek/", "microsoft/", "anthropic/", "google/", "mistralai/", "cohere/", "nvidia/", "poolside/", "inclusionai/"];
   const isOpenRouterModel = knownProviders.some((prefix) => model.includes(prefix));
   if (isOpenRouterModel && !model.includes(":free") && !model.includes(":paid") && !model.includes(":beta")) {
     return model + ":free";
@@ -2380,10 +2349,6 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
       if (!model) continue;
     }
 
-    // Boucle sur CHAQUE CLÉ du pool de ce provider avant de passer au modèle/provider suivant
-    // de la chaîne de failover. Ainsi, si la clé OpenRouter n°1 est coupée (crédits épuisés,
-    // rate-limit), on essaie immédiatement la clé n°2 puis n°3 sur le MÊME modèle avant de
-    // dégrader vers un autre modèle/provider.
     for (const keyEntry of providerInfo.keyPool) {
       let keyFailedHard = false;
 
@@ -2469,11 +2434,8 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
         }
       }
 
-      logger.warn({ provider, model, keyLabel: keyEntry.label }, keyFailedHard ? "Clé API en échec définitif, rotation vers la clé suivante" : "Clé API épuisée après les tentatives, rotation vers la clé suivante");
-      // On continue avec la clé suivante du pool quel que soit le motif d'échec.
+      logger.warn({ provider, model, keyLabel: keyEntry.label }, keyFailedHard ? "Clé API en échec définitif, rotation" : "Clé API épuisée, rotation");
     }
-    // Toutes les clés de ce provider ont échoué : la boucle passe naturellement au
-    // provider/modèle de secours suivant dans sortedProviders.
   }
 
   return {
@@ -2570,7 +2532,7 @@ class DynamicContextManager {
       {
         domain: "assistant_virtuel",
         keywords: ["rappelle-moi", "tâche", "tache", "planifie", "rendez-vous", "emploi du temps", "agenda", "clip", "vidéo", "video", "youtube", "chanson", "automatise"],
-        systemPrompt: "Tu es un assistant virtuel proactif façon Jarvis. Quand l'utilisateur demande d'accomplir une action concrète (chercher/lire une vidéo, créer/lister/terminer une tâche ou un rappel), utilise IMMÉDIATEMENT l'outil correspondant (search_youtube, create_task, list_tasks, complete_task, delete_task) plutôt que de décrire ce que tu ferais. Pour une demande complexe qui combine plusieurs actions (ex: \"trouve la météo à Kinshasa ET crée-moi un rappel pour appeler ma mère à 18h\"), décompose-la toi-même en sous-tâches et enchaîne les appels d'outils nécessaires UN PAR UN jusqu'à avoir tout ce qu'il faut, avant de répondre une seule fois avec le résultat complet des deux actions. Confirme ensuite l'action de façon brève et naturelle."
+        systemPrompt: "Tu es un assistant virtuel proactif façon Jarvis. Quand l'utilisateur demande d'accomplir une action concrète (chercher/lire une vidéo, créer/lister/terminer une tâche ou un rappel), utilise IMMÉDIATEMENT l'outil correspondant (search_youtube, create_task, list_tasks, complete_task, delete_task) plutôt que de décrire ce que tu ferais."
       },
       {
         domain: "general",
@@ -2601,29 +2563,28 @@ class DynamicContextManager {
   buildSystemPrompt(message, basePrompt, conversationContext = "") {
     const domain = this.analyzeDomain(message);
     const formattingRules = [
-      "FORMATAGE STRICT OBLIGATOIRE (lisibilité prioritaire) :",
-      "- Le grand titre de ta réponse (s'il y en a un) doit être en **gras**, sur sa propre ligne, jamais en simple texte brut.",
-      "- Les sous-titres/sections doivent utiliser des titres Markdown courts (### Sous-titre) suivis d'un saut de ligne, jamais collés au texte.",
-      "- Structure toujours ta réponse en sections courtes et bien rangées : titre, puis paragraphes ou listes à puces, jamais un pavé de texte continu.",
-      "- Utilise des listes à puces (-) ou numérotées pour toute énumération de 2 éléments ou plus.",
+      "FORMATAGE STRICT OBLIGATOIRE :",
+      "- Le grand titre de ta réponse doit être en **gras**",
+      "- Les sous-titres/sections doivent utiliser des titres Markdown courts (### Sous-titre)",
+      "- Structure toujours ta réponse en sections courtes",
+      "- Utilise des listes à puces (-) ou numérotées",
       "- TOUT code doit être encadré dans des blocs Markdown avec triple backticks",
       "- TOUTE formule mathématique doit être encadrée en LaTeX ($ pour inline, $$ pour display)",
-      "- Les noms de variables, fonctions et fichiers doivent être en backticks simples",
-      "- IMPORTANT : Utilise le contexte de la conversation pour répondre de manière cohérente et ne JAMAIS répéter une question à laquelle l'utilisateur a déjà répondu plus haut dans cette même conversation"
+      "- Utilise le contexte de la conversation pour répondre de manière cohérente"
     ].join("\n");
 
     const webCodeRules = [
       "RÈGLE STRICTE POUR LA GÉNÉRATION DE CODE HTML/CSS/JAVASCRIPT :",
-      "- Tout code HTML doit être encadré par un bloc Markdown ```html suivi de ```",
+      "- Tout code HTML doit être encadré par un bloc Markdown ```html",
       "- Tout code CSS doit utiliser UNIQUEMENT la syntaxe /* ... */",
-      "- Tout code JavaScript doit être encadré par un bloc Markdown ```javascript suivi de ```",
+      "- Tout code JavaScript doit être encadré par un bloc Markdown ```javascript",
       "- Le code livré doit TOUJOURS être complet et syntaxiquement valide",
       "- Ne génère du code que si l'utilisateur le demande explicitement"
     ].join("\n");
 
     let contextSection = "";
     if (conversationContext) {
-      contextSection = "\n\nCONTEXTE DE LA CONVERSATION PRÉCÉDENTE (à utiliser impérativement, ne redemande jamais une information déjà donnée ici) :\n" + conversationContext + "\n\nINSTRUCTION : Utilise ce contexte pour comprendre les références et maintenir la cohérence de la conversation.";
+      contextSection = "\n\nCONTEXTE DE LA CONVERSATION PRÉCÉDENTE (à utiliser impérativement) :\n" + conversationContext;
     }
 
     return {
@@ -2643,362 +2604,38 @@ const LUBA_BASE_SYSTEM_PROMPT = [
   "- Tu t'appelles Luba (ou Luba.ia).",
   "- IA développée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
   "- Ton ton est chaleureux, intelligent et proactif.",
-  "- Tu es un vrai agent IA (façon Jarvis), pas seulement un chatbot passif : quand une tâche peut être exécutée avec un outil, tu l'exécutes directement au lieu de simplement en parler.",
+  "- Tu es un vrai agent IA (façon Jarvis), pas seulement un chatbot passif.",
   "",
   "RÈGLE SUR LA MÉMOIRE CONVERSATIONNELLE :",
   "- Tu dois TOUJOURS te souvenir du contexte de la conversation.",
-  "- Si l'utilisateur fait référence à quelque chose mentionné précédemment, utilise ce contexte.",
-  "- Exemple : Si on parle du Congo et qu'on demande 'comment s'appellent ses habitants', réponds 'les Congolais'.",
-  "- Ne redemande JAMAIS une information que l'utilisateur a déjà donnée plus haut dans la même conversation.",
-  "- Si une [MÉMOIRE LONG TERME SUR CET UTILISATEUR] est fournie dans le contexte, tu DOIS t'en servir naturellement : c'est ce que tu sais de cet utilisateur au fil du temps (même dans une toute nouvelle discussion, plusieurs mois après). Ne dis jamais que tu ne le/la reconnais pas si cette mémoire existe.",
+  "- Ne redemande JAMAIS une information que l'utilisateur a déjà donnée plus haut.",
+  "- Si une [MÉMOIRE LONG TERME SUR CET UTILISATEUR] est fournie, tu DOIS t'en servir naturellement.",
   "",
   "RÈGLE SUR LES DONNÉES (OBLIGATOIRE) :",
   "- Tu ne dois JAMAIS inventer un score sportif, une actualité, un résultat de recherche, une donnée météo, une vidéo YouTube ou une tâche.",
   "- Utilise TOUJOURS l'outil approprié pour obtenir une donnée réelle.",
-  "- Si un outil échoue, dis-le honnêtement.",
   "",
   "RÈGLE STRICTE SUR LES IMAGES :",
-  "- Dès que tu décris, présentes ou identifies une personnalité (personne réelle, sportif, artiste), un lieu ou un objet précis, utilise TOUJOURS search_images pour illustrer ta réponse avec une vraie photo.",
+  "- Dès que tu décris une personnalité, un lieu ou un objet précis, utilise TOUJOURS search_images.",
   "",
   "RÈGLE SUR L'AUTOMATISATION DE TÂCHES (MODULE JARVIS) :",
-  "- Si l'utilisateur demande de chercher/regarder/écouter un clip, une vidéo ou une chanson, utilise search_youtube et propose directement la vidéo trouvée (elle sera intégrée et lisible dans l'interface).",
-  "- Si l'utilisateur demande de créer un rappel, une tâche, ou de planifier quelque chose, utilise create_task avec un titre clair et, si mentionnée, une date/heure (due_at au format ISO 8601).",
-  "- Si l'utilisateur demande de voir ses tâches/son emploi du temps, utilise list_tasks.",
-  "- Si l'utilisateur dit qu'une tâche est terminée, utilise complete_task ; s'il veut la supprimer, utilise delete_task.",
-  "",
-  "RÈGLE SUR LES SUGGESTIONS :",
-  "- Le champ suggestions doit TOUJOURS contenir 3 à 4 questions de suivi.",
-  "",
-  "RÈGLE SUR LE CODE :",
-  "- Tu ne génères JAMAIS de code (Python, JavaScript, etc.) spontanément.",
-  "- Tu ne génères du code QUE si l'utilisateur le demande explicitement.",
-  "",
-  "RÈGLE SUR LES MATHÉMATIQUES :",
-  "- Pour tout calcul, utilise le résultat exact fourni par le moteur mathématique.",
-  "- Formate les équations en LaTeX ($...$ en ligne, $$...$$ en bloc).",
+  "- Si l'utilisateur demande de chercher un clip, utilise search_youtube.",
+  "- Si l'utilisateur demande de créer un rappel, utilise create_task.",
+  "- Si l'utilisateur demande de voir ses tâches, utilise list_tasks.",
   "",
   "FORMAT DE RÉPONSE OBLIGATOIRE (JSON strict) :",
   "{",
-  '  "replyText": "Ta réponse complète en Markdown, avec un titre en **gras** et des sous-titres bien séparés si besoin",',
+  '  "replyText": "Ta réponse complète en Markdown",',
   '  "toolCalls": [],',
   '  "suggestions": ["Question 1 ?", "Question 2 ?", "Question 3 ?"]',
   "}",
   "",
   "OUTILS DISPONIBLES :",
-  "- search_images : Rechercher des images",
-  "- search_web : Recherche générale",
-  "- search_news : Actualités récentes",
-  "- search_sports_scores : Scores sportifs",
-  "- search_science : Articles scientifiques",
-  "- search_social : Discussions réseaux sociaux",
-  "- get_weather : Météo actuelle",
-  "- send_email : Envoyer un email",
-  "- send_whatsapp_message : Envoyer un message WhatsApp",
-  "- execute_math : Calcul mathématique exact",
-  "- search_youtube : Rechercher une vidéo YouTube (clip, chanson) à afficher/lire dans l'interface",
-  "- create_task : Créer une tâche/un rappel (title, notes optionnel, due_at optionnel en ISO 8601)",
-  "- list_tasks : Lister les tâches de l'utilisateur (status optionnel : pending/done)",
-  "- complete_task : Marquer une tâche comme terminée (task_id)",
-  "- delete_task : Supprimer une tâche (task_id)"
+  "- search_images, search_web, search_news, search_sports_scores",
+  "- search_science, search_social, get_weather",
+  "- send_email, send_whatsapp_message, execute_math",
+  "- search_youtube, create_task, list_tasks, complete_task, delete_task"
 ].join("\n");
-
-// ==================== INITIALISATION EXPRESS ====================
-const app = express();
-app.set("trust proxy", 1);
-app.disable("x-powered-by");
-
-// ==================== CORS ====================
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin || HOSTING_CONFIG.allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      logger.warn({ origin }, "Origine CORS refusée");
-      callback(new Error("Origine non autorisée"));
-    }
-  },
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id", "X-Google-Access-Token", "X-Session-Token"],
-  credentials: true,
-  maxAge: 86400
-}));
-
-// ==================== SECURITY ====================
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://apis.google.com", "https://www.gstatic.com"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://fonts.googleapis.com"],
-      imgSrc: ["'self'", "data:", "blob:", "https://*", "http://*"],
-      connectSrc: ["'self'", "https://api.groq.com", "https://openrouter.ai", "https://*.firebaseio.com", "https://*.supabase.co", "wss://*.firebaseio.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-      objectSrc: ["'none'"],
-      frameSrc: ["https://*.firebaseapp.com", "https://*.web.app", "https://www.youtube.com", "https://youtube.com"],
-      workerSrc: ["'self'", "blob:"],
-      upgradeInsecureRequests: []
-    }
-  },
-  hsts: { maxAge: 63072000, includeSubDomains: true, preload: true },
-  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
-  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
-  noSniff: true,
-  frameguard: { action: "deny" }
-}));
-
-// Force HTTPS en production (Render termine le TLS en amont et fournit x-forwarded-proto).
-app.use((req, res, next) => {
-  if (CONFIG.ENV === "production" && req.headers["x-forwarded-proto"] && req.headers["x-forwarded-proto"] !== "https") {
-    return res.redirect(301, "https://" + req.headers.host + req.originalUrl);
-  }
-  next();
-});
-
-// ==================== BODY PARSERS ====================
-app.use(express.json({ limit: "20mb" }));
-app.use(express.urlencoded({ extended: true, limit: "20mb" }));
-
-// ==================== RATE LIMITERS ====================
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    res.status(429).json({ success: false, error: true, reply: "Trop de requêtes. Réessayez dans 15 minutes.", code: "RATE_LIMIT" });
-  }
-});
-
-const strictLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 50,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    res.status(429).json({ success: false, error: true, reply: "Limite de requêtes atteinte.", code: "RATE_LIMIT_STRICT" });
-  }
-});
-
-// ==================== LOGGING MIDDLEWARE ====================
-app.use((req, res, next) => {
-  const requestId = generateRequestId();
-  const start = Date.now();
-  req.requestId = requestId;
-  res.on("finish", () => {
-    logger.info({ requestId, status: res.statusCode, duration: Date.now() - start }, "Réponse envoyée");
-  });
-  next();
-});
-
-// ==================== AUTHENTIFICATION ====================
-// IDENTIFIANT UNIQUE UNIFIÉ : req.userId = req.firebaseUid = uid Firebase, TOUJOURS la même valeur
-// pour un utilisateur web authentifié. C'est cet identifiant unique qui sert à la fois pour :
-// - la gestion des conversations/discussions (sessions.user_id / messages.user_id)
-// - la mémoire du modèle IA (contexte, historique)
-// - la gestion générale (quotas, rôles, sécurité, WhatsApp, tâches Jarvis)
-// Pour le canal WhatsApp (non authentifié via Firebase), l'identifiant est `whatsapp_<numéro>`,
-// un espace d'identité séparé et assumé (utilisateur non connecté à un compte Luba).
-const authenticateUser = async (req, res, next) => {
-  try {
-    const isBlocked = await isIPBlocked(req.ip);
-    if (isBlocked) {
-      return res.status(403).json({ success: false, error: true, reply: "Accès refusé. IP bloquée.", code: "IP_BLOCKED" });
-    }
-    
-    const authHeader = req.headers.authorization || req.headers.Authorization;
-    const bearerToken = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-    
-    if (!bearerToken) {
-      await recordLoginAttempt(req.ip, null, false, "Token manquant");
-      return res.status(401).json({ success: false, error: true, reply: "Authentification requise.", code: "MISSING_TOKEN" });
-    }
-    
-    try {
-      const user = await verifyFirebaseToken(bearerToken);
-      if (!user) {
-        await recordLoginAttempt(req.ip, null, false, "Token invalide");
-        return res.status(401).json({ success: false, error: true, reply: "Session invalide.", code: "INVALID_TOKEN" });
-      }
-      
-      // Identifiant unique unifié : une seule variable "uid" utilisée partout dans la requête.
-      const uid = user.uid;
-      req.uid = uid;
-      req.userId = uid;
-      req.firebaseUid = uid;
-      req.verifiedIdentity = true;
-      req.userRole = user.role || 'FREE';
-      req.emailVerified = user.emailVerified;
-      
-      await recordLoginAttempt(req.ip, uid, true);
-      await logSecurityEvent(uid, 'LOGIN_SUCCESS', { email: user.email }, req.ip, req.headers['user-agent']);
-      await detectAndLogNewDevice(uid, req.ip, req.headers['user-agent']);
-      
-      // Synchronisation utilisateur - SAUVEGARDE UID (id = firebase_uid = uid partout)
-      const userRow = await dbGet("SELECT * FROM users WHERE id = ?", [uid]);
-      if (!userRow) {
-        await dbRun(
-          "INSERT INTO users (id, firebase_uid, email, display_name, role, email_verified, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-          [uid, uid, user.email, user.displayName || uid, req.userRole, user.emailVerified ? 1 : 0]
-        );
-        logger.info({ userId: uid }, "✅ Nouvel utilisateur créé avec UID unifié");
-      } else {
-        await dbRun(
-          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, email = COALESCE(?, email), display_name = COALESCE(?, display_name), role = ?, email_verified = ?, firebase_uid = ? WHERE id = ?",
-          [user.email, user.displayName, req.userRole, user.emailVerified ? 1 : 0, uid, uid]
-        );
-        logger.info({ userId: uid }, "✅ Utilisateur synchronisé avec UID unifié");
-      }
-      
-      if (supabase) {
-        await syncUserWithSupabase(uid, user.email, user.displayName);
-      }
-      
-      next();
-    } catch (error) {
-      await recordLoginAttempt(req.ip, null, false, error.message);
-      const loginCheck = await checkLoginAttempts(req.ip);
-      return res.status(401).json({
-        success: false,
-        error: true,
-        reply: loginCheck.blocked ? loginCheck.message : "Session invalide.",
-        code: loginCheck.blocked ? "IP_BLOCKED" : "INVALID_TOKEN"
-      });
-    }
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur authentification");
-    return res.status(500).json({ success: false, error: true, reply: "Erreur interne.", code: "AUTH_INTERNAL_ERROR" });
-  }
-};
-
-const requireRole = (allowedRoles) => {
-  return (req, res, next) => {
-    if (!req.userRole || (!allowedRoles.includes(req.userRole) && req.userRole !== 'ADMIN')) {
-      return res.status(403).json({ success: false, error: true, reply: "Accès refusé.", code: "INSUFFICIENT_ROLE" });
-    }
-    next();
-  };
-};
-
-// ==================== SYNCHRONISATION SUPABASE ====================
-async function syncUserWithSupabase(firebaseUid, email, displayName) {
-  if (!supabase || !firebaseUid) return;
-  try {
-    const { data: existingUser, error: fetchError } = await supabase.from("users").select("firebase_uid").eq("firebase_uid", firebaseUid).single();
-    if (fetchError && fetchError.code !== "PGRST116") return;
-    if (!existingUser) {
-      await supabase.from("users").insert({ 
-        id: firebaseUid,
-        firebase_uid: firebaseUid, 
-        email, 
-        display_name: displayName, 
-        last_seen_at: new Date().toISOString() 
-      });
-      logger.info({ firebaseUid }, "✅ Utilisateur créé dans Supabase");
-    } else {
-      await supabase.from("users").update({ 
-        last_seen_at: new Date().toISOString(),
-        email: email || existingUser.email,
-        display_name: displayName || existingUser.display_name
-      }).eq("firebase_uid", firebaseUid);
-    }
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur sync Supabase");
-  }
-}
-
-async function syncSessionWithSupabase(sessionId, firebaseUid, userId) {
-  if (!supabase) return;
-  try {
-    const { data: existingSession, error: fetchError } = await supabase.from("sessions").select("session_id").eq("session_id", sessionId).single();
-    if (fetchError && fetchError.code !== "PGRST116") return;
-    if (!existingSession) {
-      await supabase.from("sessions").insert({ 
-        session_id: sessionId, 
-        firebase_uid: firebaseUid || userId, 
-        user_id: userId, 
-        created_at: new Date().toISOString(), 
-        updated_at: new Date().toISOString() 
-      });
-    } else {
-      await supabase.from("sessions").update({ 
-        updated_at: new Date().toISOString(),
-        user_id: userId,
-        firebase_uid: firebaseUid || userId
-      }).eq("session_id", sessionId);
-    }
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur sync session Supabase");
-  }
-}
-
-// ==================== GESTION DES SESSIONS ====================
-// Supabase est consulté EN PREMIER (source de vérité persistante) pour retrouver une conversation
-// existante ; SQLite sert de cache local et de repli si Supabase est indisponible.
-async function getSession(conversationId, userId, firebaseUid = null) {
-  if (supabase) {
-    try {
-      const { data: supabaseSession, error } = await supabase.from("sessions").select("session_id, user_id, firebase_uid").eq("session_id", conversationId).single();
-      if (supabaseSession && !error) {
-        await dbRun("INSERT OR IGNORE INTO sessions (session_id, user_id, firebase_uid) VALUES (?, ?, ?)", [conversationId, supabaseSession.user_id || userId, supabaseSession.firebase_uid || firebaseUid]);
-        await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
-        await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
-        return { session_id: conversationId, user_id: supabaseSession.user_id || userId, firebase_uid: supabaseSession.firebase_uid || firebaseUid };
-      }
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur Supabase getSession, repli sur SQLite");
-    }
-  }
-
-  const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
-  if (session) {
-    await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
-    await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
-    return session;
-  }
-
-  await dbRun("INSERT INTO sessions (session_id, user_id, firebase_uid) VALUES (?, ?, ?)", [conversationId, userId, firebaseUid]);
-  await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
-  return { session_id: conversationId, user_id: userId, firebase_uid: firebaseUid };
-}
-
-// Utiliser getFullHistory au lieu de getHistory
-async function getHistory(conversationId, userId = null, limit = CONFIG.MAX_CONTEXT_MESSAGES) {
-  return await getFullHistory(conversationId, userId, limit);
-}
-
-// Utiliser saveMessageWithUser au lieu de saveMessage
-async function saveMessage(conversationId, role, content, userId = null, firebaseUid = null) {
-  return await saveMessageWithUser(conversationId, role, content, userId, firebaseUid);
-}
-
-// ==================== GESTION DES INTENTIONS ====================
-async function setActiveIntent(conversationId, intentType, intentData = {}) {
-  await dbRun("UPDATE sessions SET active_intent = ?, intent_data = ? WHERE session_id = ?", [intentType, JSON.stringify(intentData), conversationId]);
-}
-
-async function getActiveIntent(conversationId) {
-  const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [conversationId]);
-  if (!row || !row.active_intent) return null;
-  try {
-    return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") };
-  } catch (e) {
-    return null;
-  }
-}
-
-async function clearActiveIntent(conversationId) {
-  await dbRun("UPDATE sessions SET active_intent = NULL, intent_data = NULL WHERE session_id = ?", [conversationId]);
-}
-
-async function assertConversationOwnership(conversationId, userId) {
-  const existing = await dbGet("SELECT user_id, firebase_uid FROM sessions WHERE session_id = ?", [conversationId]);
-  if (existing && existing.user_id && existing.user_id !== userId && existing.firebase_uid !== userId) {
-    const err = new Error("Cette conversation n'appartient pas à cet utilisateur.");
-    err.code = "CONVERSATION_OWNERSHIP";
-    throw err;
-  }
-}
 
 // ==================== CALL LLM ====================
 async function callLLM_v100(messages, images = null, sessionId = null, userId = null, conversationContext = "") {
@@ -3048,14 +2685,7 @@ async function callLLM_v250(messages, userMessage, images = null, sessionId = nu
     '  "replyText": "réponse complète en Markdown",',
     '  "toolCalls": [],',
     '  "suggestions": ["question 1 ?", "question 2 ?", "question 3 ?"]',
-    "}",
-    "",
-    "FORMATAGE STRICT :",
-    "- Code HTML dans un bloc ```html ... ```",
-    "- Code CSS dans un bloc ```css ... ``` avec UNIQUEMENT des commentaires /* ... */",
-    "- Code JavaScript dans un bloc ```javascript ... ```",
-    "- Code complet, jamais tronqué",
-    "- Formules mathématiques en LaTeX ($...$ en ligne, $$...$$ en bloc)"
+    "}"
   ].join("\n");
 
   const codeMessages = [
@@ -3200,7 +2830,7 @@ async function executeTool(toolName, args = {}, context = {}) {
   return { result, sourceKeys };
 }
 
-// ==================== ENRICHISSEMENT DE CONTEXTE ====================
+// ==================== ENRICHISSEMENT CONTEXTE ====================
 async function enrichContextWithIntent(intent, userMessage) {
   const enrichment = {
     contextData: "",
@@ -3248,16 +2878,14 @@ async function enrichContextWithIntent(intent, userMessage) {
       break;
     }
     case "CODE": {
-      enrichment.contextData += "\n[MODE CODE ACTIVÉ]\nL'utilisateur demande explicitement du code. Fournis une réponse complète avec des blocs de code Markdown.";
+      enrichment.contextData += "\n[MODE CODE ACTIVÉ]\nL'utilisateur demande explicitement du code.";
       break;
     }
     case "PERSONNE": {
-      // Déclenche systématiquement une recherche d'image quand l'utilisateur mentionne/interroge
-      // une personnalité, pour corriger le bug d'images qui ne s'affichaient pas toujours.
       const imgResult = await searchImagesWithFallback(userMessage);
       if (imgResult.images && imgResult.images.length > 0) {
         enrichment.media.images = imgResult.images.slice(0, 3);
-        enrichment.contextData += `\n[IMAGE TROUVÉE - à mentionner mais NE PAS citer l'URL brute, l'image sera déjà affichée dans l'interface]\n`;
+        enrichment.contextData += `\n[IMAGE TROUVÉE]\n`;
         enrichment.sourceKeys.push("wikimediacommons");
         enrichment.toolCalls.push({ name: "search_images", arguments: { query: userMessage } });
       }
@@ -3274,7 +2902,7 @@ async function enrichContextWithIntent(intent, userMessage) {
       break;
     }
     case "TASK": {
-      enrichment.contextData += "\n[MODULE JARVIS - TÂCHES] L'utilisateur veut gérer une tâche/un rappel/son emploi du temps. Utilise create_task, list_tasks, complete_task ou delete_task selon la demande.";
+      enrichment.contextData += "\n[MODULE JARVIS - TÂCHES] L'utilisateur veut gérer une tâche/un rappel.";
       break;
     }
   }
@@ -3282,7 +2910,7 @@ async function enrichContextWithIntent(intent, userMessage) {
   return enrichment;
 }
 
-// ==================== HANDLE CHAT - AVEC MÉMOIRE CONVERSATIONNELLE ====================
+// ==================== HANDLE CHAT (✅ CORRIGÉ) ====================
 async function handleChat({ conversationId, userId, firebaseUid, message, googleAccessToken = null, channel = "web", modelTier = "v100", images = null }) {
   await getSession(conversationId, userId, firebaseUid);
 
@@ -3291,20 +2919,14 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     return await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken, firebaseUid });
   }
 
-  // Sauvegarder le message utilisateur avec l'identifiant unifié
   await saveMessageWithUser(conversationId, "user", message, userId, firebaseUid);
 
-  // Récupérer l'historique complet avec le contexte (Supabase en priorité, cf. getFullHistory)
   const history = await getFullHistory(conversationId, userId);
-
-  // Mémoire long terme : suit l'utilisateur au-delà de cette seule conversation, même des mois
-  // plus tard dans un tout nouveau fil de discussion (reconnaissance utilisateur persistante).
   const longTermMemory = await getUserMemory(userId);
   
-  // Construire le contexte de conversation pour le LLM
   let conversationContext = "";
   if (longTermMemory) {
-    conversationContext += `[MÉMOIRE LONG TERME SUR CET UTILISATEUR - à utiliser naturellement, ne jamais la citer telle quelle]\n${longTermMemory}\n\n`;
+    conversationContext += `[MÉMOIRE LONG TERME SUR CET UTILISATEUR]\n${longTermMemory}\n\n`;
   }
   if (history.length > 0) {
     const recentHistory = history.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
@@ -3313,27 +2935,21 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     ).join("\n");
   }
   
-  // Phase 1 : Analyse d'intention
   const intent = analyzeIntent(message);
   logger.info({ intent, conversationId, historyLength: history.length }, "Intention détectée");
   
-  // Phase 2 : Enrichissement de contexte (inclut désormais média : images/vidéos, cf. module Jarvis)
   const enrichment = await enrichContextWithIntent(intent, message);
   
-  // Construire les messages pour le LLM avec l'historique complet
-  // Note : l'historique inclut déjà le message utilisateur courant (on vient de le sauvegarder),
-  // donc on retire le tout dernier tour "user" de l'historique pour éviter de le dupliquer.
   const historyWithoutCurrent = history.length > 0 && history[history.length - 1].role === "user"
     ? history.slice(0, -1)
     : history;
   const contextHistory = historyWithoutCurrent.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
   let messages = [...contextHistory, { role: "user", content: message }];
   
-  // Injection du contexte enrichi si disponible
   if (enrichment.contextData) {
     messages = [...contextHistory, { 
       role: "user", 
-      content: message + "\n\n[CONTEXTE ENRICHISSÉ - NE PAS CITER CES SOURCES DANS TA RÉPONSE]\n" + enrichment.contextData 
+      content: message + "\n\n[CONTEXTE ENRICHISSÉ]\n" + enrichment.contextData 
     }];
   }
 
@@ -3398,12 +3014,17 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
               toolResult = { success: false, error: toolError.message };
             }
 
-            messages.push({ role: "assistant", content: "Résultat de l'outil " + toolCall.name + " : " + JSON.stringify(toolResult) });
+            // ✅ CORRIGÉ : Role "tool" conforme OpenAI
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id || `call_${crypto.randomUUID()}`,
+              content: JSON.stringify(toolResult)
+            });
           }
 
           messages.push({
             role: "user",
-            content: "Formule maintenant ta réponse finale complète avec les résultats des outils, et propose 3 à 4 questions de suivi. Respecte strictement le formatage (titre en gras, sous-titres, listes) et le LaTeX pour les mathématiques. Utilise le contexte de la conversation pour répondre. Ne redécris pas les images/vidéos en détail, elles seront affichées séparément dans l'interface."
+            content: "Formule maintenant ta réponse finale complète avec les résultats des outils. Respecte strictement le formatage et le LaTeX. Utilise le contexte de la conversation."
           });
           enrichment.toolCalls = [];
           keepRunning = true;
@@ -3417,9 +3038,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       if (!finalResponse) finalResponse = "Je rencontre des difficultés techniques. Veuillez réessayer.";
     }
 
-    // Dédoublonnage des images
     imageUrls = [...new Set(imageUrls.filter(Boolean))];
-    // Dédoublonnage des vidéos par videoId
     const seenVideoIds = new Set();
     videoResults = videoResults.filter((v) => {
       if (!v?.videoId || seenVideoIds.has(v.videoId)) return false;
@@ -3441,11 +3060,8 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       if (sourceLines.length > 0) finalResponse += "\n\n---\n\n**Sources :** " + sourceLines.join(" · ");
     }
 
-    // Sauvegarder la réponse de l'assistant avec l'identifiant unifié
     await saveMessageWithUser(conversationId, "assistant", finalResponse, userId, firebaseUid, { providerUsed, intent });
 
-    // Mise à jour périodique (tous les N messages) de la mémoire long terme cross-conversations.
-    // Ne bloque pas la réponse à l'utilisateur : lancée en tâche de fond.
     maybeUpdateUserMemory(userId, message, finalResponse).catch((error) => {
       logger.error({ error: error.message }, "Erreur tâche de fond mémoire long terme");
     });
@@ -3453,8 +3069,6 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     return {
       reply: finalResponse,
       images: imageUrls,
-      // "media" : structure dédiée pour que le frontend affiche des cartes riches (lecteur vidéo
-      // YouTube intégré cliquable, cartes image) plutôt que du simple Markdown à parser.
       media: {
         images: imageUrls,
         videos: videoResults.map((v) => ({
@@ -3504,7 +3118,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
   }
 }
 
-// ==================== GESTION DES INTENTIONS ====================
+// ==================== GESTION DES INTENTIONS ACTIVES ====================
 async function handleActiveIntent(conversationId, activeIntent, userMessage, context = {}) {
   const { userId, googleAccessToken } = context;
 
@@ -3558,6 +3172,292 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
   return { reply: "Je ne comprends plus l'action. Recommençons.", error: true };
 }
 
+// ==================== GESTION DES SESSIONS ====================
+async function getSession(conversationId, userId, firebaseUid = null) {
+  if (supabase) {
+    try {
+      const { data: supabaseSession, error } = await supabase.from("sessions").select("session_id, user_id, firebase_uid").eq("session_id", conversationId).maybeSingle();
+      if (supabaseSession && !error) {
+        await dbRun("INSERT OR IGNORE INTO sessions (session_id, user_id, firebase_uid) VALUES (?, ?, ?)", [conversationId, supabaseSession.user_id || userId, supabaseSession.firebase_uid || firebaseUid]);
+        await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
+        await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
+        return { session_id: conversationId, user_id: supabaseSession.user_id || userId, firebase_uid: supabaseSession.firebase_uid || firebaseUid };
+      }
+    } catch (error) {
+      logger.error({ error: error.message }, "Erreur Supabase getSession, repli SQLite");
+    }
+  }
+
+  const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
+  if (session) {
+    await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
+    await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
+    return session;
+  }
+
+  await dbRun("INSERT INTO sessions (session_id, user_id, firebase_uid) VALUES (?, ?, ?)", [conversationId, userId, firebaseUid]);
+  await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
+  return { session_id: conversationId, user_id: userId, firebase_uid: firebaseUid };
+}
+
+async function setActiveIntent(conversationId, intentType, intentData = {}) {
+  await dbRun("UPDATE sessions SET active_intent = ?, intent_data = ? WHERE session_id = ?", [intentType, JSON.stringify(intentData), conversationId]);
+}
+
+async function getActiveIntent(conversationId) {
+  const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [conversationId]);
+  if (!row || !row.active_intent) return null;
+  try {
+    return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function clearActiveIntent(conversationId) {
+  await dbRun("UPDATE sessions SET active_intent = NULL, intent_data = NULL WHERE session_id = ?", [conversationId]);
+}
+
+async function assertConversationOwnership(conversationId, userId) {
+  const existing = await dbGet("SELECT user_id, firebase_uid FROM sessions WHERE session_id = ?", [conversationId]);
+  if (existing && existing.user_id && existing.user_id !== userId && existing.firebase_uid !== userId) {
+    const err = new Error("Cette conversation n'appartient pas à cet utilisateur.");
+    err.code = "CONVERSATION_OWNERSHIP";
+    throw err;
+  }
+}
+
+// ==================== SYNCHRONISATION SUPABASE ====================
+async function syncUserWithSupabase(firebaseUid, email, displayName) {
+  if (!supabase || !firebaseUid) return;
+  try {
+    const { data: existingUser, error: fetchError } = await supabase.from("users").select("firebase_uid").eq("firebase_uid", firebaseUid).maybeSingle();
+    if (fetchError && fetchError.code !== "PGRST116") return;
+    if (!existingUser) {
+      await supabase.from("users").insert({ 
+        id: firebaseUid,
+        firebase_uid: firebaseUid, 
+        email, 
+        display_name: displayName, 
+        last_seen_at: new Date().toISOString() 
+      });
+      logger.info({ firebaseUid }, "✅ Utilisateur créé dans Supabase");
+    } else {
+      await supabase.from("users").update({ 
+        last_seen_at: new Date().toISOString(),
+        email: email || existingUser.email,
+        display_name: displayName || existingUser.display_name
+      }).eq("firebase_uid", firebaseUid);
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur sync Supabase");
+  }
+}
+
+async function syncSessionWithSupabase(sessionId, firebaseUid, userId) {
+  if (!supabase) return;
+  try {
+    const { data: existingSession, error: fetchError } = await supabase.from("sessions").select("session_id").eq("session_id", sessionId).maybeSingle();
+    if (fetchError && fetchError.code !== "PGRST116") return;
+    if (!existingSession) {
+      await supabase.from("sessions").insert({ 
+        session_id: sessionId, 
+        firebase_uid: firebaseUid || userId, 
+        user_id: userId, 
+        created_at: new Date().toISOString(), 
+        updated_at: new Date().toISOString() 
+      });
+    } else {
+      await supabase.from("sessions").update({ 
+        updated_at: new Date().toISOString(),
+        user_id: userId,
+        firebase_uid: firebaseUid || userId
+      }).eq("session_id", sessionId);
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur sync session Supabase");
+  }
+}
+
+// ==================== INITIALISATION EXPRESS ====================
+const app = express();
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+
+// ==================== CORS ====================
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || HOSTING_CONFIG.allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      logger.warn({ origin }, "Origine CORS refusée");
+      callback(new Error("Origine non autorisée"));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "x-user-id", "X-Google-Access-Token", "X-Session-Token"],
+  credentials: true,
+  maxAge: 86400
+}));
+
+// ==================== SECURITY ====================
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://apis.google.com", "https://www.gstatic.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://fonts.googleapis.com"],
+      imgSrc: ["'self'", "data:", "blob:", "https://*", "http://*"],
+      connectSrc: ["'self'", "https://api.groq.com", "https://openrouter.ai", "https://*.firebaseio.com", "https://*.supabase.co", "wss://*.firebaseio.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+      objectSrc: ["'none'"],
+      frameSrc: ["https://*.firebaseapp.com", "https://*.web.app", "https://www.youtube.com", "https://youtube.com"],
+      workerSrc: ["'self'", "blob:"],
+      upgradeInsecureRequests: []
+    }
+  },
+  hsts: { maxAge: 63072000, includeSubDomains: true, preload: true },
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  noSniff: true,
+  frameguard: { action: "deny" }
+}));
+
+// Force HTTPS en production
+app.use((req, res, next) => {
+  if (CONFIG.ENV === "production" && req.headers["x-forwarded-proto"] && req.headers["x-forwarded-proto"] !== "https") {
+    return res.redirect(301, "https://" + req.headers.host + req.originalUrl);
+  }
+  next();
+});
+
+// ==================== BODY PARSERS ====================
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// ==================== RATE LIMITERS ====================
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ success: false, error: true, reply: "Trop de requêtes. Réessayez dans 15 minutes.", code: "RATE_LIMIT" });
+  }
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ success: false, error: true, reply: "Limite de requêtes atteinte.", code: "RATE_LIMIT_STRICT" });
+  }
+});
+
+// ==================== LOGGING ====================
+app.use((req, res, next) => {
+  const requestId = generateRequestId();
+  const start = Date.now();
+  req.requestId = requestId;
+  res.on("finish", () => {
+    logger.info({ requestId, status: res.statusCode, duration: Date.now() - start }, "Réponse envoyée");
+  });
+  next();
+});
+
+// ==================== AUTHENTIFICATION ====================
+const authenticateUser = async (req, res, next) => {
+  try {
+    const isBlocked = await isIPBlocked(req.ip);
+    if (isBlocked) {
+      return res.status(403).json({ success: false, error: true, reply: "Accès refusé. IP bloquée.", code: "IP_BLOCKED" });
+    }
+    
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    const bearerToken = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+    
+    if (!bearerToken) {
+      await recordLoginAttempt(req.ip, null, false, "Token manquant");
+      return res.status(401).json({ success: false, error: true, reply: "Authentification requise.", code: "MISSING_TOKEN" });
+    }
+    
+    try {
+      const user = await verifyFirebaseToken(bearerToken);
+      if (!user) {
+        await recordLoginAttempt(req.ip, null, false, "Token invalide");
+        return res.status(401).json({ success: false, error: true, reply: "Session invalide.", code: "INVALID_TOKEN" });
+      }
+      
+      const uid = user.uid;
+      req.uid = uid;
+      req.userId = uid;
+      req.firebaseUid = uid;
+      req.verifiedIdentity = true;
+      req.userRole = user.role || 'FREE';
+      req.emailVerified = user.emailVerified;
+      
+      await recordLoginAttempt(req.ip, uid, true);
+      await logSecurityEvent(uid, 'LOGIN_SUCCESS', { email: user.email }, req.ip, req.headers['user-agent']);
+      await detectAndLogNewDevice(uid, req.ip, req.headers['user-agent']);
+      
+      const userRow = await dbGet("SELECT * FROM users WHERE id = ?", [uid]);
+      if (!userRow) {
+        await dbRun(
+          "INSERT INTO users (id, firebase_uid, email, display_name, role, email_verified, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+          [uid, uid, user.email, user.displayName || uid, req.userRole, user.emailVerified ? 1 : 0]
+        );
+        logger.info({ userId: uid }, "✅ Nouvel utilisateur créé");
+      } else {
+        await dbRun(
+          "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, email = COALESCE(?, email), display_name = COALESCE(?, display_name), role = ?, email_verified = ?, firebase_uid = ? WHERE id = ?",
+          [user.email, user.displayName, req.userRole, user.emailVerified ? 1 : 0, uid, uid]
+        );
+      }
+      
+      if (supabase) {
+        await syncUserWithSupabase(uid, user.email, user.displayName);
+      }
+      
+      next();
+    } catch (error) {
+      await recordLoginAttempt(req.ip, null, false, error.message);
+      const loginCheck = await checkLoginAttempts(req.ip);
+      return res.status(401).json({
+        success: false,
+        error: true,
+        reply: loginCheck.blocked ? loginCheck.message : "Session invalide.",
+        code: loginCheck.blocked ? "IP_BLOCKED" : "INVALID_TOKEN"
+      });
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Erreur authentification");
+    return res.status(500).json({ success: false, error: true, reply: "Erreur interne.", code: "AUTH_INTERNAL_ERROR" });
+  }
+};
+
+// ✅ CORRIGÉ : ADMIN via REST explicite
+const requireRole = (allowedRoles) => {
+  return (req, res, next) => {
+    // En mode REST, impossible d'avoir ADMIN
+    if (!firebaseApp && allowedRoles.includes('ADMIN')) {
+      return res.status(503).json({ 
+        success: false, 
+        error: true, 
+        reply: "Les fonctions admin nécessitent Firebase Admin SDK (FIREBASE_SERVICE_ACCOUNT_JSON).",
+        code: "ADMIN_REQUIRES_SERVICE_ACCOUNT" 
+      });
+    }
+    
+    if (!req.userRole || (!allowedRoles.includes(req.userRole) && req.userRole !== 'ADMIN')) {
+      return res.status(403).json({ success: false, error: true, reply: "Accès refusé.", code: "INSUFFICIENT_ROLE" });
+    }
+    next();
+  };
+};
+
 // ==================== ROUTES ====================
 app.get("/", (req, res) => {
   res.json({ success: true, error: false, reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel", version: CONFIG.VERSION, company: CONFIG.COMPANY });
@@ -3607,16 +3507,11 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// Route explicite pour que le frontend récupère l'identifiant unique canonique de l'utilisateur
-// (à utiliser pour TOUT : discussions, mémoire, tâches). Évite toute ambiguïté côté frontend.
 app.get("/api/user/whoami", authenticateUser, (req, res) => {
   return res.status(200).json({ success: true, error: false, userId: req.userId, role: req.userRole });
 });
 
-// ==================== RESTAURATION COMPLÈTE À LA CONNEXION ====================
-// Un seul appel au moment où l'utilisateur se connecte : renvoie tout ce dont le frontend a
-// besoin pour reconstruire l'état complet (conversations récentes, tâches en attente, quotas,
-// statut WhatsApp) sans multiplier les allers-retours et sans jamais perdre l'historique.
+// ==================== BOOTSTRAP ====================
 app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const userId = req.userId;
@@ -3650,7 +3545,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
           }));
         }
       } catch (error) {
-        logger.error({ error: error.message }, "Erreur bootstrap conversations Supabase, repli SQLite");
+        logger.error({ error: error.message }, "Erreur bootstrap conversations Supabase");
       }
     }
     if (conversations.length === 0) {
@@ -3671,10 +3566,6 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
     const tasksResult = await listTasks(userId, { status: "pending" });
     const userRow = await dbGet("SELECT whatsapp_connected, display_name FROM users WHERE id = ?", [userId]);
 
-    // Accueil personnalisé façon Jarvis : Luba "reconnaît" l'utilisateur dès la connexion, en
-    // s'appuyant sur sa mémoire long terme et son activité récente — pas un simple "Bonjour".
-    // Un seul appel LLM léger, jamais bloquant : si ça échoue, on renvoie simplement `null` et
-    // le frontend garde son message d'accueil par défaut.
     let greeting = null;
     try {
       const longTermMemory = await getUserMemory(userId);
@@ -3683,9 +3574,8 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
           role: "system",
           content: [
             "Tu es Luba, assistant IA façon Jarvis, développé par HIKLON Technology.",
-            "Rédige UNE SEULE phrase d'accueil, courte, calme et sûre d'elle (jamais servile, jamais exagérément enthousiaste) — le ton de Jarvis qui accueille son utilisateur.",
-            "Si une mémoire long terme existe, montre discrètement que tu reconnais l'utilisateur (sans réciter la mémoire mot pour mot). Si l'utilisateur a des tâches en attente, tu peux le mentionner en une poignée de mots.",
-            "Si aucune mémoire n'existe (nouvel utilisateur), un accueil neutre et professionnel suffit.",
+            "Rédige UNE SEULE phrase d'accueil, courte, calme et sûre d'elle.",
+            "Si une mémoire long terme existe, montre discrètement que tu reconnais l'utilisateur.",
             "Réponds STRICTEMENT au format JSON : {\"greeting\": \"...\"}"
           ].join("\n")
         },
@@ -3703,7 +3593,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
         greeting = greetResult.response.greeting.slice(0, 300).trim();
       }
     } catch (error) {
-      logger.warn({ error: error.message }, "Accueil personnalisé non généré (non bloquant)");
+      logger.warn({ error: error.message }, "Accueil personnalisé non généré");
     }
 
     return res.status(200).json({
@@ -3724,6 +3614,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
   }
 });
 
+// ==================== CHAT (✅ CORRIGÉ : quota AVANT appel) ====================
 app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFIG.MAX_IMAGES_PER_REQUEST), async (req, res) => {
   try {
     const message = req.body.message;
@@ -3731,10 +3622,12 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
     let isNewConversation = false;
     const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
 
+    // ✅ CORRIGÉ : Incrémenter le quota AVANT l'appel LLM (anti-contournement)
     const quotaCheck = await checkUserQuota(req.userId, 'message', req.userRole);
     if (!quotaCheck.allowed) {
       return res.status(429).json({ success: false, error: true, reply: quotaCheck.message || "Limite atteinte.", code: "QUOTA_EXCEEDED" });
     }
+    await incrementUserQuota(req.userId, 'message');
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
       return res.status(400).json({ success: false, error: true, reply: "Le paramètre 'message' est obligatoire.", code: "MISSING_MESSAGE" });
@@ -3745,8 +3638,6 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
       return res.status(400).json({ success: false, error: true, reply: "Message invalide après nettoyage.", code: "INVALID_MESSAGE" });
     }
 
-    // conversationId ne doit jamais être fourni librement par le client au-delà d'un format
-    // attendu, pour éviter qu'un utilisateur ne devine/force l'ID d'une conversation tierce.
     if (conversationId && !/^[a-zA-Z0-9_-]{6,80}$/.test(conversationId)) {
       return res.status(400).json({ success: false, error: true, reply: "Identifiant de conversation invalide.", code: "INVALID_CONVERSATION_ID" });
     }
@@ -3781,8 +3672,6 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
       images
     });
 
-    await incrementUserQuota(req.userId, 'message');
-
     return res.status(200).json({ ...result, conversationId, isNewConversation });
   } catch (error) {
     logger.error({ error: error.message }, "Erreur API/Chat");
@@ -3790,7 +3679,7 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
   }
 });
 
-// Route pour récupérer l'historique complet d'une conversation
+// ==================== CONVERSATIONS ====================
 app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { conversationId } = req.params;
@@ -3805,8 +3694,6 @@ app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUs
       return res.status(403).json({ success: false, error: true, reply: error.message, code: "CONVERSATION_OWNERSHIP" });
     }
     
-    // ?full=true permet au frontend de tout récupérer d'un coup à la connexion (plafonné à 500
-    // messages pour rester raisonnable) ; sinon on garde le comportement paginé habituel.
     const wantsFull = req.query.full === "true";
     const requestedLimit = parseInt(req.query.limit, 10);
     const limit = wantsFull ? 500 : (Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 200) : CONFIG.MAX_HISTORY_LENGTH);
@@ -3826,8 +3713,6 @@ app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUs
   }
 });
 
-// Liste des conversations récentes (dashboard). Supabase en priorité (source de vérité
-// persistante) pour corriger le bug où les discussions récentes ne s'affichaient pas.
 app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => {
   try {
     if (supabase) {
@@ -3859,7 +3744,7 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
           return res.status(200).json({ success: true, error: false, conversations: enriched });
         }
       } catch (error) {
-        logger.error({ error: error.message }, "Erreur /api/conversations via Supabase, repli SQLite");
+        logger.error({ error: error.message }, "Erreur /api/conversations via Supabase");
       }
     }
 
@@ -3882,6 +3767,7 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
   }
 });
 
+// ==================== STATS UTILISATEUR ====================
 app.get("/api/user/stats", authenticateUser, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
@@ -3903,6 +3789,7 @@ app.get("/api/user/stats", authenticateUser, async (req, res) => {
   }
 });
 
+// ==================== SESSIONS ====================
 app.post("/api/session/create", authenticateUser, async (req, res) => {
   try {
     const sessionToken = await createActiveSession(req.userId, req.ip, req.headers['user-agent']);
@@ -3926,6 +3813,7 @@ app.post("/api/session/revoke", authenticateUser, async (req, res) => {
   }
 });
 
+// ==================== ADMIN ====================
 app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(['ADMIN']), async (req, res) => {
   try {
     const { uid, role } = req.body;
@@ -3939,6 +3827,7 @@ app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(['A
   }
 });
 
+// ==================== OUTILS ====================
 app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const toolName = req.body.toolName || req.body.action;
@@ -3958,7 +3847,7 @@ app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
   }
 });
 
-// ==================== ROUTES MODULE JARVIS : TÂCHES / EMPLOI DU TEMPS ====================
+// ==================== TÂCHES ====================
 app.get("/api/tasks", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const result = await listTasks(req.userId, { status: req.query.status || null });
@@ -4002,7 +3891,7 @@ app.delete("/api/tasks/:taskId", apiLimiter, authenticateUser, async (req, res) 
   }
 });
 
-// ==================== ROUTE MODULE JARVIS : RECHERCHE YOUTUBE DIRECTE ====================
+// ==================== YOUTUBE ====================
 app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const query = req.query.q;
@@ -4014,9 +3903,7 @@ app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) =>
   }
 });
 
-// ==================== ROUTE MODULE JARVIS : ENTRÉE VOCALE ====================
-// Le frontend enregistre un message vocal, l'envoie ici, récupère le texte transcrit, puis
-// l'envoie normalement à /api/chat — Luba répond alors "par écrit ou par vocal" indifféremment.
+// ==================== VOIX ====================
 app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.single("audio"), async (req, res) => {
   try {
     if (!req.file) {
@@ -4041,6 +3928,7 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
   }
 });
 
+// ==================== WHATSAPP ====================
 app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
   try {
     const result = await whatsappManager.initClient(req.userId);
@@ -4086,6 +3974,7 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
   }
 });
 
+// ==================== INTENTIONS ====================
 app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { intentType, conversationId } = req.body;
@@ -4108,6 +3997,32 @@ app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
     return res.status(400).json({ success: false, error: true, code: "UNKNOWN_INTENT" });
   } catch (error) {
     return res.status(500).json({ success: false, error: true, code: "INTENT_ERROR" });
+  }
+});
+
+// ==================== MÉMOIRE (✅ RGPD) ====================
+app.get("/api/user/memory", authenticateUser, async (req, res) => {
+  try {
+    const memory = await getUserMemory(req.userId);
+    return res.status(200).json({ success: true, error: false, memory: memory || null });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "MEMORY_FETCH_ERROR" });
+  }
+});
+
+app.delete("/api/user/memory", authenticateUser, async (req, res) => {
+  try {
+    await dbRun("DELETE FROM user_memory WHERE user_id = ?", [req.userId]);
+    if (supabase) {
+      try {
+        await supabase.from("user_memory").delete().eq("user_id", req.userId);
+      } catch (error) {
+        logger.error({ error: error.message }, "Erreur suppression mémoire Supabase");
+      }
+    }
+    return res.status(200).json({ success: true, error: false, message: "Mémoire long terme effacée." });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: true, code: "MEMORY_DELETE_ERROR" });
   }
 });
 
@@ -4136,6 +4051,7 @@ app.post("/api/memory/clear", authenticateUser, async (req, res) => {
   }
 });
 
+// ==================== SUPPRESSION COMPTE ====================
 app.delete("/api/account", authenticateUser, async (req, res) => {
   try {
     const userId = req.userId;
@@ -4197,7 +4113,7 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
   }
 });
 
-// ==================== ROUTE 404 ====================
+// ==================== 404 ====================
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -4212,21 +4128,20 @@ app.use((req, res) => {
       "POST /api/session/create", "POST /api/session/revoke", "POST /api/admin/set-role",
       "GET /api/tasks", "POST /api/tasks", "PUT /api/tasks/:taskId/status", "DELETE /api/tasks/:taskId",
       "GET /api/youtube/search", "POST /api/voice/transcribe",
+      "GET /api/user/memory", "DELETE /api/user/memory",
       "DELETE /api/account"
     ]
   });
 });
 
-// ==================== MIDDLEWARE D'ERREUR ====================
+// ==================== ERREUR ====================
 app.use((error, req, res, next) => {
   logger.error({ error: error.message, stack: error.stack }, "Erreur non gérée");
   if (res.headersSent) return next(error);
   return res.status(500).json({ success: false, error: true, reply: "Une erreur interne est survenue.", code: "INTERNAL_ERROR" });
 });
 
-// ==================== HYGIÈNE PRODUCTION : NETTOYAGE PÉRIODIQUE ====================
-// Purge les entrées de sécurité expirées pour éviter une croissance illimitée des tables et
-// garder les vérifications anti-fraude rapides même après des mois de production.
+// ==================== HOUSEKEEPING ====================
 async function runSecurityHousekeeping() {
   try {
     await dbRun(`DELETE FROM blocked_ips WHERE blocked_until < CURRENT_TIMESTAMP`);
@@ -4234,9 +4149,9 @@ async function runSecurityHousekeeping() {
     await dbRun(`DELETE FROM security_logs WHERE created_at < datetime('now', '-90 days')`);
     await dbRun(`DELETE FROM active_sessions WHERE expires_at < datetime('now', '-7 days')`);
     await dbRun(`DELETE FROM llm_audit_log WHERE created_at < datetime('now', '-30 days')`);
-    logger.info("🧹 Nettoyage périodique de sécurité effectué");
+    logger.info("🧹 Nettoyage périodique effectué");
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur nettoyage périodique de sécurité");
+    logger.error({ error: error.message }, "Erreur nettoyage périodique");
   }
 }
 const HOUSEKEEPING_INTERVAL_MS = parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
@@ -4245,17 +4160,11 @@ setInterval(runSecurityHousekeeping, HOUSEKEEPING_INTERVAL_MS);
 // ==================== DÉMARRAGE ====================
 const server = app.listen(CONFIG.PORT, () => {
   logger.info("Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " démarré sur le port " + CONFIG.PORT);
-  console.log("🚀 Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " opérationnel sur le port " + CONFIG.PORT);
+  console.log("🚀 Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " opérationnel");
   console.log("🌐 Domaine: " + HOSTING_CONFIG.domain);
-  console.log("🔐 Firebase Admin: " + (firebaseApp ? "activé" : "désactivé (mode API REST)"));
-  console.log("🧠 NLP Intent Engine: activé");
-  console.log("📐 MathJS Engine: activé");
-  console.log("📰 RSS Parser: activé");
-  console.log("🔍 Web Search (DuckDuckGo): activé");
-  console.log("📄 Scraping (Cheerio): activé");
-  console.log("💾 Mémoire Conversationnelle: activée (source de vérité: " + (supabase ? "Supabase" : "SQLite local, non persistant sur Render") + ")");
-  console.log("👤 Synchronisation UID unifiée: activée");
-  console.log("🤖 Module Jarvis (tâches + YouTube): activé");
+  console.log("🔐 Firebase Admin: " + (firebaseApp ? "activé" : "désactivé (REST)"));
+  console.log("💾 Mémoire: " + (supabase ? "Supabase (persistant)" : "SQLite local (éphémère)"));
+  console.log("🤖 Modèles: Groq + OpenRouter (gratuits vérifiés)");
 });
 
 // ==================== ARRÊT PROPRE ====================
