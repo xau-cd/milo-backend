@@ -1,19 +1,14 @@
 // ================================================================================
-// LUBA BACKEND v13.0.0 — Enterprise Edition
-// HIKLON TECHNOLOGIES · Kinshasa, RDC
-// Architecture : Microservices-ready, Haute Disponibilité, Production-Ready
+// LUBA BACKEND v14.0.0 — Enterprise Edition
+// HIKLON TECHNOLOGIES · Kinshasa, RDC · 2026
 // ================================================================================
-// CORRECTIONS APPLIQUÉES v13.0.0 :
-// - Clé crypto WhatsApp obligatoire en prod + IV aléatoire
-// - Regex math resserrée (opérateur obligatoire)
-// - Quota incrémenté AVANT appel LLM (anti-contournement)
-// - ADMIN via REST explicite + erreur 503
-// - Résultats d'outils en role "tool" (conforme OpenAI)
-// - Vision Groq : qwen/qwen3.6-27b (obsolète llama-3.2-90b-vision-preview)
-// - Modèles OpenRouter : liste Septembre 2026 vérifiée
-// - Route RGPD /api/user/memory (GET + DELETE)
-// - maybeSingle() pour getUserMemory
-// - Fallback SQLite transparent si Supabase absent
+// NOUVEAUTÉS v14 :
+// ✅ Gemini (Google AI Studio) — provider complet avec vision native
+// ✅ Cerebras — 1M tokens/jour gratuit
+// ✅ Fix images Wikimedia (fusion Commons + Wikipedia + DuckDuckGo)
+// ✅ Fix sessions Supabase (upsert + retry exponentiel)
+// ✅ Support reasoning_effort Cerebras
+// ✅ Conversion auto format OpenAI ↔ Gemini
 // ================================================================================
 
 require("dotenv").config();
@@ -41,7 +36,15 @@ const FormData = require("form-data");
 const cheerio = require("cheerio");
 const natural = require("natural");
 
-// ==================== IMPORTS FIREBASE ADMIN ====================
+// ==================== GEMINI SDK (v14) ====================
+let GoogleGenAI = null;
+try {
+  GoogleGenAI = require("@google/genai").GoogleGenAI;
+} catch (e) {
+  console.warn("⚠️ @google/genai non installé — Gemini désactivé");
+}
+
+// ==================== FIREBASE ADMIN ====================
 let firebaseAdmin = null;
 try {
   firebaseAdmin = require("firebase-admin");
@@ -49,14 +52,13 @@ try {
   console.warn("⚠️ firebase-admin non installé");
 }
 
-// ==================== IMPORTS OPTIONNELS ====================
-let BullMQ = null;
-let IORedis = null;
+// ==================== OPTIONNELS ====================
+let BullMQ = null, IORedis = null;
 try {
   BullMQ = require("bullmq");
   IORedis = require("ioredis");
 } catch (e) {
-  console.warn("⚠️ BullMQ/Redis non installés - file d'attente en mémoire");
+  console.warn("⚠️ BullMQ/Redis non installés");
 }
 
 const {
@@ -70,7 +72,7 @@ const {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "13.0.0",
+  VERSION: "14.0.0",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON TECHNOLOGIES",
 
@@ -95,7 +97,14 @@ const CONFIG = {
   WHATSAPP_QR_TIMEOUT: parseInt(process.env.WHATSAPP_QR_TIMEOUT || "30000", 10),
   WHATSAPP_RETRY_DELAY: parseInt(process.env.WHATSAPP_RETRY_DELAY || "3000", 10),
 
-  MAX_LOGIN_ATTEMPTS: parseInt(process.env.MAX_LOGIN_ATTEMPTS || "5", 10),
+  // ⚠️ Ce compteur est incrémenté à CHAQUE échec de vérification de token sur
+  // authenticateUser (middleware appelé sur presque toutes les routes), pas
+  // uniquement sur un endpoint de login dédié. Un client mobile dont le token
+  // Firebase a simplement expiré peut donc légitimement échouer plusieurs fois
+  // en quelques minutes. On relève le seuil par défaut pour éviter de bloquer
+  // des utilisateurs légitimes ; voir aussi le traitement différencié dans
+  // authenticateUser (auth/id-token-expired n'est pas compté comme une attaque).
+  MAX_LOGIN_ATTEMPTS: parseInt(process.env.MAX_LOGIN_ATTEMPTS || "20", 10),
   LOGIN_BLOCK_DURATION: parseInt(process.env.LOGIN_BLOCK_DURATION || "900000", 10),
   MAX_SESSIONS_PER_USER: parseInt(process.env.MAX_SESSIONS_PER_USER || "10", 10),
 
@@ -103,18 +112,20 @@ const CONFIG = {
   SESSIONS_PATH: path.join(__dirname, "sessions"),
   UPLOADS_PATH: path.join(__dirname, "uploads"),
 
-  // ✅ CORRIGÉ : qwen/qwen3.6-27b (vision Groq confirmée)
   VISION_MODEL_GROQ: process.env.VISION_MODEL_GROQ || "qwen/qwen3.6-27b",
-  // ✅ CORRIGÉ : inclusionai/ling-3.0-flash-vl:free (vision OpenRouter confirmée)
   VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "inclusionai/ling-3.0-flash-vl:free",
+  VISION_MODEL_GEMINI: process.env.VISION_MODEL_GEMINI || "gemini-3.6-flash",
 
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/13.0.0"
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/14.0.0"
 };
 
-// ==================== CONFIGURATION FIREBASE ====================
+// ==================== FIREBASE CONFIG ====================
+// ⚠️ SÉCURITÉ : plus AUCUN secret ne doit avoir de valeur par défaut codée en dur.
+// Une clé Firebase réelle était précédemment exposée ici en clair dans le code source
+// (donc dans git, dans les logs de build, etc.) — c'est une faille critique, corrigée.
 const FIREBASE_CONFIG = {
-  apiKey: process.env.FIREBASE_API_KEY || "AIzaSyAdGCNZZAmbFyFSiDErjpEA4C1-PVsy52A",
+  apiKey: process.env.FIREBASE_API_KEY || null,
   projectId: process.env.FIREBASE_PROJECT_ID || "luba-ia-636",
   authDomain: process.env.FIREBASE_AUTH_DOMAIN || "luba-ia-636.firebaseapp.com",
   storageBucket: process.env.FIREBASE_STORAGE_BUCKET || "luba-ia-636.firebasestorage.app",
@@ -122,7 +133,7 @@ const FIREBASE_CONFIG = {
   appId: process.env.FIREBASE_APP_ID || "1:502404354252:web:660ab2109ce448e1803269"
 };
 
-// ==================== CONFIGURATION HOSTING ====================
+// ==================== HOSTING CONFIG ====================
 const HOSTING_CONFIG = {
   domain: process.env.HOSTING_DOMAIN || "https://luba.web.app",
   allowedOrigins: [
@@ -136,32 +147,14 @@ const HOSTING_CONFIG = {
   ]
 };
 
-// ==================== SYSTÈME DE QUOTAS ====================
+// ==================== QUOTAS ====================
 const USER_QUOTAS = {
-  FREE: {
-    maxMessagesPerDay: 100,
-    maxImagesPerDay: 20,
-    maxWhatsAppMessagesPerDay: 10,
-    maxEmailsPerDay: 5,
-    maxTokensPerRequest: 8000
-  },
-  PREMIUM: {
-    maxMessagesPerDay: 1000,
-    maxImagesPerDay: 200,
-    maxWhatsAppMessagesPerDay: 100,
-    maxEmailsPerDay: 50,
-    maxTokensPerRequest: 32000
-  },
-  ADMIN: {
-    maxMessagesPerDay: 999999,
-    maxImagesPerDay: 999999,
-    maxWhatsAppMessagesPerDay: 999999,
-    maxEmailsPerDay: 999999,
-    maxTokensPerRequest: 128000
-  }
+  FREE: { maxMessagesPerDay: 100, maxImagesPerDay: 20, maxWhatsAppMessagesPerDay: 10, maxEmailsPerDay: 5, maxTokensPerRequest: 8000 },
+  PREMIUM: { maxMessagesPerDay: 1000, maxImagesPerDay: 200, maxWhatsAppMessagesPerDay: 100, maxEmailsPerDay: 50, maxTokensPerRequest: 32000 },
+  ADMIN: { maxMessagesPerDay: 999999, maxImagesPerDay: 999999, maxWhatsAppMessagesPerDay: 999999, maxEmailsPerDay: 999999, maxTokensPerRequest: 128000 }
 };
 
-// ==================== CRÉATION DES DOSSIERS ====================
+// ==================== DOSSIERS ====================
 for (const dir of [path.dirname(CONFIG.DB_PATH), CONFIG.SESSIONS_PATH, CONFIG.UPLOADS_PATH]) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -169,31 +162,65 @@ for (const dir of [path.dirname(CONFIG.DB_PATH), CONFIG.SESSIONS_PATH, CONFIG.UP
   }
 }
 
-// ==================== LOGGER PINO ====================
+// ==================== LOGGER ====================
 const logger = pino({
   level: process.env.LOG_LEVEL || "info",
-  transport: process.env.NODE_ENV === "development" ? {
-    target: "pino-pretty",
-    options: { colorize: true }
-  } : undefined,
-  base: {
-    service: "luba-backend",
-    version: CONFIG.VERSION
-  }
+  transport: process.env.NODE_ENV === "development" ? { target: "pino-pretty", options: { colorize: true } } : undefined,
+  base: { service: "luba-backend", version: CONFIG.VERSION }
 });
 
-// ==================== INITIALISATION FIREBASE ADMIN ====================
+// ==================== VALIDATION ENVIRONNEMENT (fail-fast) ====================
+// En production, on ne démarre JAMAIS avec des secrets manquants ou des valeurs
+// de développement par défaut : mieux vaut un crash au démarrage qu'une faille en silence.
+function validateEnvironment() {
+  const problems = [];
+
+  const hasFirebaseAdmin = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const hasFirebaseRestKey = Boolean(process.env.FIREBASE_API_KEY);
+  if (!hasFirebaseAdmin && !hasFirebaseRestKey) {
+    problems.push("Aucune authentification Firebase configurée : définissez FIREBASE_SERVICE_ACCOUNT_JSON (recommandé) ou FIREBASE_API_KEY.");
+  }
+
+  const hasAnyLLMKey = Boolean(
+    process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY ||
+    process.env.CEREBRAS_API_KEY || process.env.GEMINI_API_KEY
+  );
+  if (!hasAnyLLMKey) {
+    problems.push("Aucune clé de provider LLM configurée (GROQ_API_KEY / OPENROUTER_API_KEY / CEREBRAS_API_KEY / GEMINI_API_KEY).");
+  }
+
+  if (CONFIG.ENV === "production") {
+    const key = process.env.WHATSAPP_ENCRYPTION_KEY;
+    const iv = process.env.WHATSAPP_ENCRYPTION_IV;
+    if (!key || key.length < 32 || !iv || iv.length < 16) {
+      problems.push("WHATSAPP_ENCRYPTION_KEY (32+ caractères) et WHATSAPP_ENCRYPTION_IV (16+ caractères) sont obligatoires en production.");
+    }
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+      problems.push("SUPABASE_URL / SUPABASE_KEY absents : en production, SQLite seul n'est pas une persistance fiable (disque éphémère sur la plupart des hébergeurs).");
+    }
+  }
+
+  if (problems.length > 0) {
+    for (const p of problems) console.error("❌ CONFIG MANQUANTE : " + p);
+    if (CONFIG.ENV === "production") {
+      console.error("🛑 Démarrage interrompu (production) — corrigez les variables d'environnement ci-dessus.");
+      process.exit(1);
+    } else {
+      console.warn("⚠️ Démarrage en mode dégradé (non-production) malgré les points ci-dessus.");
+    }
+  }
+}
+
+validateEnvironment();
+
+// ==================== FIREBASE ADMIN INIT ====================
 let firebaseApp = null;
 
 function parseFirebaseServiceAccount(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    try {
-      return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
-    } catch (e2) {
-      throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON invalide");
-    }
+  try { return JSON.parse(raw); }
+  catch (e) {
+    try { return JSON.parse(Buffer.from(raw, "base64").toString("utf8")); }
+    catch (e2) { throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON invalide"); }
   }
 }
 
@@ -209,16 +236,16 @@ if (firebaseAdmin && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     logger.error({ err: e.message }, "❌ Erreur initialisation Firebase Admin");
   }
 } else {
-  logger.warn("⚠️ Firebase Admin non initialisé - mode API REST");
+  logger.warn("⚠️ Firebase Admin non initialisé — mode API REST");
 }
 
-// ==================== INITIALISATION SQLITE ====================
+// ==================== SQLITE ====================
 const db = new sqlite3.Database(CONFIG.DB_PATH, (err) => {
   if (err) {
-    logger.error({ err: err.message }, "❌ Impossible d'ouvrir la base SQLite");
+    logger.error({ err: err.message }, "❌ Impossible d'ouvrir SQLite");
     process.exit(1);
   }
-  logger.info("✅ Base de données SQLite initialisée");
+  logger.info("✅ SQLite initialisé");
 });
 
 db.run("PRAGMA journal_mode = WAL;");
@@ -279,39 +306,24 @@ db.serialize(() => {
 
   db.run(`CREATE TABLE IF NOT EXISTS email_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT,
-    firebase_uid TEXT,
-    to_email TEXT NOT NULL,
-    subject TEXT,
-    status TEXT DEFAULT 'pending',
-    provider TEXT,
-    error_message TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    user_id TEXT, firebase_uid TEXT, to_email TEXT NOT NULL,
+    subject TEXT, status TEXT DEFAULT 'pending', provider TEXT,
+    error_message TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS llm_audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT,
-    user_id TEXT,
-    provider TEXT,
-    model TEXT,
-    tier TEXT,
-    prompt_tokens INTEGER DEFAULT 0,
-    completion_tokens INTEGER DEFAULT 0,
-    latency_ms INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'success',
-    error_code TEXT,
+    session_id TEXT, user_id TEXT, provider TEXT, model TEXT, tier TEXT,
+    prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
+    latency_ms INTEGER DEFAULT 0, status TEXT DEFAULT 'success', error_code TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS user_quotas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    date TEXT NOT NULL,
-    messages_count INTEGER DEFAULT 0,
-    images_count INTEGER DEFAULT 0,
-    whatsapp_count INTEGER DEFAULT 0,
-    emails_count INTEGER DEFAULT 0,
+    user_id TEXT NOT NULL, date TEXT NOT NULL,
+    messages_count INTEGER DEFAULT 0, images_count INTEGER DEFAULT 0,
+    whatsapp_count INTEGER DEFAULT 0, emails_count INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, date),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -319,60 +331,42 @@ db.serialize(() => {
 
   db.run(`CREATE TABLE IF NOT EXISTS security_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT,
-    event_type TEXT NOT NULL,
-    details TEXT DEFAULT '{}',
-    ip_address TEXT,
-    user_agent TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    user_id TEXT, event_type TEXT NOT NULL, details TEXT DEFAULT '{}',
+    ip_address TEXT, user_agent TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS active_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    session_token TEXT UNIQUE,
-    ip_address TEXT,
-    user_agent TEXT,
+    user_id TEXT NOT NULL, session_token TEXT UNIQUE,
+    ip_address TEXT, user_agent TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME,
-    is_revoked INTEGER DEFAULT 0,
+    expires_at DATETIME, is_revoked INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS login_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT,
-    ip_address TEXT,
-    success INTEGER DEFAULT 0,
-    error_message TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    user_id TEXT, ip_address TEXT, success INTEGER DEFAULT 0,
+    error_message TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS blocked_ips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip_address TEXT UNIQUE,
-    reason TEXT,
-    strike_count INTEGER DEFAULT 1,
-    blocked_until DATETIME,
+    ip_address TEXT UNIQUE, reason TEXT,
+    strike_count INTEGER DEFAULT 1, blocked_until DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
   db.run(`ALTER TABLE blocked_ips ADD COLUMN strike_count INTEGER DEFAULT 1`, () => {});
 
   db.run(`CREATE TABLE IF NOT EXISTS news_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    category TEXT NOT NULL,
-    title TEXT,
-    link TEXT,
-    pub_date TEXT,
-    description TEXT,
-    source TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    category TEXT NOT NULL, title TEXT, link TEXT, pub_date TEXT,
+    description TEXT, source TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS user_memory (
-    user_id TEXT PRIMARY KEY,
-    summary TEXT DEFAULT '',
+    user_id TEXT PRIMARY KEY, summary TEXT DEFAULT '',
     messages_since_update INTEGER DEFAULT 0,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -380,11 +374,8 @@ db.serialize(() => {
 
   db.run(`CREATE TABLE IF NOT EXISTS user_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    notes TEXT,
-    due_at DATETIME,
-    status TEXT DEFAULT 'pending',
+    user_id TEXT NOT NULL, title TEXT NOT NULL, notes TEXT,
+    due_at DATETIME, status TEXT DEFAULT 'pending',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -403,7 +394,7 @@ db.serialize(() => {
 
 logger.info("✅ Schéma SQLite initialisé");
 
-// ==================== INITIALISATION SUPABASE ====================
+// ==================== SUPABASE ====================
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
   supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -411,12 +402,12 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
     db: { schema: "public" },
     global: { headers: { "x-application-name": "luba-backend" } }
   });
-  logger.info("✅ Supabase initialisé (source de vérité persistante)");
+  logger.info("✅ Supabase initialisé (source de vérité)");
 } else {
-  logger.warn("⚠️ Supabase non configuré - SQLite éphémère sur Render. Configure SUPABASE_URL et SUPABASE_KEY.");
+  logger.warn("⚠️ Supabase non configuré — SQLite éphémère sur Render");
 }
 
-// ==================== CONFIGURATION EMAIL ====================
+// ==================== EMAIL ====================
 let emailTransporter = null;
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   emailTransporter = nodemailer.createTransport({
@@ -425,54 +416,39 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     secure: process.env.SMTP_PORT === "465",
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     tls: { rejectUnauthorized: false },
-    pool: true,
-    maxConnections: 3,
-    maxMessages: 50
+    pool: true, maxConnections: 3, maxMessages: 50
   });
   logger.info("✅ SMTP configuré");
 } else {
   logger.warn("⚠️ SMTP non configuré");
 }
 
-// ==================== CONFIGURATION MULTER ====================
+// ==================== MULTER ====================
 const storage = multer.memoryStorage();
 const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: CONFIG.MAX_IMAGE_SIZE_MB * 1024 * 1024,
-    files: CONFIG.MAX_IMAGES_PER_REQUEST
-  },
+  storage,
+  limits: { fileSize: CONFIG.MAX_IMAGE_SIZE_MB * 1024 * 1024, files: CONFIG.MAX_IMAGES_PER_REQUEST },
   fileFilter: (req, file, cb) => {
-    if (CONFIG.ALLOWED_IMAGE_TYPES.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`Type de fichier non supporté. Types autorisés: ${CONFIG.ALLOWED_IMAGE_TYPES.join(", ")}`));
-    }
+    if (CONFIG.ALLOWED_IMAGE_TYPES.includes(file.mimetype)) cb(null, true);
+    else cb(new Error(`Type non supporté. Autorisés: ${CONFIG.ALLOWED_IMAGE_TYPES.join(", ")}`));
   }
 });
 
-// Upload audio dédié à la transcription vocale
 const ALLOWED_AUDIO_TYPES = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/webm", "audio/ogg", "audio/m4a", "audio/x-m4a", "audio/aac"];
 const uploadAudio = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (ALLOWED_AUDIO_TYPES.includes(file.mimetype)) cb(null, true);
-    else cb(new Error(`Type audio non supporté. Types autorisés: ${ALLOWED_AUDIO_TYPES.join(", ")}`));
+    else cb(new Error(`Type audio non supporté.`));
   }
 });
 
-// ==================== INITIALISATION RSS PARSER ====================
-const rssParser = new Parser({
-  timeout: 10000,
-  headers: { "User-Agent": CONFIG.HTTP_USER_AGENT }
-});
+// ==================== RSS + NLP ====================
+const rssParser = new Parser({ timeout: 10000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
 
-// ==================== INITIALISATION NATURAL NLP ====================
-const tokenizer = new natural.WordTokenizer();
 const classifier = new natural.BayesClassifier();
 
-// Entraînement du classifieur d'intention
 classifier.addDocument("calcule 2+2", "MATHS");
 classifier.addDocument("résous cette équation x^2 + 3x + 2 = 0", "MATHS");
 classifier.addDocument("intégrale de sin(x)", "MATHS");
@@ -518,6 +494,20 @@ classifier.addDocument("liste mes rappels", "TASK");
 classifier.train();
 
 // ==================== UTILITAIRES ====================
+// ✅ Le mimetype envoyé par le client (multer fileFilter) est déclaratif et donc
+// falsifiable. On vérifie ici la signature binaire réelle du fichier avant de
+// l'envoyer aux providers de vision, pour éviter qu'un fichier arbitraire
+// (potentiellement malveillant) ne transite déguisé en image.
+function isValidImageSignature(buffer) {
+  if (!buffer || buffer.length < 12) return false;
+  const hex = buffer.subarray(0, 12).toString("hex");
+  if (hex.startsWith("ffd8ff")) return true; // JPEG
+  if (hex.startsWith("89504e470d0a1a0a")) return true; // PNG
+  if (hex.startsWith("47494638")) return true; // GIF87a / GIF89a
+  if (hex.startsWith("52494646") && buffer.subarray(8, 12).toString("ascii") === "WEBP") return true; // WEBP (RIFF....WEBP)
+  return false;
+}
+
 function convertImageToBase64(buffer, mimetype) {
   return {
     dataUrl: `data:${mimetype};base64,${buffer.toString("base64")}`,
@@ -527,19 +517,14 @@ function convertImageToBase64(buffer, mimetype) {
   };
 }
 
-function generateRequestId() {
-  return `req_${crypto.randomUUID()}`;
-}
+function generateRequestId() { return `req_${crypto.randomUUID()}`; }
+function generateConversationId() { return `conv_${crypto.randomUUID()}`; }
+function generateSessionToken() { return `sess_${crypto.randomBytes(32).toString("hex")}`; }
+// ✅ Les jetons de session ne sont plus jamais stockés en clair en base : on stocke
+// leur empreinte SHA-256. Une fuite de la base ne permet donc pas de rejouer une session.
+function hashSessionToken(token) { return crypto.createHash("sha256").update(String(token)).digest("hex"); }
 
-function generateConversationId() {
-  return `conv_${crypto.randomUUID()}`;
-}
-
-function generateSessionToken() {
-  return `sess_${crypto.randomBytes(32).toString("hex")}`;
-}
-
-// ==================== SÉCURITÉ : ASSAINISSEMENT ====================
+// ==================== SÉCURITÉ ====================
 function sanitizeUserText(input, maxLength = CONFIG.MAX_MESSAGE_LENGTH) {
   if (input === null || input === undefined) return input;
   let text = String(input);
@@ -564,81 +549,70 @@ async function detectAndLogNewDevice(userId, ip, userAgent) {
       `SELECT id FROM security_logs WHERE user_id = ? AND event_type = 'DEVICE_SEEN' AND details LIKE ?`,
       [userId, `%${fingerprint}%`]
     );
-    if (!seen) {
-      await logSecurityEvent(userId, "NEW_DEVICE_DETECTED", { fingerprint }, ip, userAgent);
-    }
+    if (!seen) await logSecurityEvent(userId, "NEW_DEVICE_DETECTED", { fingerprint }, ip, userAgent);
     await logSecurityEvent(userId, "DEVICE_SEEN", { fingerprint }, ip, userAgent);
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur détection nouvel appareil");
+    logger.error({ error: error.message }, "Erreur détection appareil");
   }
+}
+
+// ✅ Échappe le HTML avant de convertir les retours à la ligne en <br> (emails) —
+// empêche l'injection de balises (<script>, <img onerror>, etc.) dans un contenu
+// censé être du texte brut.
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function decodeXmlEntities(str) {
   return String(str)
-    .replace(/<!\[CDATA\[/g, "")
-    .replace(/\]\]>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/<!\[CDATA\[/g, "").replace(/\]\]>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ").trim();
 }
 
-// ==================== WRAPPERS SQLITE ====================
+// ==================== DB WRAPPERS ====================
 function dbGet(query, params = []) {
   return new Promise((resolve, reject) => {
-    db.get(query, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
+    db.get(query, params, (err, row) => err ? reject(err) : resolve(row));
   });
 }
-
 function dbAll(query, params = []) {
   return new Promise((resolve, reject) => {
-    db.all(query, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
+    db.all(query, params, (err, rows) => err ? reject(err) : resolve(rows));
   });
 }
-
 function dbRun(query, params = []) {
   return new Promise((resolve, reject) => {
-    db.run(query, params, function (err) {
-      if (err) reject(err);
-      else resolve(this);
-    });
+    db.run(query, params, function (err) { err ? reject(err) : resolve(this); });
   });
 }
 
-// ==================== AUDIT LLM ====================
+// ==================== AUDIT + LOGS ====================
 async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTokens, completionTokens, latencyMs, status, errorCode }) {
   try {
     await dbRun(
       `INSERT INTO llm_audit_log (session_id, user_id, provider, model, tier, prompt_tokens, completion_tokens, latency_ms, status, error_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [sessionId, userId, provider, model, tier, promptTokens, completionTokens, latencyMs, status, errorCode]
     );
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur audit LLM");
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur audit LLM"); }
 }
 
-// ==================== LOGS DE SÉCURITÉ ====================
 async function logSecurityEvent(userId, eventType, details = {}, ipAddress = null, userAgent = null) {
   try {
     await dbRun(
       `INSERT INTO security_logs (user_id, event_type, details, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)`,
       [userId, eventType, JSON.stringify(details), ipAddress, userAgent]
     );
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur log sécurité");
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur log sécurité"); }
 }
 
-// ==================== VÉRIFICATION TOKEN FIREBASE ====================
+// ==================== FIREBASE VERIFY ====================
 async function verifyFirebaseToken(token) {
   if (firebaseApp && firebaseAdmin) {
     try {
@@ -653,39 +627,31 @@ async function verifyFirebaseToken(token) {
         customClaims: decodedToken
       };
     } catch (error) {
-      logger.error({ error: error.message }, "Erreur vérification token (Admin SDK)");
+      logger.error({ error: error.message }, "Erreur vérif token (Admin SDK)");
       throw error;
     }
   }
-  
-  // Mode REST : rôle toujours FREE (pas de custom claims)
+
   try {
     const response = await axios.post(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
-      { idToken: token },
-      { timeout: 10000 }
+      { idToken: token }, { timeout: 10000 }
     );
-    
     if (response.data.users && response.data.users.length > 0) {
       const user = response.data.users[0];
       return {
-        uid: user.localId,
-        email: user.email || null,
-        displayName: user.displayName || null,
-        photoURL: user.photoUrl || null,
-        emailVerified: user.emailVerified || false,
-        role: 'FREE' // ✅ REST mode = FREE uniquement
+        uid: user.localId, email: user.email || null, displayName: user.displayName || null,
+        photoURL: user.photoUrl || null, emailVerified: user.emailVerified || false, role: 'FREE'
       };
     }
-    
     return null;
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur vérification token (API REST)");
+    logger.error({ error: error.message }, "Erreur vérif token (REST)");
     throw error;
   }
 }
 
-// ==================== GESTION DES RÔLES ====================
+// ==================== RÔLES ====================
 async function setUserRole(uid, role) {
   if (firebaseApp && firebaseAdmin) {
     try {
@@ -694,11 +660,10 @@ async function setUserRole(uid, role) {
       await logSecurityEvent(uid, 'ROLE_UPDATED', { role });
       return { success: true, role };
     } catch (error) {
-      logger.error({ error: error.message }, "Erreur mise à jour rôle");
+      logger.error({ error: error.message }, "Erreur màj rôle");
       throw error;
     }
   }
-  
   await dbRun(`UPDATE users SET role = ? WHERE firebase_uid = ? OR id = ?`, [role, uid, uid]);
   return { success: true, role, warning: "REST mode - role local uniquement" };
 }
@@ -708,71 +673,65 @@ async function getUserRole(uid) {
     try {
       const user = await firebaseAdmin.auth(firebaseApp).getUser(uid);
       return user.customClaims?.role || 'FREE';
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur récupération rôle");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur récup rôle"); }
   }
-  
   const user = await dbGet("SELECT role FROM users WHERE firebase_uid = ? OR id = ?", [uid, uid]);
   return user?.role || 'FREE';
 }
 
-// ==================== GESTION DES SESSIONS ====================
+// ==================== SESSIONS ACTIVES ====================
 async function createActiveSession(userId, ipAddress, userAgent) {
   const sessionToken = generateSessionToken();
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  
+
   const activeSessions = await dbAll(
     `SELECT COUNT(*) as count FROM active_sessions WHERE user_id = ? AND is_revoked = 0 AND expires_at > CURRENT_TIMESTAMP`,
     [userId]
   );
-  
+
   if (activeSessions[0]?.count >= CONFIG.MAX_SESSIONS_PER_USER) {
     await dbRun(
       `UPDATE active_sessions SET is_revoked = 1 WHERE id = (SELECT id FROM active_sessions WHERE user_id = ? AND is_revoked = 0 ORDER BY created_at ASC LIMIT 1)`,
       [userId]
     );
   }
-  
+
   await dbRun(
     `INSERT INTO active_sessions (user_id, session_token, ip_address, user_agent, expires_at) VALUES (?, ?, ?, ?, ?)`,
-    [userId, sessionToken, ipAddress, userAgent, expiresAt]
+    [userId, hashSessionToken(sessionToken), ipAddress, userAgent, expiresAt]
   );
-  
-  return sessionToken;
+
+  return sessionToken; // le jeton en clair n'est jamais renvoyé après cet appel ni stocké tel quel
 }
 
 async function validateActiveSession(userId, sessionToken) {
   const session = await dbGet(
     `SELECT * FROM active_sessions WHERE user_id = ? AND session_token = ? AND is_revoked = 0 AND expires_at > CURRENT_TIMESTAMP`,
-    [userId, sessionToken]
+    [userId, hashSessionToken(sessionToken)]
   );
-  
   if (session) {
     await dbRun(`UPDATE active_sessions SET last_activity = CURRENT_TIMESTAMP WHERE id = ?`, [session.id]);
     return true;
   }
-  
   return false;
 }
 
 async function revokeSession(userId, sessionToken) {
-  await dbRun(`UPDATE active_sessions SET is_revoked = 1 WHERE user_id = ? AND session_token = ?`, [userId, sessionToken]);
+  await dbRun(`UPDATE active_sessions SET is_revoked = 1 WHERE user_id = ? AND session_token = ?`, [userId, hashSessionToken(sessionToken)]);
 }
 
 async function revokeAllSessions(userId) {
   await dbRun(`UPDATE active_sessions SET is_revoked = 1 WHERE user_id = ? AND is_revoked = 0`, [userId]);
 }
 
-// ==================== GESTION DES TENTATIVES ====================
+// ==================== LOGIN ATTEMPTS ====================
 async function checkLoginAttempts(ipAddress) {
   const cutoffTime = new Date(Date.now() - CONFIG.LOGIN_BLOCK_DURATION).toISOString();
-  
   const attempts = await dbGet(
     `SELECT COUNT(*) as count FROM login_attempts WHERE ip_address = ? AND success = 0 AND created_at > ?`,
     [ipAddress, cutoffTime]
   );
-  
+
   if (attempts?.count >= CONFIG.MAX_LOGIN_ATTEMPTS) {
     const existingBlock = await dbGet(`SELECT strike_count FROM blocked_ips WHERE ip_address = ?`, [ipAddress]);
     const strikeCount = (existingBlock?.strike_count || 0) + 1;
@@ -784,13 +743,9 @@ async function checkLoginAttempts(ipAddress) {
       [ipAddress, strikeCount, new Date(Date.now() + escalatedDuration).toISOString()]
     );
 
-    if (strikeCount >= 3) {
-      logger.warn({ ipAddress, strikeCount }, "🚨 IP récidiviste — suspicion de fraude/brute-force");
-    }
-
-    return { blocked: true, message: "Trop de tentatives échouées. IP bloquée temporairement." };
+    if (strikeCount >= 3) logger.warn({ ipAddress, strikeCount }, "🚨 IP récidiviste");
+    return { blocked: true, message: "Trop de tentatives échouées. IP bloquée." };
   }
-  
   return { blocked: false };
 }
 
@@ -809,13 +764,12 @@ async function isIPBlocked(ipAddress) {
   return Boolean(blocked);
 }
 
-// ==================== GESTION DES QUOTAS ====================
+// ==================== QUOTAS ====================
 async function checkUserQuota(userId, action, userRole = 'FREE') {
   try {
     const today = new Date().toISOString().split('T')[0];
-    
     const quotaRow = await dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [userId, today]);
-    
+
     if (!quotaRow) {
       await dbRun(
         `INSERT INTO user_quotas (user_id, date, messages_count, images_count, whatsapp_count, emails_count) VALUES (?, ?, 0, 0, 0, 0)`,
@@ -823,49 +777,24 @@ async function checkUserQuota(userId, action, userRole = 'FREE') {
       );
       return { allowed: true, remaining: USER_QUOTAS[userRole] || USER_QUOTAS.FREE };
     }
-    
+
     const limits = USER_QUOTAS[userRole] || USER_QUOTAS.FREE;
-    
-    let currentCount = 0;
-    let maxAllowed = 0;
-    
+    let currentCount = 0, maxAllowed = 0;
+
     switch (action) {
-      case 'message':
-        currentCount = quotaRow.messages_count;
-        maxAllowed = limits.maxMessagesPerDay;
-        break;
-      case 'image':
-        currentCount = quotaRow.images_count;
-        maxAllowed = limits.maxImagesPerDay;
-        break;
-      case 'whatsapp':
-        currentCount = quotaRow.whatsapp_count;
-        maxAllowed = limits.maxWhatsAppMessagesPerDay;
-        break;
-      case 'email':
-        currentCount = quotaRow.emails_count;
-        maxAllowed = limits.maxEmailsPerDay;
-        break;
+      case 'message': currentCount = quotaRow.messages_count; maxAllowed = limits.maxMessagesPerDay; break;
+      case 'image': currentCount = quotaRow.images_count; maxAllowed = limits.maxImagesPerDay; break;
+      case 'whatsapp': currentCount = quotaRow.whatsapp_count; maxAllowed = limits.maxWhatsAppMessagesPerDay; break;
+      case 'email': currentCount = quotaRow.emails_count; maxAllowed = limits.maxEmailsPerDay; break;
     }
-    
+
     if (currentCount >= maxAllowed) {
-      return { 
-        allowed: false, 
-        remaining: 0,
-        message: `Limite quotidienne atteinte pour ${action}. Limite : ${maxAllowed}`,
-        current: currentCount,
-        max: maxAllowed
-      };
+      return { allowed: false, remaining: 0, message: `Limite atteinte pour ${action}. Max : ${maxAllowed}`, current: currentCount, max: maxAllowed };
     }
-    
-    return { 
-      allowed: true, 
-      remaining: maxAllowed - currentCount,
-      current: currentCount,
-      max: maxAllowed
-    };
+
+    return { allowed: true, remaining: maxAllowed - currentCount, current: currentCount, max: maxAllowed };
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur vérification quota");
+    logger.error({ error: error.message }, "Erreur vérif quota");
     return { allowed: true, remaining: null };
   }
 }
@@ -873,7 +802,6 @@ async function checkUserQuota(userId, action, userRole = 'FREE') {
 async function incrementUserQuota(userId, action) {
   try {
     const today = new Date().toISOString().split('T')[0];
-    
     let columnToUpdate;
     switch (action) {
       case 'message': columnToUpdate = 'messages_count'; break;
@@ -882,14 +810,11 @@ async function incrementUserQuota(userId, action) {
       case 'email': columnToUpdate = 'emails_count'; break;
       default: return;
     }
-    
     await dbRun(
       `UPDATE user_quotas SET ${columnToUpdate} = ${columnToUpdate} + 1 WHERE user_id = ? AND date = ?`,
       [userId, today]
     );
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur mise à jour quota");
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur màj quota"); }
 }
 
 // ==================== CIRCUIT BREAKER ====================
@@ -914,7 +839,6 @@ class CircuitBreaker {
         throw new Error(`Circuit breaker ${this.name} est OPEN`);
       }
     }
-
     try {
       const result = await fn();
       this.onSuccess();
@@ -934,18 +858,16 @@ class CircuitBreaker {
   onFailure() {
     this.failureCount++;
     this.lastFailureTime = Date.now();
-
     if (this.failureCount >= this.failureThreshold) {
       this.state = "OPEN";
       this.emitter.emit("open", { name: this.name, failureCount: this.failureCount });
       logger.warn({ circuit: this.name, failures: this.failureCount }, "Circuit breaker: OPEN");
     }
-
     this.emitter.emit("failure", { name: this.name, failureCount: this.failureCount });
   }
 }
 
-// ==================== GESTIONNAIRE DE FILE ====================
+// ==================== QUEUE MANAGER ====================
 class QueueManager {
   constructor() {
     this.useRedis = Boolean(process.env.REDIS_URL) && Boolean(BullMQ) && Boolean(IORedis);
@@ -955,11 +877,10 @@ class QueueManager {
 
     if (this.useRedis) {
       this.connection = new IORedis(process.env.REDIS_URL, {
-        maxRetriesPerRequest: null,
-        enableReadyCheck: true,
+        maxRetriesPerRequest: null, enableReadyCheck: true,
         retryStrategy: (times) => Math.min(times * 200, 5000)
       });
-      logger.info("✅ File d'attente Redis initialisée");
+      logger.info("✅ Redis initialisé");
     } else {
       logger.warn("⚠️ File d'attente en mémoire (fallback)");
     }
@@ -973,11 +894,9 @@ class QueueManager {
         concurrency: options.concurrency || 3,
         limiter: options.limiter || { max: 10, duration: 1000 }
       });
-
       worker.on("failed", (job, err) => {
         logger.error({ jobId: job?.id, err: err.message }, `Job ${name} échoué`);
       });
-
       this.queues.set(name, queue);
       this.workers.set(name, worker);
     } else {
@@ -988,20 +907,13 @@ class QueueManager {
         processing = true;
         while (inMemoryQueue.length > 0) {
           const job = inMemoryQueue.shift();
-          try {
-            await processor(job);
-          } catch (error) {
-            logger.error({ err: error.message }, `Job ${name} échoué (mémoire)`);
-          }
+          try { await processor(job); }
+          catch (error) { logger.error({ err: error.message }, `Job ${name} échoué`); }
         }
         processing = false;
       };
-
       this.inMemoryQueues.set(name, {
-        add: async (data) => {
-          inMemoryQueue.push(data);
-          processQueue();
-        }
+        add: async (data) => { inMemoryQueue.push(data); processQueue(); }
       });
     }
   }
@@ -1013,15 +925,12 @@ class QueueManager {
         return await queue.add("process", data, {
           attempts: options.attempts || 5,
           backoff: { type: "exponential", delay: options.backoffDelay || 2000 },
-          removeOnComplete: 100,
-          removeOnFail: 500
+          removeOnComplete: 100, removeOnFail: 500
         });
       }
     } else {
       const queue = this.inMemoryQueues.get(name);
-      if (queue) {
-        return await queue.add(data);
-      }
+      if (queue) return await queue.add(data);
     }
     throw new Error(`Queue ${name} non trouvée`);
   }
@@ -1046,7 +955,8 @@ const OPEN_SOURCES = {
   arxiv: { name: "arXiv", url: "https://arxiv.org", logo: "https://www.google.com/s2/favicons?sz=64&domain=arxiv.org" },
   reddit: { name: "Reddit", url: "https://reddit.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=reddit.com" },
   openmeteo: { name: "Open-Meteo", url: "https://open-meteo.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=open-meteo.com" },
-  youtube: { name: "YouTube", url: "https://youtube.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=youtube.com" }
+  youtube: { name: "YouTube", url: "https://youtube.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=youtube.com" },
+  duckduckgo: { name: "DuckDuckGo", url: "https://duckduckgo.com", logo: "https://www.google.com/s2/favicons?sz=64&domain=duckduckgo.com" }
 };
 
 // ==================== CACHE IMAGES ====================
@@ -1078,7 +988,7 @@ function withDeadline(promise, deadlineMs, fallbackValue) {
   ]);
 }
 
-// ==================== RECHERCHE IMAGES ====================
+// ==================== RECHERCHE IMAGES (✅ FIX v14) ====================
 async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
   try {
@@ -1091,28 +1001,51 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
         url: page.imageinfo?.[0]?.thumburl || page.imageinfo?.[0]?.url || null,
         title: page.title || "Image",
         description: page.imageinfo?.[0]?.extmetadata?.ImageDescription?.value?.replace(/<[^>]*>/g, "") || null,
-        pageUrl: page.imageinfo?.[0]?.descriptionurl || null
+        pageUrl: page.imageinfo?.[0]?.descriptionurl || null,
+        source: "wikimediacommons"
       }))
       .filter((img) => img.url);
     return { images };
   } catch (error) {
-    logger.error({ error: error.message, query }, "Erreur recherche images Wikimedia");
+    logger.error({ error: error.message, query }, "Erreur recherche Wikimedia");
     return { images: [], error: error.message };
   }
 }
 
+// ✅ NOUVEAU : DuckDuckGo Images
+async function searchDuckDuckGoImages(query, limit = 4) {
+  try {
+    const results = await search(`${query} image`, {
+      safeSearch: "OFF", locale: "fr-fr", maxResults: limit
+    });
+    return results
+      .filter(r => r.url && r.url.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i))
+      .map(r => ({
+        url: r.url,
+        title: r.title || query,
+        description: r.description || null,
+        pageUrl: r.url,
+        source: "duckduckgo"
+      }));
+  } catch (error) {
+    logger.warn({ error: error.message }, "DuckDuckGo images échoué");
+    return [];
+  }
+}
+
+// ✅ CORRIGÉ v14 : Fusion 3 sources avec dédoublonnage
 async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   const cacheKey = `img:${query.toLowerCase().trim()}:${limit}`;
   const cached = getCachedImages(cacheKey);
   if (cached) return cached;
 
-  const HARD_DEADLINE_MS = 1800;
+  const HARD_DEADLINE_MS = 2500;
 
   const commonsPromise = searchWikimediaImages(query, limit).catch(() => ({ images: [] }));
+
   const wikipediaThumbPromise = axios
     .get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(query)}`, {
-      timeout: HARD_DEADLINE_MS,
-      headers: { "User-Agent": CONFIG.HTTP_USER_AGENT }
+      timeout: 2000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT }
     })
     .then((response) => {
       const thumb = response.data?.thumbnail?.source || response.data?.originalimage?.source;
@@ -1121,27 +1054,36 @@ async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT
         url: thumb,
         title: response.data.title || query,
         description: response.data.extract ? response.data.extract.slice(0, 200) : null,
-        pageUrl: response.data.content_urls?.desktop?.page || null
+        pageUrl: response.data.content_urls?.desktop?.page || null,
+        source: "wikipedia"
       };
     })
     .catch(() => null);
 
-  const [commonsResult, wikipediaThumb] = await withDeadline(
-    Promise.all([commonsPromise, wikipediaThumbPromise]),
+  const ddgImagesPromise = searchDuckDuckGoImages(query, 4).catch(() => []);
+
+  const [commonsResult, wikipediaThumb, ddgImages] = await withDeadline(
+    Promise.all([commonsPromise, wikipediaThumbPromise, ddgImagesPromise]),
     HARD_DEADLINE_MS,
-    [{ images: [] }, null]
+    [{ images: [] }, null, []]
   );
 
-  let result;
-  if (commonsResult.images && commonsResult.images.length > 0) {
-    result = commonsResult;
-  } else if (wikipediaThumb) {
-    result = { images: [wikipediaThumb] };
-  } else {
-    result = { images: [] };
-  }
+  const allImages = [
+    ...(commonsResult.images || []),
+    ...(wikipediaThumb ? [wikipediaThumb] : []),
+    ...ddgImages
+  ];
 
+  const seenUrls = new Set();
+  const uniqueImages = allImages.filter(img => {
+    if (!img?.url || seenUrls.has(img.url)) return false;
+    seenUrls.add(img.url);
+    return true;
+  }).slice(0, limit);
+
+  const result = { images: uniqueImages };
   setCachedImages(cacheKey, result);
+  logger.info({ query, count: uniqueImages.length }, "Images trouvées");
   return result;
 }
 
@@ -1152,13 +1094,10 @@ async function searchWikipediaSummary(query) {
     const response = await axios.get(url, { timeout: 10000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
     if (response.data?.type === "disambiguation" || !response.data?.extract) return { summary: null };
     return {
-      title: response.data.title,
-      summary: response.data.extract,
+      title: response.data.title, summary: response.data.extract,
       url: response.data.content_urls?.desktop?.page
     };
-  } catch (error) {
-    return { summary: null, error: error.message };
-  }
+  } catch (error) { return { summary: null, error: error.message }; }
 }
 
 // ==================== RECHERCHE ACTUALITÉS ====================
@@ -1181,7 +1120,7 @@ async function searchNews(query) {
     }
     return { articles: items };
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur recherche actualités");
+    logger.error({ error: error.message }, "Erreur actualités");
     return { articles: [], error: error.message };
   }
 }
@@ -1196,41 +1135,27 @@ async function searchWeb(query) {
   ]);
   const results = [];
   const sourcesUsed = [];
-  
+
   if (wiki.summary) {
     results.push({ title: wiki.title, snippet: wiki.summary, url: wiki.url, type: "wiki" });
     sourcesUsed.push("wikipedia");
   }
-  
   if (ddgResults.length > 0) {
-    for (const r of ddgResults) {
-      results.push({ title: r.title, snippet: r.snippet, url: r.url, type: "web" });
-    }
+    for (const r of ddgResults) results.push({ title: r.title, snippet: r.snippet, url: r.url, type: "web" });
   }
-  
   if (news.articles?.length > 0) {
     news.articles.slice(0, 3).forEach((a) => results.push({ title: a.title, url: a.link, pubDate: a.pubDate, type: "news" }));
     sourcesUsed.push("googlenews");
   }
-  
   return { results, sourcesUsed };
 }
 
 async function searchDuckDuckGo(query) {
   try {
-    const results = await search(query, {
-      safeSearch: "OFF",
-      locale: "fr-fr",
-      maxResults: 5
-    });
-    return results.map(r => ({
-      title: r.title,
-      snippet: r.description,
-      url: r.url,
-      source: r.source
-    }));
+    const results = await search(query, { safeSearch: "OFF", locale: "fr-fr", maxResults: 5 });
+    return results.map(r => ({ title: r.title, snippet: r.description, url: r.url, source: r.source }));
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur recherche DuckDuckGo");
+    logger.error({ error: error.message }, "Erreur DuckDuckGo");
     return [];
   }
 }
@@ -1238,10 +1163,7 @@ async function searchDuckDuckGo(query) {
 // ==================== SCRAPING ====================
 async function scrapeArticleContent(url) {
   try {
-    const response = await axios.get(url, {
-      timeout: 15000,
-      headers: { "User-Agent": CONFIG.HTTP_USER_AGENT }
-    });
+    const response = await axios.get(url, { timeout: 15000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
     const $ = cheerio.load(response.data);
     const title = $("title").text().trim();
     const paragraphs = [];
@@ -1249,17 +1171,11 @@ async function scrapeArticleContent(url) {
       const text = $(el).text().trim();
       if (text.length > 50) paragraphs.push(text);
     });
-    return {
-      title,
-      content: paragraphs.slice(0, 5).join("\n\n").slice(0, 2000),
-      url
-    };
-  } catch (error) {
-    return { error: error.message, url };
-  }
+    return { title, content: paragraphs.slice(0, 5).join("\n\n").slice(0, 2000), url };
+  } catch (error) { return { error: error.message, url }; }
 }
 
-// ==================== RECHERCHE SPORT ====================
+// ==================== SPORT ====================
 async function searchSportsScores(query) {
   if (!query) return { events: [], error: "Aucune équipe précisée" };
   try {
@@ -1271,16 +1187,13 @@ async function searchSportsScores(query) {
     const eventsResp = await axios.get(eventsUrl, { timeout: 12000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
     const events = (eventsResp.data?.results || []).slice(0, 5).map((e) => ({
       match: `${e.strHomeTeam} ${e.intHomeScore ?? "?"} - ${e.intAwayScore ?? "?"} ${e.strAwayTeam}`,
-      date: e.dateEvent,
-      league: e.strLeague
+      date: e.dateEvent, league: e.strLeague
     }));
     return { team: team.strTeam, events };
-  } catch (error) {
-    return { events: [], error: error.message };
-  }
+  } catch (error) { return { events: [], error: error.message }; }
 }
 
-// ==================== RECHERCHE SCIENCE ====================
+// ==================== SCIENCE ====================
 async function searchScience(query) {
   if (!query) return { papers: [] };
   try {
@@ -1298,27 +1211,21 @@ async function searchScience(query) {
       if (title) items.push({ title: decodeXmlEntities(title), summary: decodeXmlEntities(summary).slice(0, 300), link: link.trim() });
     }
     return { papers: items };
-  } catch (error) {
-    return { papers: [], error: error.message };
-  }
+  } catch (error) { return { papers: [], error: error.message }; }
 }
 
-// ==================== RECHERCHE SOCIAL ====================
+// ==================== SOCIAL ====================
 async function searchSocial(query) {
   if (!query) return { posts: [] };
   try {
     const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&limit=6&sort=relevance`;
     const response = await axios.get(url, { timeout: 12000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
     const posts = (response.data?.data?.children || []).map((c) => ({
-      title: c.data.title,
-      subreddit: c.data.subreddit_name_prefixed,
-      score: c.data.score,
-      url: `https://reddit.com${c.data.permalink}`
+      title: c.data.title, subreddit: c.data.subreddit_name_prefixed,
+      score: c.data.score, url: `https://reddit.com${c.data.permalink}`
     }));
     return { posts };
-  } catch (error) {
-    return { posts: [], error: error.message };
-  }
+  } catch (error) { return { posts: [], error: error.message }; }
 }
 
 // ==================== MÉTÉO ====================
@@ -1334,21 +1241,15 @@ async function getWeather(location) {
     const current = weatherResp.data?.current;
     return {
       location: `${place.name}, ${place.country}`,
-      temperature: current?.temperature_2m,
-      windSpeed: current?.wind_speed_10m,
-      weatherCode: current?.weather_code
+      temperature: current?.temperature_2m, windSpeed: current?.wind_speed_10m, weatherCode: current?.weather_code
     };
-  } catch (error) {
-    return { error: error.message };
-  }
+  } catch (error) { return { error: error.message }; }
 }
 
-// ==================== MODULE JARVIS : YOUTUBE ====================
+// ==================== YOUTUBE ====================
 function extractYouTubeVideoId(url) {
   if (!url) return null;
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/
-  ];
+  const patterns = [/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/];
   for (const p of patterns) {
     const m = url.match(p);
     if (m) return m[1];
@@ -1357,7 +1258,7 @@ function extractYouTubeVideoId(url) {
 }
 
 async function searchYouTube(query) {
-  if (!query || typeof query !== "string") return { videos: [], error: "Aucune requête précisée" };
+  if (!query || typeof query !== "string") return { videos: [], error: "Aucune requête" };
 
   if (process.env.YOUTUBE_API_KEY) {
     try {
@@ -1373,37 +1274,32 @@ async function searchYouTube(query) {
       })).filter((v) => v.videoId);
       return { videos };
     } catch (error) {
-      logger.error({ error: error.message }, "Erreur YouTube Data API, repli sur recherche web");
+      logger.error({ error: error.message }, "Erreur YouTube API");
     }
   }
 
   try {
     const results = await search(`site:youtube.com ${query}`, { safeSearch: "OFF", locale: "fr-fr", maxResults: 6 });
-    const videos = results
-      .map((r) => {
-        const videoId = extractYouTubeVideoId(r.url);
-        if (!videoId) return null;
-        return {
-          videoId,
-          title: r.title,
-          channel: r.source || null,
-          thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-          publishedAt: null,
-          url: `https://www.youtube.com/watch?v=${videoId}`
-        };
-      })
-      .filter(Boolean);
+    const videos = results.map((r) => {
+      const videoId = extractYouTubeVideoId(r.url);
+      if (!videoId) return null;
+      return {
+        videoId, title: r.title, channel: r.source || null,
+        thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        publishedAt: null, url: `https://www.youtube.com/watch?v=${videoId}`
+      };
+    }).filter(Boolean);
     return { videos };
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur recherche YouTube (repli DuckDuckGo)");
+    logger.error({ error: error.message }, "Erreur YouTube DDG");
     return { videos: [], error: error.message };
   }
 }
 
-// ==================== MODULE JARVIS : TRANSCRIPTION VOCALE ====================
+// ==================== TRANSCRIPTION VOCALE ====================
 async function transcribeAudioGroq(buffer, filename, mimetype) {
   if (!LLM_PROVIDERS.GROQ.keyPool || LLM_PROVIDERS.GROQ.keyPool.length === 0) {
-    return { success: false, error: "Aucune clé Groq configurée pour la transcription" };
+    return { success: false, error: "Aucune clé Groq pour la transcription" };
   }
 
   let lastError = null;
@@ -1417,31 +1313,28 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
 
       const response = await axios.post("https://api.groq.com/openai/v1/audio/transcriptions", form, {
         headers: { ...form.getHeaders(), Authorization: "Bearer " + keyEntry.apiKey },
-        timeout: 30000,
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity
+        timeout: 30000, maxBodyLength: Infinity, maxContentLength: Infinity
       });
 
       return { success: true, text: response.data?.text || "" };
     } catch (error) {
       lastError = error;
-      logger.warn({ error: error.message, keyLabel: keyEntry.label }, "Échec transcription vocale avec cette clé, rotation");
+      logger.warn({ error: error.message, keyLabel: keyEntry.label }, "Échec transcription, rotation");
     }
   }
 
-  return { success: false, error: lastError?.response?.data?.error?.message || lastError?.message || "Échec de la transcription" };
+  return { success: false, error: lastError?.response?.data?.error?.message || lastError?.message || "Échec transcription" };
 }
 
-// ==================== MODULE JARVIS : TÂCHES ====================
+// ==================== TÂCHES ====================
 async function createTask(userId, { title, notes = null, dueAt = null }) {
   if (!title || typeof title !== "string" || !title.trim()) {
-    return { success: false, error: "Le titre de la tâche est obligatoire" };
+    return { success: false, error: "Le titre est obligatoire" };
   }
   const cleanTitle = sanitizeUserText(title, 200);
   const cleanNotes = notes ? sanitizeUserText(notes, 2000) : null;
-  if (dueAt && isNaN(Date.parse(dueAt))) {
-    return { success: false, error: "Date d'échéance invalide (attendu ISO 8601)" };
-  }
+  if (dueAt && isNaN(Date.parse(dueAt))) return { success: false, error: "Date invalide" };
+
   const result = await dbRun(
     `INSERT INTO user_tasks (user_id, title, notes, due_at) VALUES (?, ?, ?, ?)`,
     [userId, cleanTitle, cleanNotes, dueAt]
@@ -1453,9 +1346,7 @@ async function createTask(userId, { title, notes = null, dueAt = null }) {
       await supabase.from("user_tasks").insert({
         id: result.lastID, user_id: userId, title: cleanTitle, notes: cleanNotes, due_at: dueAt, status: "pending"
       });
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur sync tâche Supabase");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur sync tâche Supabase"); }
   }
 
   return { success: true, task };
@@ -1464,10 +1355,7 @@ async function createTask(userId, { title, notes = null, dueAt = null }) {
 async function listTasks(userId, { status = null } = {}) {
   let query = `SELECT * FROM user_tasks WHERE user_id = ?`;
   const params = [userId];
-  if (status) {
-    query += ` AND status = ?`;
-    params.push(status);
-  }
+  if (status) { query += ` AND status = ?`; params.push(status); }
   query += ` ORDER BY (due_at IS NULL), due_at ASC, created_at DESC LIMIT 50`;
   const tasks = await dbAll(query, params);
   return { success: true, tasks };
@@ -1478,9 +1366,7 @@ async function updateTaskStatus(userId, taskId, status) {
   if (supabase) {
     try {
       await supabase.from("user_tasks").update({ status, updated_at: new Date().toISOString() }).eq("id", taskId).eq("user_id", userId);
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur sync statut tâche Supabase");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur sync tâche"); }
   }
   const task = await dbGet(`SELECT * FROM user_tasks WHERE id = ? AND user_id = ?`, [taskId, userId]);
   return { success: Boolean(task), task };
@@ -1489,76 +1375,53 @@ async function updateTaskStatus(userId, taskId, status) {
 async function deleteTask(userId, taskId) {
   await dbRun(`DELETE FROM user_tasks WHERE id = ? AND user_id = ?`, [taskId, userId]);
   if (supabase) {
-    try {
-      await supabase.from("user_tasks").delete().eq("id", taskId).eq("user_id", userId);
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur sync suppression tâche Supabase");
-    }
+    try { await supabase.from("user_tasks").delete().eq("id", taskId).eq("user_id", userId); }
+    catch (error) { logger.error({ error: error.message }, "Erreur sync suppression"); }
   }
   return { success: true };
 }
 
-// ==================== MOTEUR MATHÉMATIQUE ====================
+// ==================== MATH ====================
 function executeMathExpression(expression) {
   try {
     const result = math.evaluate(expression);
-    return {
-      success: true,
-      expression,
-      result: result,
-      formatted: math.format(result, { precision: 14 })
-    };
-  } catch (error) {
-    return {
-      success: false,
-      expression,
-      error: error.message
-    };
-  }
+    return { success: true, expression, result, formatted: math.format(result, { precision: 14 }) };
+  } catch (error) { return { success: false, expression, error: error.message }; }
 }
 
-// ✅ CORRIGÉ : Regex resserrée (opérateur obligatoire)
 function detectMathExpressions(message) {
   const patterns = [
-    // Exige au moins un opérateur arithmétique entre deux nombres
     /(\d+(?:\.\d+)?(?:\s*[\+\-\*\/\^]\s*\d+(?:\.\d+)?)+)/g,
-    // Mots-clés explicites
     /(?:calcule|calcul|résous|resous|solve|compute)\s*:?\s*([^\n]+)/i,
-    // Fonctions mathématiques
     /(?:sqrt|sin|cos|tan|log|exp|abs|floor|ceil|round)\s*\([^)]+\)/gi,
-    // Mots-clés avancés
     /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)\s*(?:de|of)?\s*:?\s*([^\n]+)/i
   ];
-  
   const expressions = [];
   for (const pattern of patterns) {
     const matches = message.match(pattern);
-    if (matches) {
-      expressions.push(...matches);
-    }
+    if (matches) expressions.push(...matches);
   }
-  
   return [...new Set(expressions)];
 }
 
-// ==================== ANALYSE D'INTENTION ====================
+// ==================== ANALYSE INTENTION ====================
 function analyzeIntent(message) {
   const lowerMessage = message.toLowerCase();
-  
+
   const mathPatterns = [
-    /\d+(?:\.\d+)?\s*[\+\-\*\/\^]\s*\d+/, // au moins un opérateur
+    /\d+(?:\.\d+)?\s*[\+\-\*\/\^]\s*\d+/,
     /(?:calcule|calcul|résous|resous|solve|compute|equation|équation)/i,
     /(?:intégrale|integrale|dérivée|derivee|factorielle|matrice|limite)/i,
     /(?:sqrt|sin\(|cos\(|tan\(|log\(|exp\()/i
   ];
   const hasMath = mathPatterns.some(p => p.test(message));
-  
+
   const newsWords = ["actualité", "actualites", "news", "dernières nouvelles", "journal", "politique", "économie", "monde", "international", "breaking", "info"];
   const hasNews = newsWords.some(w => lowerMessage.includes(w));
-  
+
   const sportWords = ["sport", "match", "football", "basket", "tennis", "score", "résultat", "resultat", "classement", "ligue", "championnat", "nba", "psg", "om", "real madrid", "barca"];
   const hasSport = sportWords.some(w => lowerMessage.includes(w));
-  
+
   const codeWords = ["code", "coder", "programmation", "programme", "javascript", "python", "java", "c++", "typescript", "react", "vue", "angular", "node", "api", "debug", "fonction", "function", "classe", "class", "algorithme", "sql", "html", "css"];
   const hasCode = codeWords.some(w => lowerMessage.includes(w));
 
@@ -1577,36 +1440,22 @@ function analyzeIntent(message) {
   if (hasSport) return "SPORT";
   if (hasNews) return "ACTUALITÉ";
   if (hasCode) return "CODE";
-  
+
   const classified = classifier.classify(lowerMessage);
-  
-  const intentMap = {
-    "MATHS": "MATHS",
-    "ACTUALITÉ": "ACTUALITÉ",
-    "SPORT": "SPORT",
-    "CODE": "CODE",
-    "PERSONNE": "PERSONNE",
-    "VIDEO": "VIDEO",
-    "TASK": "TASK"
-  };
-  
+  const intentMap = { "MATHS": "MATHS", "ACTUALITÉ": "ACTUALITÉ", "SPORT": "SPORT", "CODE": "CODE", "PERSONNE": "PERSONNE", "VIDEO": "VIDEO", "TASK": "TASK" };
   const mapped = intentMap[classified] || "GENERAL";
   if (mapped === "GENERAL" && hasPersonQuery) return "PERSONNE";
   return mapped;
 }
-
 // ==================== MÉMOIRE LONG TERME ====================
 const USER_MEMORY_UPDATE_EVERY_N_MESSAGES = parseInt(process.env.USER_MEMORY_UPDATE_EVERY_N_MESSAGES || "6", 10);
 
-// ✅ CORRIGÉ : maybeSingle() au lieu de single()
 async function getUserMemory(userId) {
   if (supabase) {
     try {
       const { data, error } = await supabase.from("user_memory").select("summary").eq("user_id", userId).maybeSingle();
       if (!error && data) return data.summary || "";
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur lecture mémoire long terme Supabase, repli SQLite");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur lecture mémoire Supabase"); }
   }
   const row = await dbGet("SELECT summary FROM user_memory WHERE user_id = ?", [userId]);
   return row?.summary || "";
@@ -1620,10 +1469,11 @@ async function saveUserMemory(userId, summary, messagesSinceUpdate = 0) {
   );
   if (supabase) {
     try {
-      await supabase.from("user_memory").upsert({ user_id: userId, summary, messages_since_update: messagesSinceUpdate, updated_at: new Date().toISOString() });
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur sync mémoire long terme Supabase");
-    }
+      await supabase.from("user_memory").upsert(
+        { user_id: userId, summary, messages_since_update: messagesSinceUpdate, updated_at: new Date().toISOString() },
+        { onConflict: "user_id" }
+      );
+    } catch (error) { logger.error({ error: error.message }, "Erreur sync mémoire Supabase"); }
   }
 }
 
@@ -1650,13 +1500,13 @@ async function maybeUpdateUserMemory(userId, userMessage, assistantReply) {
         content: [
           "Tu mets à jour une mémoire long terme compacte sur un utilisateur, pour un assistant IA.",
           "Résume en 5 à 8 lignes MAXIMUM les faits durables et utiles : prénom/surnom, préférences, projets en cours, sujets récurrents, contexte professionnel.",
-          "N'invente rien. Ignore les détails ponctuels sans intérêt à long terme (météo du jour, une seule question isolée).",
-          "Réponds STRICTEMENT au format JSON : {\"summary\": \"le résumé mis à jour ici\"}"
+          "N'invente rien. Ignore les détails ponctuels sans intérêt à long terme.",
+          'Réponds STRICTEMENT au format JSON : {"summary": "le résumé mis à jour ici"}'
         ].join("\n")
       },
       {
         role: "user",
-        content: `RÉSUMÉ ACTUEL :\n${previousSummary || "(aucun résumé pour l'instant)"}\n\nDERNIER ÉCHANGE :\nUtilisateur: ${userMessage.slice(0, 800)}\nAssistant: ${String(assistantReply).slice(0, 800)}\n\nDonne le résumé mis à jour au format JSON demandé :`
+        content: `RÉSUMÉ ACTUEL :\n${previousSummary || "(aucun)"}\n\nDERNIER ÉCHANGE :\nUtilisateur: ${userMessage.slice(0, 800)}\nAssistant: ${String(assistantReply).slice(0, 800)}\n\nDonne le résumé mis à jour au format JSON :`
       }
     ];
 
@@ -1669,13 +1519,11 @@ async function maybeUpdateUserMemory(userId, userMessage, assistantReply) {
     if (result.success && result.response && typeof result.response.summary === "string") {
       const newSummary = result.response.summary.slice(0, 2000).trim();
       await saveUserMemory(userId, newSummary, 0);
-      logger.info({ userId }, "🧠 Mémoire long terme utilisateur mise à jour");
+      logger.info({ userId }, "🧠 Mémoire long terme mise à jour");
     } else {
       await saveUserMemory(userId, previousSummary, 0);
     }
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur mise à jour mémoire long terme");
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur màj mémoire long terme"); }
 }
 
 // ==================== HISTORIQUE CONVERSATION ====================
@@ -1692,39 +1540,31 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_
       if (!error && supabaseMessages && supabaseMessages.length > 0) {
         return supabaseMessages.reverse().map((row) => ({ role: row.role, content: row.content }));
       }
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur Supabase getFullHistory, repli sur SQLite local");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur Supabase getFullHistory"); }
   }
 
   try {
     let query = "SELECT role, content, created_at FROM messages WHERE session_id = ?";
-    let params = [conversationId];
-    
+    const params = [conversationId];
     if (userId) {
       query += " AND (user_id = ? OR user_id IS NULL)";
       params.push(userId);
     }
-    
     query += " ORDER BY id DESC LIMIT ?";
     params.push(limit);
-    
+
     const localRows = await dbAll(query, params);
-    
     if (localRows.length > 0) {
-      return localRows.reverse().map(row => ({
-        role: row.role,
-        content: row.content
-      }));
+      return localRows.reverse().map(row => ({ role: row.role, content: row.content }));
     }
-    
     return [];
   } catch (error) {
-    logger.error({ error: error.message }, "Erreur getFullHistory (SQLite)");
+    logger.error({ error: error.message }, "Erreur getFullHistory SQLite");
     return [];
   }
 }
 
+// ✅ CORRIGÉ v14 : saveMessageWithUser robuste
 async function saveMessageWithUser(conversationId, role, content, userId = null, firebaseUid = null, metadata = {}) {
   let supabaseOk = false;
 
@@ -1736,14 +1576,12 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
         user_id: userId,
         role,
         content,
-        metadata: JSON.stringify(metadata || {}),
+        metadata: metadata || {},
         created_at: new Date().toISOString()
       });
       if (!error) supabaseOk = true;
       else logger.error({ error: error.message }, "Erreur insertion message Supabase");
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur sync message Supabase");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur sync message Supabase"); }
   }
 
   try {
@@ -1752,35 +1590,30 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
       [conversationId, userId, role, content, JSON.stringify(metadata)]
     );
     await dbRun("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?", [conversationId]);
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur saveMessageWithUser (SQLite)");
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur saveMessageWithUser SQLite"); }
 
-  return supabaseOk || true;
+  return supabaseOk;
 }
 
 // ==================== EMAIL ====================
 async function verifyGmailScope(accessToken) {
   try {
     const response = await axios.get("https://www.googleapis.com/oauth2/v1/tokeninfo", {
-      params: { access_token: accessToken },
-      timeout: 10000
+      params: { access_token: accessToken }, timeout: 10000
     });
     const scopes = response.data.scope?.split(" ") || [];
     return scopes.includes("https://www.googleapis.com/auth/gmail.send") || scopes.includes("https://mail.google.com/");
-  } catch (error) {
-    return false;
-  }
+  } catch (error) { return false; }
 }
 
 async function sendEmailViaGmail(accessToken, recipient, subject, body) {
   const hasValidScope = await verifyGmailScope(accessToken);
   if (!hasValidScope) {
-    const error = new Error("Token Gmail invalide ou scope gmail.send manquant");
+    const error = new Error("Token Gmail invalide ou scope manquant");
     error.code = "GMAIL_SCOPE_MISSING";
     throw error;
   }
-  
+
   const messageLines = [
     `To: ${recipient}`,
     `Subject: =?utf-8?B?${Buffer.from(subject || "(sans sujet)").toString("base64")}?=`,
@@ -1807,9 +1640,8 @@ async function sendEmailViaResend(recipient, subject, body) {
       "https://api.resend.com/emails",
       {
         from: process.env.RESEND_FROM || "Luba <onboarding@resend.dev>",
-        to: recipient,
-        subject: subject || "(sans sujet)",
-        html: `<div style="font-family: Arial; padding: 20px;">${String(body || "").replace(/\n/g, "<br>")}</div>`
+        to: recipient, subject: subject || "(sans sujet)",
+        html: `<div style="font-family: Arial; padding: 20px;">${escapeHtml(body).replace(/\n/g, "<br>")}</div>`
       },
       { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, timeout: 15000 }
     );
@@ -1824,15 +1656,12 @@ async function sendEmailViaSMTP(to, subject, body) {
   try {
     const info = await emailTransporter.sendMail({
       from: process.env.EMAIL_FROM || `"Luba" <${process.env.SMTP_USER}>`,
-      to,
-      subject: subject || "(sans sujet)",
-      html: `<div style="font-family: Arial; padding: 20px;">${String(body || "").replace(/\n/g, "<br>")}</div>`,
+      to, subject: subject || "(sans sujet)",
+      html: `<div style="font-family: Arial; padding: 20px;">${escapeHtml(body).replace(/\n/g, "<br>")}</div>`,
       text: body || ""
     });
     return { success: true, provider: "smtp", messageId: info.messageId };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
+  } catch (error) { return { success: false, error: error.message }; }
 }
 
 async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, userId }) {
@@ -1843,11 +1672,8 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, 
 
   let result;
   if (googleAccessToken) {
-    try {
-      result = await sendEmailViaGmail(googleAccessToken, recipient, subject, body);
-    } catch (error) {
-      result = { success: false, error: `Gmail API: ${error.message}` };
-    }
+    try { result = await sendEmailViaGmail(googleAccessToken, recipient, subject, body); }
+    catch (error) { result = { success: false, error: `Gmail API: ${error.message}` }; }
   } else if (process.env.RESEND_API_KEY) {
     result = await sendEmailViaResend(recipient, subject, body);
   } else {
@@ -1858,94 +1684,74 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, 
     await dbRun("INSERT INTO email_logs (user_id, to_email, subject, status, provider, error_message) VALUES (?, ?, ?, ?, ?, ?)", [
       userId || null, recipient, subject || null, result.success ? "sent" : "failed", result.provider || null, result.error || null
     ]);
-  } catch (logErr) {
-    logger.error({ error: logErr.message }, "Erreur journalisation email");
-  }
+  } catch (logErr) { logger.error({ error: logErr.message }, "Erreur journalisation email"); }
 
   return result;
 }
 
-// ==================== WHATSAPP CRYPTO (✅ CORRIGÉ) ====================
+// ==================== WHATSAPP CRYPTO ====================
 function getWhatsAppCryptoKey() {
   const key = process.env.WHATSAPP_ENCRYPTION_KEY;
   const iv = process.env.WHATSAPP_ENCRYPTION_IV;
-  
+
   if (!key || key.length < 32 || !iv || iv.length < 16) {
     if (CONFIG.ENV === "production") {
-      throw new Error("WHATSAPP_ENCRYPTION_KEY (32+ chars) et WHATSAPP_ENCRYPTION_IV (16 chars) requis en production");
+      throw new Error("WHATSAPP_ENCRYPTION_KEY (32+) et WHATSAPP_ENCRYPTION_IV (16+) requis en production");
     }
     logger.warn("⚠️ Clé WhatsApp par défaut — JAMAIS en prod");
   }
-  
+
   return {
     key: Buffer.from((key || "dev-only-key-32-chars-minimum!!").slice(0, 32)),
     iv: Buffer.from((iv || "dev-only-iv-16ch").slice(0, 16))
   };
 }
 
-// ✅ CORRIGÉ : IV aléatoire par enregistrement
 async function saveWhatsAppCredentials(userId, credentialsData) {
   if (!supabase) return false;
-  
   try {
     const { key } = getWhatsAppCryptoKey();
-    const iv = crypto.randomBytes(16); // ✅ IV aléatoire par enregistrement
+    const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    
+
     let encrypted = cipher.update(JSON.stringify(credentialsData), 'utf8', 'hex');
     encrypted += cipher.final('hex');
     const authTag = cipher.getAuthTag().toString('hex');
-    
+
     const { error } = await supabase
       .from('whatsapp_credentials')
-      .upsert({ 
-        user_id: userId, 
-        encrypted_data: encrypted, 
-        auth_tag: authTag,
-        iv: iv.toString('hex'), // ✅ Stocker l'IV
-        updated_at: new Date().toISOString() 
-      });
-    
-    if (error) {
-      logger.error({ error: error.message }, "Erreur sauvegarde credentials WhatsApp");
-      return false;
-    }
-    
+      .upsert({
+        user_id: userId, encrypted_data: encrypted, auth_tag: authTag,
+        iv: iv.toString('hex'), updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id' });
+
+    if (error) { logger.error({ error: error.message }, "Erreur save credentials WhatsApp"); return false; }
     return true;
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur chiffrement credentials WhatsApp");
-    return false;
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur chiffrement WhatsApp"); return false; }
 }
 
 async function loadWhatsAppCredentials(userId) {
   if (!supabase) return null;
-  
   try {
     const { data, error } = await supabase
       .from('whatsapp_credentials')
       .select('encrypted_data, auth_tag, iv')
       .eq('user_id', userId)
       .maybeSingle();
-    
+
     if (error || !data) return null;
-    
+
     const { key } = getWhatsAppCryptoKey();
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(data.iv, 'hex'));
-    
     decipher.setAuthTag(Buffer.from(data.auth_tag, 'hex'));
-    
+
     let decrypted = decipher.update(data.encrypted_data, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
-    
     return JSON.parse(decrypted);
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur déchiffrement credentials WhatsApp");
-    return null;
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur déchiffrement WhatsApp"); return null; }
 }
 
-// ==================== WHATSAPP - BAILEYS ====================
+// ==================== WHATSAPP BAILEYS ====================
 function toPlainWhatsAppText(markdown) {
   return String(markdown)
     .replace(/!\[.*?\]\(.*?\)/g, "")
@@ -1956,9 +1762,7 @@ function toPlainWhatsAppText(markdown) {
 }
 
 class BaileysManager {
-  constructor() {
-    this.sessions = new Map();
-  }
+  constructor() { this.sessions = new Map(); }
 
   async initClient(userId) {
     const existing = this.sessions.get(userId);
@@ -1970,27 +1774,19 @@ class BaileysManager {
 
     const savedCredentials = await loadWhatsAppCredentials(userId);
     if (savedCredentials) {
-      try {
-        fs.writeFileSync(path.join(authDir, "creds.json"), JSON.stringify(savedCredentials));
-      } catch (error) {
-        logger.error({ error: error.message }, "Erreur restauration credentials WhatsApp");
-      }
+      try { fs.writeFileSync(path.join(authDir, "creds.json"), JSON.stringify(savedCredentials)); }
+      catch (error) { logger.error({ error: error.message }, "Erreur restauration WhatsApp"); }
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     let version;
-    try {
-      version = (await fetchLatestBaileysVersion()).version;
-    } catch (e) {
-      version = undefined;
-    }
+    try { version = (await fetchLatestBaileysVersion()).version; } catch (e) { version = undefined; }
 
     const sock = makeWASocket({
-      version,
-      auth: state,
+      version, auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Luba.ia", "Chrome", "1.0.0"]
+      browser: ["Luba.ia", "Chrome", "14.0.0"]
     });
 
     const sessionData = { sock, qrCode: null, ready: false };
@@ -2003,23 +1799,15 @@ class BaileysManager {
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
-
       if (qr) {
-        try {
-          sessionData.qrCode = await qrcode.toDataURL(qr, { width: 600, margin: 2 });
-          logger.info({ userId }, "QR Code WhatsApp généré");
-        } catch (e) {
-          logger.error({ error: e.message }, "Erreur génération QR");
-        }
+        try { sessionData.qrCode = await qrcode.toDataURL(qr, { width: 600, margin: 2 }); logger.info({ userId }, "QR WhatsApp généré"); }
+        catch (e) { logger.error({ error: e.message }, "Erreur QR"); }
       }
-
       if (connection === "open") {
-        sessionData.ready = true;
-        sessionData.qrCode = null;
+        sessionData.ready = true; sessionData.qrCode = null;
         db.run("UPDATE users SET whatsapp_connected = 1 WHERE id = ?", [userId]);
         logger.info({ userId }, "WhatsApp connecté");
       }
-
       if (connection === "close") {
         sessionData.ready = false;
         db.run("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]);
@@ -2027,9 +1815,7 @@ class BaileysManager {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         this.sessions.delete(userId);
         if (shouldReconnect) {
-          setTimeout(() => {
-            this.initClient(userId).catch((e) => logger.error({ error: e.message }, "Erreur reconnexion WhatsApp"));
-          }, CONFIG.WHATSAPP_RETRY_DELAY);
+          setTimeout(() => { this.initClient(userId).catch((e) => logger.error({ error: e.message }, "Erreur reconnexion WhatsApp")); }, CONFIG.WHATSAPP_RETRY_DELAY);
         }
       }
     });
@@ -2049,20 +1835,15 @@ class BaileysManager {
           const conversationId = `whatsapp_${phoneNumber}`;
 
           const result = await handleChat({
-            conversationId,
-            userId: conversationId,
-            firebaseUid: null,
+            conversationId, userId: conversationId, firebaseUid: null,
             message: text.slice(0, CONFIG.MAX_MESSAGE_LENGTH),
-            channel: "whatsapp",
-            modelTier: "v100"
+            channel: "whatsapp", modelTier: "v100"
           });
 
           if (result?.reply) {
             await sock.sendMessage(remoteJid, { text: toPlainWhatsAppText(result.reply) || "🙂" });
           }
-        } catch (err) {
-          logger.error({ error: err.message }, "Erreur traitement message WhatsApp");
-        }
+        } catch (err) { logger.error({ error: err.message }, "Erreur traitement message WhatsApp"); }
       }
     });
 
@@ -2078,7 +1859,7 @@ class BaileysManager {
     }
     const cleanNumber = String(to).replace(/[^\d]/g, "");
     if (!cleanNumber) {
-      const error = new Error("Numéro de destinataire invalide");
+      const error = new Error("Numéro destinataire invalide");
       error.code = "INVALID_RECIPIENT";
       throw error;
     }
@@ -2087,45 +1868,33 @@ class BaileysManager {
     return { success: true, to: cleanNumber };
   }
 
-  getQRCode(userId) {
-    return this.sessions.get(userId)?.qrCode || null;
-  }
+  getQRCode(userId) { return this.sessions.get(userId)?.qrCode || null; }
 
   async destroyAll() {
     for (const [userId, session] of this.sessions) {
-      try {
-        session.sock.end(undefined);
-      } catch (e) {
-        logger.error({ error: e.message }, `Erreur fermeture WhatsApp (${userId})`);
-      }
+      try { session.sock.end(undefined); }
+      catch (e) { logger.error({ error: e.message }, `Erreur fermeture WhatsApp (${userId})`); }
     }
   }
 }
 
 const whatsappManager = new BaileysManager();
 
-queueManager.createQueue(
-  "whatsapp-outbound",
-  async (job) => {
-    const data = job?.data ?? job;
-    const { userId, phoneNumber, message } = data;
-    await whatsappManager.sendMessage(userId, phoneNumber, message);
-  },
-  { concurrency: 3, limiter: { max: 10, duration: 1000 } }
-);
+queueManager.createQueue("whatsapp-outbound", async (job) => {
+  const data = job?.data ?? job;
+  const { userId, phoneNumber, message } = data;
+  await whatsappManager.sendMessage(userId, phoneNumber, message);
+}, { concurrency: 3, limiter: { max: 10, duration: 1000 } });
 
 async function sendWhatsAppSmart(userId, phoneNumber, message) {
   const quotaCheck = await checkUserQuota(userId, 'whatsapp');
-  if (!quotaCheck.allowed) {
-    throw new Error(quotaCheck.message || "Limite WhatsApp atteinte");
-  }
-  
+  if (!quotaCheck.allowed) throw new Error(quotaCheck.message || "Limite WhatsApp atteinte");
   await queueManager.add("whatsapp-outbound", { userId, phoneNumber, message }, { attempts: 5, backoffDelay: 2000 });
   await incrementUserQuota(userId, 'whatsapp');
   return { success: true, queued: true };
 }
 
-// ==================== ARCHITECTURE LLM (✅ CORRIGÉE) ====================
+// ==================== ARCHITECTURE LLM MULTI-PROVIDER v14 ====================
 function buildKeyPool(keys, prefix) {
   return keys
     .filter((k) => typeof k === "string" && k.trim().length > 0)
@@ -2136,66 +1905,83 @@ function buildKeyPool(keys, prefix) {
     }));
 }
 
+// ✅ GEMINI v14 : SDK officiel
+let geminiClient = null;
+if (GoogleGenAI && process.env.GEMINI_API_KEY) {
+  try {
+    geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    logger.info("✅ Client Gemini initialisé");
+  } catch (error) {
+    logger.error({ error: error.message }, "❌ Erreur init Gemini");
+  }
+} else if (!process.env.GEMINI_API_KEY) {
+  logger.warn("⚠️ GEMINI_API_KEY absent — Gemini désactivé");
+}
+
 const LLM_PROVIDERS = {
   GROQ: {
     baseURL: "https://api.groq.com/openai/v1",
     timeout: CONFIG.DEFAULT_TIMEOUT,
-    maxTokens: 4000,
-    temperature: 0.7,
+    maxTokens: 4000, temperature: 0.7,
     keyPool: buildKeyPool([process.env.GROQ_API_KEY, process.env.GROQ_API_KEY_2], "groq")
   },
   OPENROUTER: {
     baseURL: "https://openrouter.ai/api/v1",
     timeout: 60000,
-    maxTokens: 4000,
-    temperature: 0.7,
-    keyPool: buildKeyPool(
-      [process.env.OPENROUTER_API_KEY, process.env.OPENROUTER_API_KEY_2, process.env.OPENROUTER_API_KEY_3],
-      "openrouter"
-    )
+    maxTokens: 4000, temperature: 0.7,
+    keyPool: buildKeyPool([process.env.OPENROUTER_API_KEY, process.env.OPENROUTER_API_KEY_2, process.env.OPENROUTER_API_KEY_3], "openrouter")
+  },
+  // ✅ CEREBRAS v14 : API OpenAI-compatible
+  CEREBRAS: {
+    baseURL: "https://api.cerebras.ai/v1",
+    timeout: 45000,
+    maxTokens: 4000, temperature: 0.7,
+    keyPool: buildKeyPool([process.env.CEREBRAS_API_KEY, process.env.CEREBRAS_API_KEY_2], "cerebras")
+  },
+  // ✅ GEMINI v14 : SDK dédié
+  GEMINI: {
+    baseURL: "https://generativelanguage.googleapis.com/v1beta",
+    timeout: 60000,
+    maxTokens: 8000, temperature: 0.7,
+    isGemini: true,
+    client: geminiClient,
+    keyPool: buildKeyPool([process.env.GEMINI_API_KEY], "gemini")
   }
 };
 
-if (LLM_PROVIDERS.OPENROUTER.keyPool.length === 0) {
-  logger.warn("⚠️ Aucune clé OPENROUTER_API_KEY configurée");
-} else {
-  logger.info(`✅ ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s) OpenRouter configurée(s)`);
-}
-if (LLM_PROVIDERS.GROQ.keyPool.length === 0) {
-  logger.warn("⚠️ Aucune clé GROQ_API_KEY configurée");
-} else {
-  logger.info(`✅ ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s) Groq configurée(s)`);
-}
+if (LLM_PROVIDERS.OPENROUTER.keyPool.length === 0) logger.warn("⚠️ Aucune clé OPENROUTER");
+else logger.info(`✅ ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s) OpenRouter`);
+if (LLM_PROVIDERS.GROQ.keyPool.length === 0) logger.warn("⚠️ Aucune clé GROQ");
+else logger.info(`✅ ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s) Groq`);
+if (LLM_PROVIDERS.CEREBRAS.keyPool.length === 0) logger.warn("⚠️ Aucune clé CEREBRAS");
+else logger.info(`✅ ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s) Cerebras`);
 
-// ==================== MODÈLES (✅ ACTUALISÉS SEPTEMBRE 2026) ====================
+// ==================== MODÈLES v14 ====================
 const MODEL_TIERS = {
   v100: {
     name: "Mwamba",
     providers: [
-      // Groq principal (confirmé)
       { provider: "groq", model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile", maxTokens: 4000, timeout: 45000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
-      // OpenRouter codage (confirmé)
-      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "poolside/laguna-s-2.1:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 1 },
-      // OpenRouter raisonnement (confirmé)
-      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "nvidia/nemotron-3-super-120b:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 2 },
-      // OpenRouter général (confirmé)
-      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_3 || "nvidia/nemotron-3.5-lightning:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 3 }
+      { provider: "gemini", model: process.env.GEMINI_MODEL_V100 || "gemini-3.6-flash", maxTokens: 8000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 1 },
+      { provider: "cerebras", model: process.env.CEREBRAS_MODEL_V100 || "qwen-3.8-27b", maxTokens: 4000, timeout: 45000, temperature: 0.7, jsonMode: true, failoverPriority: 2 },
+      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "poolside/laguna-s-2.1:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 3 },
+      { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "nvidia/nemotron-3-super-120b:free", maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 4 }
     ]
   },
   v250: {
     name: "Ngandu",
     reasoning: {
       providers: [
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "nvidia/nemotron-3-super-120b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING_FALLBACK || "nvidia/nemotron-3.5-lightning:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1 },
-        { provider: "groq", model: process.env.GROQ_MODEL_V250_REASONING_FALLBACK || "openai/gpt-oss-120b", maxTokens: 6000, timeout: 45000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
+        { provider: "gemini", model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-3.6-flash", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 0 },
+        { provider: "cerebras", model: process.env.CEREBRAS_MODEL_V250_REASONING || "qwen-3.8-27b", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 1, reasoningEffort: "high" },
+        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "nvidia/nemotron-3-super-120b:free", maxTokens: 8000, timeout: 90000, temperature: 0.3, jsonMode: false, failoverPriority: 2 }
       ]
     },
     code: {
       providers: [
         { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE || "poolside/laguna-s-2.1:free", maxTokens: 8000, timeout: 90000, temperature: 0.5, jsonMode: true, failoverPriority: 0 },
-        { provider: "groq", model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 1 },
-        { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_CODE_FALLBACK_2 || "nvidia/nemotron-3.5-lightning:free", maxTokens: 8000, timeout: 60000, temperature: 0.5, jsonMode: true, failoverPriority: 2 }
+        { provider: "cerebras", model: process.env.CEREBRAS_MODEL_V250_CODE || "qwen-3.8-27b", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 1 },
+        { provider: "groq", model: process.env.GROQ_MODEL_V250_CODE_FALLBACK || "llama-3.3-70b-versatile", maxTokens: 8000, timeout: 45000, temperature: 0.5, jsonMode: true, failoverPriority: 2 }
       ]
     },
     maxRetries: CONFIG.MAX_RETRY_ATTEMPTS,
@@ -2204,10 +1990,9 @@ const MODEL_TIERS = {
   vision: {
     name: "Vision",
     providers: [
-      // ✅ CORRIGÉ : qwen/qwen3.6-27b (vision Groq confirmée)
-      { provider: "groq", model: CONFIG.VISION_MODEL_GROQ, maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
-      // ✅ CORRIGÉ : inclusionai/ling-3.0-flash-vl:free (vision OpenRouter confirmée)
-      { provider: "openrouter", model: CONFIG.VISION_MODEL_OPENROUTER, maxTokens: 4000, timeout: 90000, temperature: 0.7, jsonMode: true, failoverPriority: 1 }
+      { provider: "gemini", model: CONFIG.VISION_MODEL_GEMINI, maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 0 },
+      { provider: "openrouter", model: CONFIG.VISION_MODEL_OPENROUTER, maxTokens: 4000, timeout: 90000, temperature: 0.7, jsonMode: true, failoverPriority: 1 },
+      { provider: "groq", model: CONFIG.VISION_MODEL_GROQ, maxTokens: 4000, timeout: 60000, temperature: 0.7, jsonMode: true, failoverPriority: 2 }
     ]
   }
 };
@@ -2229,29 +2014,19 @@ async function checkModelAvailability() {
   try {
     const response = await axios.get("https://openrouter.ai/api/v1/models", { timeout: 10000 });
     const catalog = response.data?.data || [];
-    const freeIds = new Set(
-      catalog
-        .filter((m) => m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0"))
-        .map((m) => m.id)
-    );
+    const freeIds = new Set(catalog.filter((m) => m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0")).map((m) => m.id));
     const allIds = new Set(catalog.map((m) => m.id));
 
     for (const model of collectConfiguredOpenRouterModels()) {
-      if (!allIds.has(model)) {
-        issues.push({ provider: "openrouter", model, problem: "INTROUVABLE" });
-      } else if (!freeIds.has(model)) {
-        issues.push({ provider: "openrouter", model, problem: "PAYANT" });
-      }
+      if (!allIds.has(model)) issues.push({ provider: "openrouter", model, problem: "INTROUVABLE" });
+      else if (!freeIds.has(model)) issues.push({ provider: "openrouter", model, problem: "PAYANT" });
     }
-  } catch (error) {
-    logger.error({ error: error.message }, "Impossible de vérifier le catalogue OpenRouter");
-  }
+  } catch (error) { logger.error({ error: error.message }, "Erreur vérif OpenRouter"); }
 
   try {
     if (LLM_PROVIDERS.GROQ.keyPool.length > 0) {
       const response = await axios.get("https://api.groq.com/openai/v1/models", {
-        timeout: 10000,
-        headers: { Authorization: "Bearer " + LLM_PROVIDERS.GROQ.keyPool[0].apiKey }
+        timeout: 10000, headers: { Authorization: "Bearer " + LLM_PROVIDERS.GROQ.keyPool[0].apiKey }
       });
       const groqIds = new Set((response.data?.data || []).map((m) => m.id));
       const configuredGroqModels = new Set([
@@ -2261,13 +2036,46 @@ async function checkModelAvailability() {
         CONFIG.VISION_MODEL_GROQ
       ]);
       for (const model of configuredGroqModels) {
-        if (!groqIds.has(model)) {
-          issues.push({ provider: "groq", model, problem: "INTROUVABLE" });
-        }
+        if (!groqIds.has(model)) issues.push({ provider: "groq", model, problem: "INTROUVABLE" });
       }
     }
-  } catch (error) {
-    logger.warn({ error: error.message }, "Impossible de vérifier le catalogue Groq");
+  } catch (error) { logger.warn({ error: error.message }, "Erreur vérif Groq"); }
+
+  // ✅ v14 : Vérification Cerebras
+  try {
+    if (LLM_PROVIDERS.CEREBRAS.keyPool.length > 0) {
+      const response = await axios.get("https://api.cerebras.ai/v1/models", {
+        timeout: 10000, headers: { Authorization: "Bearer " + LLM_PROVIDERS.CEREBRAS.keyPool[0].apiKey }
+      });
+      const cerebrasIds = new Set((response.data?.data || []).map((m) => m.id));
+      const configuredCerebrasModels = new Set([
+        ...MODEL_TIERS.v100.providers.filter((p) => p.provider === "cerebras").map((p) => p.model),
+        ...MODEL_TIERS.v250.reasoning.providers.filter((p) => p.provider === "cerebras").map((p) => p.model),
+        ...MODEL_TIERS.v250.code.providers.filter((p) => p.provider === "cerebras").map((p) => p.model)
+      ]);
+      for (const model of configuredCerebrasModels) {
+        if (!cerebrasIds.has(model)) issues.push({ provider: "cerebras", model, problem: "INTROUVABLE" });
+      }
+    }
+  } catch (error) { logger.warn({ error: error.message }, "Erreur vérif Cerebras"); }
+
+  // ✅ v14 : Vérification Gemini
+  if (geminiClient) {
+    try {
+      const response = await axios.get(
+        `https://generativelanguage.googleapis.com/v1beta/models`,
+        { timeout: 10000, headers: { "x-goog-api-key": process.env.GEMINI_API_KEY } }
+      );
+      const geminiIds = new Set((response.data?.models || []).map((m) => m.name?.replace("models/", "")));
+      const configuredGeminiModels = new Set([
+        ...MODEL_TIERS.v100.providers.filter((p) => p.provider === "gemini").map((p) => p.model),
+        ...MODEL_TIERS.v250.reasoning.providers.filter((p) => p.provider === "gemini").map((p) => p.model),
+        CONFIG.VISION_MODEL_GEMINI
+      ]);
+      for (const model of configuredGeminiModels) {
+        if (!geminiIds.has(model)) issues.push({ provider: "gemini", model, problem: "INTROUVABLE" });
+      }
+    } catch (error) { logger.warn({ error: error.message }, "Erreur vérif Gemini"); }
   }
 
   modelAvailabilityReport = { checkedAt: new Date().toISOString(), issues, ok: issues.length === 0 };
@@ -2275,7 +2083,7 @@ async function checkModelAvailability() {
   if (issues.length > 0) {
     logger.warn({ issues }, "🚨 MODÈLES PROBLÉMATIQUES — voir GET /api/health");
   } else {
-    logger.info("✅ Tous les modèles configurés sont vérifiés");
+    logger.info("✅ Tous les modèles vérifiés");
   }
 }
 
@@ -2311,33 +2119,30 @@ class LLMErrorInterceptor {
     return "UNKNOWN_ERROR";
   }
 
-  static shouldSkipProvider(error, providerConfig) {
+  static shouldSkipProvider(error) {
     const errorCode = this.getErrorCode(error);
     if (["HTTP_402", "HTTP_404", "MISSING_API_KEY"].includes(errorCode)) return true;
     return false;
   }
 }
 
+// ==================== EXECUTE WITH RETRY AND FALLBACK ====================
 async function executeWithRetryAndFallback(providerList, promptParams, options = {}) {
   const {
     maxRetriesPerProvider = CONFIG.MAX_RETRY_ATTEMPTS,
     baseDelayMs = CONFIG.RETRY_BASE_DELAY_MS,
     maxDelayMs = CONFIG.RETRY_MAX_DELAY_MS,
     timeoutMultiplier = 1.5,
-    onProviderFail = null,
-    onProviderSuccess = null,
+    onProviderFail = null, onProviderSuccess = null,
     enableCircuitBreaker = true,
-    sessionId = null,
-    userId = null,
-    tier = "v100"
+    sessionId = null, userId = null, tier = "v100"
   } = options;
 
   let lastError = null;
   const providerResults = [];
   const sortedProviders = [...providerList].sort((a, b) => a.failoverPriority - b.failoverPriority);
 
-  for (let i = 0; i < sortedProviders.length; i++) {
-    const providerConfig = sortedProviders[i];
+  for (const providerConfig of sortedProviders) {
     const provider = providerConfig.provider;
     const providerInfo = LLM_PROVIDERS[provider.toUpperCase()];
 
@@ -2349,7 +2154,10 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
       if (!model) continue;
     }
 
-    for (const keyEntry of providerInfo.keyPool) {
+    // Gemini utilise un client global, pas de clé par requête
+    const keyList = provider === "gemini" ? [{ apiKey: null, label: "gemini_global", circuitBreaker: providerInfo.keyPool[0]?.circuitBreaker }] : providerInfo.keyPool;
+
+    for (const keyEntry of keyList) {
       let keyFailedHard = false;
 
       for (let attempt = 0; attempt < maxRetriesPerProvider; attempt++) {
@@ -2359,15 +2167,15 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
 
           const executeCall = async () => {
             return await callProviderRaw({
-              provider,
-              model,
+              provider, model,
               messages: promptParams.messages,
               jsonMode: providerConfig.jsonMode,
               timeout,
               maxTokens: providerConfig.maxTokens,
               temperature: providerConfig.temperature,
               images: promptParams.images || null,
-              apiKey: keyEntry.apiKey
+              apiKey: keyEntry.apiKey,
+              reasoningEffort: providerConfig.reasoningEffort || null
             });
           };
 
@@ -2380,13 +2188,9 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
 
           const latencyMs = Date.now() - startTime;
           const providerResult = {
-            providerUsed: provider,
-            modelUsed: model,
-            keyLabel: keyEntry.label,
+            providerUsed: provider, modelUsed: model, keyLabel: keyEntry.label,
             providerPriority: providerConfig.failoverPriority,
-            attempts: attempt + 1,
-            response: result,
-            latencyMs
+            attempts: attempt + 1, response: result, latencyMs
           };
 
           providerResults.push(providerResult);
@@ -2400,7 +2204,6 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
           }
 
           if (onProviderSuccess) onProviderSuccess(providerResult);
-
           return { success: true, ...providerResult, providerChain: providerResults };
         } catch (error) {
           lastError = error;
@@ -2419,10 +2222,7 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
             onProviderFail({ provider, model, keyLabel: keyEntry.label, errorCode, errorMessage: error.message, attempt: attempt + 1 });
           }
 
-          if (LLMErrorInterceptor.shouldSkipProvider(error, providerConfig)) {
-            keyFailedHard = true;
-            break;
-          }
+          if (LLMErrorInterceptor.shouldSkipProvider(error)) { keyFailedHard = true; break; }
 
           if (LLMErrorInterceptor.isRetryableError(error) && attempt < maxRetriesPerProvider - 1) {
             const retryDelay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
@@ -2434,20 +2234,28 @@ async function executeWithRetryAndFallback(providerList, promptParams, options =
         }
       }
 
-      logger.warn({ provider, model, keyLabel: keyEntry.label }, keyFailedHard ? "Clé API en échec définitif, rotation" : "Clé API épuisée, rotation");
+      logger.warn({ provider, model, keyLabel: keyEntry.label }, keyFailedHard ? "Clé en échec définitif, rotation" : "Clé épuisée, rotation");
     }
   }
 
   return {
-    success: false,
-    error: lastError,
+    success: false, error: lastError,
     providerChain: providerResults,
     errorCode: LLMErrorInterceptor.getErrorCode(lastError)
   };
 }
 
-async function callProviderRaw({ provider, model, messages, jsonMode = false, timeout, maxTokens, temperature = 0.7, images = null, apiKey = null }) {
-  const cfg = provider === "groq" ? LLM_PROVIDERS.GROQ : LLM_PROVIDERS.OPENROUTER;
+// ==================== CALL PROVIDER RAW (v14 : Gemini + Cerebras) ====================
+async function callProviderRaw({ provider, model, messages, jsonMode = false, timeout, maxTokens, temperature = 0.7, images = null, apiKey = null, reasoningEffort = null }) {
+  // ✅ Gemini : format spécifique
+  if (provider === "gemini") {
+    return await callGeminiRaw({ model, messages, jsonMode, timeout, maxTokens, temperature, images });
+  }
+
+  // Cerebras / Groq / OpenRouter : OpenAI-compatible
+  const cfg = provider === "groq" ? LLM_PROVIDERS.GROQ
+    : provider === "cerebras" ? LLM_PROVIDERS.CEREBRAS
+    : LLM_PROVIDERS.OPENROUTER;
 
   if (!apiKey) {
     const err = new Error("Clé API manquante pour " + provider);
@@ -2470,20 +2278,11 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
     }
   }
 
-  const payload = {
-    model,
-    messages: formattedMessages,
-    temperature,
-    max_tokens: maxTokens || cfg.maxTokens
-  };
-
+  const payload = { model, messages: formattedMessages, temperature, max_tokens: maxTokens || cfg.maxTokens };
   if (jsonMode) payload.response_format = { type: "json_object" };
+  if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
 
-  const headers = {
-    Authorization: "Bearer " + apiKey,
-    "Content-Type": "application/json"
-  };
-
+  const headers = { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" };
   if (provider === "openrouter") {
     headers["HTTP-Referer"] = HOSTING_CONFIG.domain;
     headers["X-Title"] = "Luba.ia Assistant";
@@ -2493,15 +2292,90 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
 
   const choice = response?.data?.choices?.[0];
   const content = choice?.message?.content;
-
   if (!content) throw new Error("Réponse " + provider + " vide");
 
   if (!jsonMode) return content;
 
-  try {
-    return JSON.parse(content);
-  } catch (parseError) {
-    throw new Error(`Réponse ${provider} invalide (JSON malformé)`);
+  try { return JSON.parse(content); }
+  catch (parseError) { throw new Error(`Réponse ${provider} invalide (JSON malformé)`); }
+}
+
+// ✅ NOUVELLE FONCTION v14 : Appel Gemini natif
+async function callGeminiRaw({ model, messages, jsonMode, timeout, maxTokens, temperature, images }) {
+  if (!geminiClient) throw new Error("Client Gemini non initialisé");
+
+  // Conversion OpenAI → Gemini Contents
+  const contents = [];
+  let systemInstruction = null;
+
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      systemInstruction = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      continue;
+    }
+    if (msg.role === "tool") {
+      // Gemini n'a pas de role "tool" — on le convertit en texte utilisateur
+      contents.push({ role: "user", parts: [{ text: `[Résultat outil] ${typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)}` }] });
+      continue;
+    }
+
+    const role = msg.role === "assistant" ? "model" : "user";
+    const parts = [];
+
+    if (typeof msg.content === "string") {
+      parts.push({ text: msg.content });
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "text") parts.push({ text: part.text });
+        if (part.type === "image_url") {
+          const dataUrl = part.image_url.url;
+          const [mimePrefix, base64Data] = dataUrl.split(",");
+          const cleanMime = mimePrefix.match(/data:(.*?);/)?.[1] || "image/jpeg";
+          parts.push({ inlineData: { mimeType: cleanMime, data: base64Data } });
+        }
+      }
+    }
+
+    if (parts.length > 0) contents.push({ role, parts });
+  }
+
+  // Ajout d'images séparées au dernier message user
+  if (images && images.length > 0) {
+    const lastContent = contents[contents.length - 1];
+    if (lastContent?.role === "user") {
+      for (const image of images) {
+        lastContent.parts.push({
+          inlineData: { mimeType: image.mimetype || "image/jpeg", data: image.base64 }
+        });
+      }
+    }
+  }
+
+  const config = {
+    temperature,
+    maxOutputTokens: maxTokens || LLM_PROVIDERS.GEMINI.maxTokens,
+    responseMimeType: jsonMode ? "application/json" : "text/plain"
+  };
+
+  if (systemInstruction) {
+    config.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+
+  const response = await geminiClient.models.generateContent({ model, contents, config });
+  const text = response.text;
+  if (!text) throw new Error("Réponse Gemini vide");
+
+  if (!jsonMode) return text;
+
+  try { return JSON.parse(text); }
+  catch (e) {
+    // Tentative de récupération : cherche un JSON dans le texte
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); }
+      catch (e2) { throw new Error("Réponse Gemini invalide (JSON malformé)"); }
+    }
+    throw new Error("Réponse Gemini invalide (JSON malformé)");
   }
 }
 
@@ -2509,36 +2383,12 @@ async function callProviderRaw({ provider, model, messages, jsonMode = false, ti
 class DynamicContextManager {
   constructor() {
     this.domainPatterns = [
-      {
-        domain: "mathematics",
-        keywords: ["math", "calcul", "équation", "equation", "algèbre", "algebra", "géométrie", "geometry", "calculus", "intégrale", "integrale", "dérivée", "derivative", "théorème", "theorem", "nombre", "number", "fonction", "function", "limite", "limit", "matrice", "matrix", "probabilité", "probability", "statistique", "statistics"],
-        systemPrompt: "Tu es un expert en mathématiques. Utilise LaTeX pour toutes les formules. Détaille chaque étape du raisonnement."
-      },
-      {
-        domain: "cybersecurity",
-        keywords: ["sécurité", "security", "cyber", "hack", "vulnérabilité", "vulnerability", "exploit", "pentest", "cryptographie", "cryptography", "chiffrement", "encryption", "pare-feu", "firewall", "malware", "virus", "phishing", "authentification", "token", "jwt", "sql injection", "xss", "csrf", "ddos", "ransomware"],
-        systemPrompt: "Tu es un expert en cybersécurité. Adopte une approche défensive et éthique."
-      },
-      {
-        domain: "development",
-        keywords: ["code", "coder", "programmation", "development", "développement", "javascript", "python", "java", "c++", "rust", "go", "typescript", "react", "vue", "angular", "node", "express", "api", "database", "sql", "nosql", "backend", "frontend", "bug", "debug", "fonction", "function", "classe", "class", "algorithme", "framework", "library", "package", "npm", "git", "docker", "kubernetes", "html", "css"],
-        systemPrompt: "Tu es un expert en développement logiciel. Fournis du code de production complet et fonctionnel. Ne génère du code que si l'utilisateur le demande explicitement."
-      },
-      {
-        domain: "data_science",
-        keywords: ["data", "données", "machine learning", "deep learning", "neural network", "réseau de neurones", "pandas", "numpy", "tensorflow", "pytorch", "scikit", "regression", "classification", "clustering", "nlp", "computer vision", "dataset"],
-        systemPrompt: "Tu es un expert en data science et machine learning."
-      },
-      {
-        domain: "assistant_virtuel",
-        keywords: ["rappelle-moi", "tâche", "tache", "planifie", "rendez-vous", "emploi du temps", "agenda", "clip", "vidéo", "video", "youtube", "chanson", "automatise"],
-        systemPrompt: "Tu es un assistant virtuel proactif façon Jarvis. Quand l'utilisateur demande d'accomplir une action concrète (chercher/lire une vidéo, créer/lister/terminer une tâche ou un rappel), utilise IMMÉDIATEMENT l'outil correspondant (search_youtube, create_task, list_tasks, complete_task, delete_task) plutôt que de décrire ce que tu ferais."
-      },
-      {
-        domain: "general",
-        keywords: [],
-        systemPrompt: "Tu es un assistant polyvalent."
-      }
+      { domain: "mathematics", keywords: ["math", "calcul", "équation", "equation", "algèbre", "algebra", "géométrie", "geometry", "calculus", "intégrale", "integrale", "dérivée", "derivative", "théorème", "theorem", "nombre", "number", "fonction", "function", "limite", "limit", "matrice", "matrix", "probabilité", "probability", "statistique", "statistics"], systemPrompt: "Tu es un expert en mathématiques. Utilise LaTeX pour toutes les formules. Détaille chaque étape." },
+      { domain: "cybersecurity", keywords: ["sécurité", "security", "cyber", "hack", "vulnérabilité", "vulnerability", "exploit", "pentest", "cryptographie", "cryptography", "chiffrement", "encryption", "pare-feu", "firewall", "malware", "virus", "phishing", "authentification", "token", "jwt", "sql injection", "xss", "csrf", "ddos", "ransomware"], systemPrompt: "Tu es un expert en cybersécurité. Adopte une approche défensive et éthique." },
+      { domain: "development", keywords: ["code", "coder", "programmation", "development", "développement", "javascript", "python", "java", "c++", "rust", "go", "typescript", "react", "vue", "angular", "node", "express", "api", "database", "sql", "nosql", "backend", "frontend", "bug", "debug", "fonction", "function", "classe", "class", "algorithme", "framework", "library", "package", "npm", "git", "docker", "kubernetes", "html", "css"], systemPrompt: "Tu es un expert en développement logiciel. Fournis du code de production complet et fonctionnel." },
+      { domain: "data_science", keywords: ["data", "données", "machine learning", "deep learning", "neural network", "réseau de neurones", "pandas", "numpy", "tensorflow", "pytorch", "scikit", "regression", "classification", "clustering", "nlp", "computer vision", "dataset"], systemPrompt: "Tu es un expert en data science et machine learning." },
+      { domain: "assistant_virtuel", keywords: ["rappelle-moi", "tâche", "tache", "planifie", "rendez-vous", "emploi du temps", "agenda", "clip", "vidéo", "video", "youtube", "chanson", "automatise"], systemPrompt: "Tu es un assistant virtuel proactif façon Jarvis. Utilise immédiatement les outils disponibles (search_youtube, create_task, list_tasks, etc.) au lieu de décrire ce que tu ferais." },
+      { domain: "general", keywords: [], systemPrompt: "Tu es un assistant polyvalent." }
     ];
   }
 
@@ -2549,13 +2399,8 @@ class DynamicContextManager {
     for (const pattern of this.domainPatterns) {
       if (pattern.domain === "general") continue;
       let score = 0;
-      for (const keyword of pattern.keywords) {
-        if (lowerMessage.includes(keyword.toLowerCase())) score += 1;
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatch = pattern;
-      }
+      for (const keyword of pattern.keywords) if (lowerMessage.includes(keyword.toLowerCase())) score += 1;
+      if (score > bestScore) { bestScore = score; bestMatch = pattern; }
     }
     return bestMatch;
   }
@@ -2564,32 +2409,31 @@ class DynamicContextManager {
     const domain = this.analyzeDomain(message);
     const formattingRules = [
       "FORMATAGE STRICT OBLIGATOIRE :",
-      "- Le grand titre de ta réponse doit être en **gras**",
-      "- Les sous-titres/sections doivent utiliser des titres Markdown courts (### Sous-titre)",
-      "- Structure toujours ta réponse en sections courtes",
-      "- Utilise des listes à puces (-) ou numérotées",
-      "- TOUT code doit être encadré dans des blocs Markdown avec triple backticks",
-      "- TOUTE formule mathématique doit être encadrée en LaTeX ($ pour inline, $$ pour display)",
-      "- Utilise le contexte de la conversation pour répondre de manière cohérente"
+      "- Titre principal en **gras** sur sa propre ligne",
+      "- Sous-titres en ### Titre",
+      "- Sections courtes, listes à puces/numerotées",
+      "- Code dans des blocs Markdown avec triple backticks",
+      "- Formules en LaTeX ($ inline, $$ display)",
+      "- Utilise le contexte de la conversation, ne redemande jamais une info déjà donnée"
     ].join("\n");
 
     const webCodeRules = [
-      "RÈGLE STRICTE POUR LA GÉNÉRATION DE CODE HTML/CSS/JAVASCRIPT :",
-      "- Tout code HTML doit être encadré par un bloc Markdown ```html",
-      "- Tout code CSS doit utiliser UNIQUEMENT la syntaxe /* ... */",
-      "- Tout code JavaScript doit être encadré par un bloc Markdown ```javascript",
-      "- Le code livré doit TOUJOURS être complet et syntaxiquement valide",
-      "- Ne génère du code que si l'utilisateur le demande explicitement"
+      "RÈGLE POUR LA GÉNÉRATION DE CODE :",
+      "- HTML : bloc ```html",
+      "- CSS : UNIQUEMENT syntaxe /* ... */",
+      "- JavaScript : bloc ```javascript",
+      "- Code complet et valide, jamais tronqué",
+      "- Génère du code seulement si l'utilisateur le demande explicitement"
     ].join("\n");
 
     let contextSection = "";
     if (conversationContext) {
-      contextSection = "\n\nCONTEXTE DE LA CONVERSATION PRÉCÉDENTE (à utiliser impérativement) :\n" + conversationContext;
+      contextSection = "\n\nCONTEXTE DE LA CONVERSATION PRÉCÉDENTE :\n" + conversationContext;
     }
 
     return {
       role: "system",
-      content: basePrompt + "\n\nDOMAINE D'EXPERTISE DÉTECTÉ : " + domain.domain.toUpperCase() + "\n" + domain.systemPrompt + "\n\n" + formattingRules + "\n\n" + webCodeRules + contextSection
+      content: basePrompt + "\n\nDOMAINE DÉTECTÉ : " + domain.domain.toUpperCase() + "\n" + domain.systemPrompt + "\n\n" + formattingRules + "\n\n" + webCodeRules + contextSection
     };
   }
 }
@@ -2598,30 +2442,29 @@ const dynamicContextManager = new DynamicContextManager();
 
 // ==================== SYSTEM PROMPT ====================
 const LUBA_BASE_SYSTEM_PROMPT = [
-  "Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, une startup basée à Kinshasa, fondée en 2026.",
+  "Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
   "",
   "IDENTITÉ :",
   "- Tu t'appelles Luba (ou Luba.ia).",
-  "- IA développée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
-  "- Ton ton est chaleureux, intelligent et proactif.",
-  "- Tu es un vrai agent IA (façon Jarvis), pas seulement un chatbot passif.",
+  "- Ton ton est chaleureux, intelligent, proactif.",
+  "- Tu es un vrai agent IA (façon Jarvis), pas un chatbot passif.",
   "",
-  "RÈGLE SUR LA MÉMOIRE CONVERSATIONNELLE :",
-  "- Tu dois TOUJOURS te souvenir du contexte de la conversation.",
-  "- Ne redemande JAMAIS une information que l'utilisateur a déjà donnée plus haut.",
-  "- Si une [MÉMOIRE LONG TERME SUR CET UTILISATEUR] est fournie, tu DOIS t'en servir naturellement.",
+  "MÉMOIRE CONVERSATIONNELLE :",
+  "- Souviens-toi du contexte de la conversation.",
+  "- Ne redemande JAMAIS une info déjà donnée.",
+  "- Si une [MÉMOIRE LONG TERME] est fournie, utilise-la naturellement.",
   "",
-  "RÈGLE SUR LES DONNÉES (OBLIGATOIRE) :",
-  "- Tu ne dois JAMAIS inventer un score sportif, une actualité, un résultat de recherche, une donnée météo, une vidéo YouTube ou une tâche.",
-  "- Utilise TOUJOURS l'outil approprié pour obtenir une donnée réelle.",
+  "DONNÉES :",
+  "- N'invente JAMAIS un score, une actualité, une météo, une vidéo.",
+  "- Utilise TOUJOURS l'outil approprié.",
   "",
-  "RÈGLE STRICTE SUR LES IMAGES :",
-  "- Dès que tu décris une personnalité, un lieu ou un objet précis, utilise TOUJOURS search_images.",
+  "IMAGES :",
+  "- Dès que tu décris une personnalité/lieu/objet précis, utilise search_images.",
   "",
-  "RÈGLE SUR L'AUTOMATISATION DE TÂCHES (MODULE JARVIS) :",
-  "- Si l'utilisateur demande de chercher un clip, utilise search_youtube.",
-  "- Si l'utilisateur demande de créer un rappel, utilise create_task.",
-  "- Si l'utilisateur demande de voir ses tâches, utilise list_tasks.",
+  "MODULE JARVIS :",
+  "- Chercher un clip → search_youtube",
+  "- Créer un rappel → create_task",
+  "- Voir les tâches → list_tasks",
   "",
   "FORMAT DE RÉPONSE OBLIGATOIRE (JSON strict) :",
   "{",
@@ -2653,7 +2496,7 @@ async function callLLM_v100(messages, images = null, sessionId = null, userId = 
     return { ...result.response, providerUsed: result.providerUsed, modelUsed: result.modelUsed, degraded: result.providerPriority > 0 };
   }
 
-  throw new Error("Échec complet du tier v100");
+  throw new Error("Échec complet tier v100");
 }
 
 async function callLLM_v250(messages, userMessage, images = null, sessionId = null, userId = null, conversationContext = "") {
@@ -2672,20 +2515,27 @@ async function callLLM_v250(messages, userMessage, images = null, sessionId = nu
     { maxRetriesPerProvider: tier.maxRetries, sessionId, userId, tier: "v250_reasoning" }
   );
 
-  if (!reasoningResult.success || !reasoningResult.response || reasoningResult.response.trim().length < 40) {
+  if (!reasoningResult.success || !reasoningResult.response || String(reasoningResult.response).trim().length < 40) {
     return await degradedFallbackToV100(messages, "reasoning_failed", images, conversationContext);
   }
 
-  const reasoningAnalysis = reasoningResult.response;
+  const reasoningAnalysis = typeof reasoningResult.response === "string" ? reasoningResult.response : JSON.stringify(reasoningResult.response);
   providerChain.push("R1:" + reasoningResult.providerUsed + "/" + reasoningResult.modelUsed);
 
   const formattingDirective = [
-    "Tu DOIS répondre au format JSON strict :",
+    "Réponds STRICTEMENT au format JSON :",
     "{",
     '  "replyText": "réponse complète en Markdown",',
     '  "toolCalls": [],',
     '  "suggestions": ["question 1 ?", "question 2 ?", "question 3 ?"]',
-    "}"
+    "}",
+    "",
+    "FORMATAGE :",
+    "- HTML : ```html ... ```",
+    "- CSS : ```css ... ``` avec /* ... */ uniquement",
+    "- JavaScript : ```javascript ... ```",
+    "- Code complet, jamais tronqué",
+    "- LaTeX : $ inline, $$ display"
   ].join("\n");
 
   const codeMessages = [
@@ -2738,23 +2588,20 @@ async function degradedFallbackToV100(messages, reason, images = null, conversat
       modelUsed: fallbackResult.providerUsed + "/" + fallbackResult.modelUsed,
       degraded: true,
       degradationReason: reason,
-      originalTier: "v250",
-      actualTier: "v100"
+      originalTier: "v250", actualTier: "v100"
     };
   } catch (fallbackError) {
     return {
-      replyText: "Je rencontre actuellement des difficultés techniques. Veuillez réessayer.",
+      replyText: "Je rencontre des difficultés techniques. Veuillez réessayer.",
       toolCalls: [],
-      suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"],
-      providerUsed: "error_graceful_degradation",
-      modelUsed: "none",
-      degraded: true,
-      error: true
+      suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services ?"],
+      providerUsed: "error_graceful_degradation", modelUsed: "none",
+      degraded: true, error: true
     };
   }
 }
 
-// ==================== DISPATCHER D'OUTILS ====================
+// ==================== TOOL DISPATCHER ====================
 async function executeTool(toolName, args = {}, context = {}) {
   const { userId, googleAccessToken } = context;
   let result;
@@ -2764,7 +2611,9 @@ async function executeTool(toolName, args = {}, context = {}) {
     case "search_images":
     case "search_image":
       result = await searchImagesWithFallback(args.query);
-      if (result.images?.length > 0) sourceKeys.push("wikimediacommons");
+      if (result.images?.length > 0) {
+        sourceKeys.push("wikimediacommons");
+      }
       break;
     case "search_web":
       result = await searchWeb(args.query);
@@ -2799,8 +2648,7 @@ async function executeTool(toolName, args = {}, context = {}) {
         googleAccessToken,
         recipient: args.recipient || args.to,
         subject: args.subject,
-        body: args.body,
-        userId
+        body: args.body, userId
       });
       break;
     case "send_whatsapp_message":
@@ -2833,9 +2681,7 @@ async function executeTool(toolName, args = {}, context = {}) {
 // ==================== ENRICHISSEMENT CONTEXTE ====================
 async function enrichContextWithIntent(intent, userMessage) {
   const enrichment = {
-    contextData: "",
-    toolCalls: [],
-    sourceKeys: [],
+    contextData: "", toolCalls: [], sourceKeys: [],
     media: { images: [], videos: [] }
   };
 
@@ -2845,9 +2691,7 @@ async function enrichContextWithIntent(intent, userMessage) {
       if (expressions.length > 0) {
         for (const expr of expressions.slice(0, 3)) {
           const mathResult = executeMathExpression(expr);
-          if (mathResult.success) {
-            enrichment.contextData += `\n[Calcul exact] ${expr} = ${mathResult.formatted}\n`;
-          }
+          if (mathResult.success) enrichment.contextData += `\n[Calcul exact] ${expr} = ${mathResult.formatted}\n`;
         }
         enrichment.toolCalls.push({ name: "execute_math", arguments: { expression: expressions[0] } });
       }
@@ -2869,23 +2713,20 @@ async function enrichContextWithIntent(intent, userMessage) {
       const sportResult = await searchSportsScores(userMessage);
       if (sportResult.events && sportResult.events.length > 0) {
         enrichment.contextData += `\n[RÉSULTATS SPORTIFS - ${sportResult.team || ""}]\n`;
-        sportResult.events.forEach((e) => {
-          enrichment.contextData += `${e.match} (${e.date}) - ${e.league}\n`;
-        });
+        sportResult.events.forEach((e) => { enrichment.contextData += `${e.match} (${e.date}) - ${e.league}\n`; });
         enrichment.sourceKeys.push("thesportsdb");
         enrichment.toolCalls.push({ name: "search_sports_scores", arguments: { query: userMessage } });
       }
       break;
     }
-    case "CODE": {
-      enrichment.contextData += "\n[MODE CODE ACTIVÉ]\nL'utilisateur demande explicitement du code.";
+    case "CODE":
+      enrichment.contextData += "\n[MODE CODE ACTIVÉ] L'utilisateur demande explicitement du code.";
       break;
-    }
     case "PERSONNE": {
       const imgResult = await searchImagesWithFallback(userMessage);
       if (imgResult.images && imgResult.images.length > 0) {
         enrichment.media.images = imgResult.images.slice(0, 3);
-        enrichment.contextData += `\n[IMAGE TROUVÉE]\n`;
+        enrichment.contextData += `\n[IMAGES TROUVÉES — elles seront affichées automatiquement, ne cite pas les URLs]\n`;
         enrichment.sourceKeys.push("wikimediacommons");
         enrichment.toolCalls.push({ name: "search_images", arguments: { query: userMessage } });
       }
@@ -2901,16 +2742,15 @@ async function enrichContextWithIntent(intent, userMessage) {
       }
       break;
     }
-    case "TASK": {
+    case "TASK":
       enrichment.contextData += "\n[MODULE JARVIS - TÂCHES] L'utilisateur veut gérer une tâche/un rappel.";
       break;
-    }
   }
 
   return enrichment;
 }
 
-// ==================== HANDLE CHAT (✅ CORRIGÉ) ====================
+// ==================== HANDLE CHAT (v14 : fix images + tool role) ====================
 async function handleChat({ conversationId, userId, firebaseUid, message, googleAccessToken = null, channel = "web", modelTier = "v100", images = null }) {
   await getSession(conversationId, userId, firebaseUid);
 
@@ -2923,33 +2763,29 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
 
   const history = await getFullHistory(conversationId, userId);
   const longTermMemory = await getUserMemory(userId);
-  
+
   let conversationContext = "";
-  if (longTermMemory) {
-    conversationContext += `[MÉMOIRE LONG TERME SUR CET UTILISATEUR]\n${longTermMemory}\n\n`;
-  }
+  if (longTermMemory) conversationContext += `[MÉMOIRE LONG TERME SUR CET UTILISATEUR]\n${longTermMemory}\n\n`;
   if (history.length > 0) {
     const recentHistory = history.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
-    conversationContext += recentHistory.map(msg => 
-      `${msg.role === "user" ? "Utilisateur" : "Assistant"}: ${msg.content.slice(0, 500)}`
-    ).join("\n");
+    conversationContext += recentHistory.map(msg => `${msg.role === "user" ? "Utilisateur" : "Assistant"}: ${msg.content.slice(0, 500)}`).join("\n");
   }
-  
+
   const intent = analyzeIntent(message);
   logger.info({ intent, conversationId, historyLength: history.length }, "Intention détectée");
-  
+
   const enrichment = await enrichContextWithIntent(intent, message);
-  
+
   const historyWithoutCurrent = history.length > 0 && history[history.length - 1].role === "user"
     ? history.slice(0, -1)
     : history;
   const contextHistory = historyWithoutCurrent.slice(-CONFIG.MAX_CONTEXT_MESSAGES);
   let messages = [...contextHistory, { role: "user", content: message }];
-  
+
   if (enrichment.contextData) {
-    messages = [...contextHistory, { 
-      role: "user", 
-      content: message + "\n\n[CONTEXTE ENRICHISSÉ]\n" + enrichment.contextData 
+    messages = [...contextHistory, {
+      role: "user",
+      content: message + "\n\n[CONTEXTE ENRICHISSÉ — NE PAS CITER CES SOURCES DANS TA RÉPONSE]\n" + enrichment.contextData
     }];
   }
 
@@ -2989,14 +2825,14 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
           degraded = llmResponse.degraded || false;
         } catch (error) {
           finalResponse = "Je suis momentanément indisponible. Veuillez réessayer.";
-          suggestions = ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"];
+          suggestions = ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services ?"];
           providerUsed = "error_graceful_degradation";
           degraded = true;
           break;
         }
 
         const allToolCalls = [...(llmResponse.toolCalls || []), ...enrichment.toolCalls];
-        
+
         if (allToolCalls.length > 0) {
           for (const toolCall of allToolCalls) {
             let toolResult;
@@ -3014,7 +2850,6 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
               toolResult = { success: false, error: toolError.message };
             }
 
-            // ✅ CORRIGÉ : Role "tool" conforme OpenAI
             messages.push({
               role: "tool",
               tool_call_id: toolCall.id || `call_${crypto.randomUUID()}`,
@@ -3024,7 +2859,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
 
           messages.push({
             role: "user",
-            content: "Formule maintenant ta réponse finale complète avec les résultats des outils. Respecte strictement le formatage et le LaTeX. Utilise le contexte de la conversation."
+            content: "Formule maintenant ta réponse finale complète avec les résultats des outils. Respecte strictement le formatage Markdown et LaTeX. Utilise le contexte de la conversation. Ne mentionne pas les URLs d'images, elles seront affichées séparément."
           });
           enrichment.toolCalls = [];
           keepRunning = true;
@@ -3046,8 +2881,9 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       return true;
     });
 
+    // ✅ v14 : Images intégrées au Markdown ET envoyées en media séparés
     if (imageUrls.length > 0) {
-      const imageMarkdown = imageUrls.map((url, index) => "![Image " + (index + 1) + "](" + url + ")").join("\n\n");
+      const imageMarkdown = imageUrls.map((url, index) => `![Image ${index + 1}](${url})`).join("\n\n");
       finalResponse += "\n\n---\n\n**Illustrations :**\n\n" + imageMarkdown;
       usedSources.add("wikimediacommons");
     }
@@ -3063,7 +2899,7 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
     await saveMessageWithUser(conversationId, "assistant", finalResponse, userId, firebaseUid, { providerUsed, intent });
 
     maybeUpdateUserMemory(userId, message, finalResponse).catch((error) => {
-      logger.error({ error: error.message }, "Erreur tâche de fond mémoire long terme");
+      logger.error({ error: error.message }, "Erreur tâche de fond mémoire");
     });
 
     return {
@@ -3072,53 +2908,38 @@ async function handleChat({ conversationId, userId, firebaseUid, message, google
       media: {
         images: imageUrls,
         videos: videoResults.map((v) => ({
-          videoId: v.videoId,
-          title: v.title,
-          channel: v.channel,
-          thumbnail: v.thumbnail,
-          url: v.url,
+          videoId: v.videoId, title: v.title, channel: v.channel,
+          thumbnail: v.thumbnail, url: v.url,
           embedUrl: `https://www.youtube.com/embed/${v.videoId}`
         }))
       },
       error: providerUsed.startsWith("error"),
-      providerUsed,
-      modelTier,
-      degraded,
+      providerUsed, modelTier, degraded,
       visionEnabled: Boolean(images && images.length > 0),
       suggestions,
       sources: Array.from(usedSources).map((key) => OPEN_SOURCES[key]).filter(Boolean),
-      intent,
-      userId,
-      contextLength: history.length
+      intent, userId, contextLength: history.length
     };
   } catch (error) {
     logger.error({ error: error.message }, "Erreur critique handleChat");
 
     const fallbackResponse = {
       reply: "Je suis momentanément indisponible. Nos équipes techniques travaillent à résoudre le problème.",
-      images: [],
-      media: { images: [], videos: [] },
-      error: true,
-      providerUsed: "error_critical",
-      modelTier,
-      degraded: true,
-      suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services disponibles ?"],
-      sources: [],
-      intent,
-      userId
+      images: [], media: { images: [], videos: [] },
+      error: true, providerUsed: "error_critical",
+      modelTier, degraded: true,
+      suggestions: ["Peux-tu réessayer ?", "Comment fonctionne Luba.ia ?", "Quels sont les services ?"],
+      sources: [], intent, userId
     };
 
-    try {
-      await saveMessageWithUser(conversationId, "assistant", fallbackResponse.reply, userId, firebaseUid);
-    } catch (saveError) {
-      logger.error({ error: saveError.message }, "Erreur sauvegarde message de secours");
-    }
+    try { await saveMessageWithUser(conversationId, "assistant", fallbackResponse.reply, userId, firebaseUid); }
+    catch (saveError) { logger.error({ error: saveError.message }, "Erreur sauvegarde fallback"); }
 
     return fallbackResponse;
   }
 }
 
-// ==================== GESTION DES INTENTIONS ACTIVES ====================
+// ==================== INTENTIONS ACTIVES ====================
 async function handleActiveIntent(conversationId, activeIntent, userMessage, context = {}) {
   const { userId, googleAccessToken } = context;
 
@@ -3129,7 +2950,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         const phoneRegex = /^(\+?\d{1,3}[-.\s]?)?\d{9,15}$/;
         if (phoneRegex.test(userMessage.trim())) {
           await setActiveIntent(conversationId, "WHATSAPP", { step: "NEED_MESSAGE", recipient: userMessage.trim() });
-          return { reply: "Numéro enregistré. Quel message voulez-vous envoyer à " + userMessage.trim() + " ?", error: false };
+          return { reply: "Numéro enregistré. Quel message ?", error: false };
         }
         return { reply: "Numéro invalide.", error: true };
       }
@@ -3137,9 +2958,10 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         try {
           await sendWhatsAppSmart(userId, data.recipient, userMessage);
           await clearActiveIntent(conversationId);
-          return { reply: "Message WhatsApp mis en file d'envoi vers " + data.recipient + " !", error: false };
+          return { reply: "Message WhatsApp envoyé vers " + data.recipient + " !", error: false };
         } catch (error) {
-          return { reply: "Erreur d'envoi : " + error.message, error: true };
+          logger.error({ error: error.message, userId }, "Erreur envoi WhatsApp (intention active)");
+          return { reply: "Impossible d'envoyer le message WhatsApp pour le moment. Réessayez plus tard.", error: true };
         }
       }
       break;
@@ -3150,18 +2972,18 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (emailRegex.test(userMessage.trim())) {
           await setActiveIntent(conversationId, "EMAIL", { step: "NEED_SUBJECT", recipient: userMessage.trim() });
-          return { reply: "Destinataire enregistré. Quel est le sujet de l'email ?", error: false };
+          return { reply: "Destinataire enregistré. Sujet ?", error: false };
         }
-        return { reply: "Adresse email invalide.", error: true };
+        return { reply: "Email invalide.", error: true };
       }
       if (data.step === "NEED_SUBJECT") {
         await setActiveIntent(conversationId, "EMAIL", { step: "NEED_BODY", recipient: data.recipient, subject: userMessage });
-        return { reply: "Sujet enregistré. Quel est le contenu de l'email ?", error: false };
+        return { reply: "Sujet enregistré. Contenu ?", error: false };
       }
       if (data.step === "NEED_BODY") {
         const result = await dispatchSendEmail({ googleAccessToken, recipient: data.recipient, subject: data.subject, body: userMessage, userId });
         await clearActiveIntent(conversationId);
-        if (result.success) return { reply: "Email envoyé à " + data.recipient + " (via " + result.provider + ") !", error: false };
+        if (result.success) return { reply: "Email envoyé à " + data.recipient + " !", error: false };
         return { reply: "Erreur : " + result.error, error: true };
       }
       break;
@@ -3172,7 +2994,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
   return { reply: "Je ne comprends plus l'action. Recommençons.", error: true };
 }
 
-// ==================== GESTION DES SESSIONS ====================
+// ==================== SESSIONS ====================
 async function getSession(conversationId, userId, firebaseUid = null) {
   if (supabase) {
     try {
@@ -3183,9 +3005,7 @@ async function getSession(conversationId, userId, firebaseUid = null) {
         await syncSessionWithSupabase(conversationId, firebaseUid || userId, userId);
         return { session_id: conversationId, user_id: supabaseSession.user_id || userId, firebase_uid: supabaseSession.firebase_uid || firebaseUid };
       }
-    } catch (error) {
-      logger.error({ error: error.message }, "Erreur Supabase getSession, repli SQLite");
-    }
+    } catch (error) { logger.error({ error: error.message }, "Erreur Supabase getSession"); }
   }
 
   const session = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
@@ -3207,11 +3027,8 @@ async function setActiveIntent(conversationId, intentType, intentData = {}) {
 async function getActiveIntent(conversationId) {
   const row = await dbGet("SELECT active_intent, intent_data FROM sessions WHERE session_id = ?", [conversationId]);
   if (!row || !row.active_intent) return null;
-  try {
-    return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") };
-  } catch (e) {
-    return null;
-  }
+  try { return { type: row.active_intent, data: JSON.parse(row.intent_data || "{}") }; }
+  catch (e) { return null; }
 }
 
 async function clearActiveIntent(conversationId) {
@@ -3227,58 +3044,62 @@ async function assertConversationOwnership(conversationId, userId) {
   }
 }
 
-// ==================== SYNCHRONISATION SUPABASE ====================
+// ✅ CORRIGÉ v14 : syncUserWithSupabase avec upsert + retry
 async function syncUserWithSupabase(firebaseUid, email, displayName) {
-  if (!supabase || !firebaseUid) return;
-  try {
-    const { data: existingUser, error: fetchError } = await supabase.from("users").select("firebase_uid").eq("firebase_uid", firebaseUid).maybeSingle();
-    if (fetchError && fetchError.code !== "PGRST116") return;
-    if (!existingUser) {
-      await supabase.from("users").insert({ 
-        id: firebaseUid,
-        firebase_uid: firebaseUid, 
-        email, 
-        display_name: displayName, 
-        last_seen_at: new Date().toISOString() 
-      });
-      logger.info({ firebaseUid }, "✅ Utilisateur créé dans Supabase");
-    } else {
-      await supabase.from("users").update({ 
-        last_seen_at: new Date().toISOString(),
-        email: email || existingUser.email,
-        display_name: displayName || existingUser.display_name
-      }).eq("firebase_uid", firebaseUid);
+  if (!supabase || !firebaseUid) return false;
+
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const { error } = await supabase
+        .from("users")
+        .upsert(
+          {
+            id: firebaseUid, firebase_uid: firebaseUid,
+            email: email || null, display_name: displayName || null,
+            last_seen_at: new Date().toISOString()
+          },
+          { onConflict: "firebase_uid", ignoreDuplicates: false }
+        );
+      if (!error) return true;
+      logger.warn({ error: error.message, attempt: attempt + 1 }, "Retry sync user Supabase");
+    } catch (error) {
+      logger.warn({ error: error.message, attempt: attempt + 1 }, "Retry sync user Supabase (exception)");
     }
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur sync Supabase");
+    if (attempt < maxRetries - 1) await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 500));
   }
+  logger.error({ firebaseUid }, "❌ Échec sync user Supabase après retries");
+  return false;
 }
 
+// ✅ CORRIGÉ v14 : syncSessionWithSupabase avec upsert + retry
 async function syncSessionWithSupabase(sessionId, firebaseUid, userId) {
-  if (!supabase) return;
-  try {
-    const { data: existingSession, error: fetchError } = await supabase.from("sessions").select("session_id").eq("session_id", sessionId).maybeSingle();
-    if (fetchError && fetchError.code !== "PGRST116") return;
-    if (!existingSession) {
-      await supabase.from("sessions").insert({ 
-        session_id: sessionId, 
-        firebase_uid: firebaseUid || userId, 
-        user_id: userId, 
-        created_at: new Date().toISOString(), 
-        updated_at: new Date().toISOString() 
-      });
-    } else {
-      await supabase.from("sessions").update({ 
-        updated_at: new Date().toISOString(),
-        user_id: userId,
-        firebase_uid: firebaseUid || userId
-      }).eq("session_id", sessionId);
-    }
-  } catch (error) {
-    logger.error({ error: error.message }, "Erreur sync session Supabase");
-  }
-}
+  if (!supabase) return false;
 
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const { error } = await supabase
+        .from("sessions")
+        .upsert(
+          {
+            session_id: sessionId,
+            firebase_uid: firebaseUid || userId,
+            user_id: userId,
+            updated_at: new Date().toISOString()
+          },
+          { onConflict: "session_id", ignoreDuplicates: false }
+        );
+      if (!error) return true;
+      logger.warn({ error: error.message, attempt: attempt + 1 }, "Retry sync session Supabase");
+    } catch (error) {
+      logger.warn({ error: error.message, attempt: attempt + 1 }, "Retry sync session Supabase (exception)");
+    }
+    if (attempt < maxRetries - 1) await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 500));
+  }
+  logger.error({ sessionId }, "❌ Échec sync session Supabase après retries");
+  return false;
+}
 // ==================== INITIALISATION EXPRESS ====================
 const app = express();
 app.set("trust proxy", 1);
@@ -3290,8 +3111,11 @@ app.use(cors({
     if (!origin || HOSTING_CONFIG.allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
+      // ✅ On refuse sans lever d'exception : évite une 500 opaque et une trace
+      // d'erreur non gérée ; le middleware `cors` renverra une réponse sans les
+      // en-têtes CORS, ce que le navigateur bloquera correctement côté client.
       logger.warn({ origin }, "Origine CORS refusée");
-      callback(new Error("Origine non autorisée"));
+      callback(null, false);
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -3300,16 +3124,21 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// ==================== SECURITY ====================
+// ==================== SECURITY (HELMET) ====================
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: {
     directives: {
+      // ⚠️ 'unsafe-inline' sur scriptSrc affaiblit la protection CSP contre le XSS
+      // (il autorise l'exécution de <script> inline, la principale charge utile XSS).
+      // Conservé ici pour ne pas casser le frontend existant sans le tester, mais
+      // à remplacer dès que possible par un CSP basé sur des nonces par requête
+      // (générer un nonce aléatoire par réponse, l'ajouter aux <script nonce="..."> et à scriptSrc).
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://apis.google.com", "https://www.gstatic.com"],
       styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://fonts.googleapis.com"],
       imgSrc: ["'self'", "data:", "blob:", "https://*", "http://*"],
-      connectSrc: ["'self'", "https://api.groq.com", "https://openrouter.ai", "https://*.firebaseio.com", "https://*.supabase.co", "wss://*.firebaseio.com"],
+      connectSrc: ["'self'", "https://api.groq.com", "https://openrouter.ai", "https://api.cerebras.ai", "https://generativelanguage.googleapis.com", "https://*.firebaseio.com", "https://*.supabase.co", "wss://*.firebaseio.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
       objectSrc: ["'none'"],
       frameSrc: ["https://*.firebaseapp.com", "https://*.web.app", "https://www.youtube.com", "https://youtube.com"],
@@ -3337,6 +3166,12 @@ app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
 // ==================== RATE LIMITERS ====================
+// ℹ️ NOTE PRODUCTION : ces limiteurs stockent leurs compteurs EN MÉMOIRE PROCESS.
+// Si tu déploies plusieurs instances/replicas (scaling horizontal), chaque instance
+// aura son propre compteur et la limite réelle sera "max × nombre d'instances".
+// Pour une limite fiable à grande échelle, utilise un store partagé, ex. :
+//   const RedisStore = require("rate-limit-redis");
+//   new rateLimit({ store: new RedisStore({ sendCommand: (...args) => redisClient.call(...args) }), ... })
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
@@ -3357,7 +3192,7 @@ const strictLimiter = rateLimit({
   }
 });
 
-// ==================== LOGGING ====================
+// ==================== LOGGING MIDDLEWARE ====================
 app.use((req, res, next) => {
   const requestId = generateRequestId();
   const start = Date.now();
@@ -3368,29 +3203,29 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== AUTHENTIFICATION ====================
+// ==================== AUTH MIDDLEWARE ====================
 const authenticateUser = async (req, res, next) => {
   try {
     const isBlocked = await isIPBlocked(req.ip);
     if (isBlocked) {
       return res.status(403).json({ success: false, error: true, reply: "Accès refusé. IP bloquée.", code: "IP_BLOCKED" });
     }
-    
+
     const authHeader = req.headers.authorization || req.headers.Authorization;
     const bearerToken = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-    
+
     if (!bearerToken) {
       await recordLoginAttempt(req.ip, null, false, "Token manquant");
       return res.status(401).json({ success: false, error: true, reply: "Authentification requise.", code: "MISSING_TOKEN" });
     }
-    
+
     try {
       const user = await verifyFirebaseToken(bearerToken);
       if (!user) {
         await recordLoginAttempt(req.ip, null, false, "Token invalide");
         return res.status(401).json({ success: false, error: true, reply: "Session invalide.", code: "INVALID_TOKEN" });
       }
-      
+
       const uid = user.uid;
       req.uid = uid;
       req.userId = uid;
@@ -3398,11 +3233,11 @@ const authenticateUser = async (req, res, next) => {
       req.verifiedIdentity = true;
       req.userRole = user.role || 'FREE';
       req.emailVerified = user.emailVerified;
-      
+
       await recordLoginAttempt(req.ip, uid, true);
       await logSecurityEvent(uid, 'LOGIN_SUCCESS', { email: user.email }, req.ip, req.headers['user-agent']);
       await detectAndLogNewDevice(uid, req.ip, req.headers['user-agent']);
-      
+
       const userRow = await dbGet("SELECT * FROM users WHERE id = ?", [uid]);
       if (!userRow) {
         await dbRun(
@@ -3416,20 +3251,26 @@ const authenticateUser = async (req, res, next) => {
           [user.email, user.displayName, req.userRole, user.emailVerified ? 1 : 0, uid, uid]
         );
       }
-      
+
       if (supabase) {
         await syncUserWithSupabase(uid, user.email, user.displayName);
       }
-      
+
       next();
     } catch (error) {
-      await recordLoginAttempt(req.ip, null, false, error.message);
-      const loginCheck = await checkLoginAttempts(req.ip);
+      // ✅ Un token expiré est un cas normal (client qui n'a pas encore rafraîchi
+      // sa session) — on ne le compte PAS comme une tentative d'intrusion, sinon
+      // un utilisateur légitime avec une app en arrière-plan peut se faire
+      // bloquer son IP après quelques échecs bénins.
+      const isExpiredToken = error?.code === "auth/id-token-expired" || error?.errorInfo?.code === "auth/id-token-expired";
+      if (!isExpiredToken) {
+        await recordLoginAttempt(req.ip, null, false, error.message);
+      }
+      const loginCheck = isExpiredToken ? { blocked: false } : await checkLoginAttempts(req.ip);
       return res.status(401).json({
-        success: false,
-        error: true,
-        reply: loginCheck.blocked ? loginCheck.message : "Session invalide.",
-        code: loginCheck.blocked ? "IP_BLOCKED" : "INVALID_TOKEN"
+        success: false, error: true,
+        reply: loginCheck.blocked ? loginCheck.message : (isExpiredToken ? "Session expirée, veuillez vous reconnecter." : "Session invalide."),
+        code: loginCheck.blocked ? "IP_BLOCKED" : (isExpiredToken ? "TOKEN_EXPIRED" : "INVALID_TOKEN")
       });
     }
   } catch (error) {
@@ -3438,19 +3279,15 @@ const authenticateUser = async (req, res, next) => {
   }
 };
 
-// ✅ CORRIGÉ : ADMIN via REST explicite
 const requireRole = (allowedRoles) => {
   return (req, res, next) => {
-    // En mode REST, impossible d'avoir ADMIN
     if (!firebaseApp && allowedRoles.includes('ADMIN')) {
-      return res.status(503).json({ 
-        success: false, 
-        error: true, 
+      return res.status(503).json({
+        success: false, error: true,
         reply: "Les fonctions admin nécessitent Firebase Admin SDK (FIREBASE_SERVICE_ACCOUNT_JSON).",
-        code: "ADMIN_REQUIRES_SERVICE_ACCOUNT" 
+        code: "ADMIN_REQUIRES_SERVICE_ACCOUNT"
       });
     }
-    
     if (!req.userRole || (!allowedRoles.includes(req.userRole) && req.userRole !== 'ADMIN')) {
       return res.status(403).json({ success: false, error: true, reply: "Accès refusé.", code: "INSUFFICIENT_ROLE" });
     }
@@ -3458,9 +3295,14 @@ const requireRole = (allowedRoles) => {
   };
 };
 
-// ==================== ROUTES ====================
+// ==================== ROUTES PUBLIQUES ====================
 app.get("/", (req, res) => {
-  res.json({ success: true, error: false, reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel", version: CONFIG.VERSION, company: CONFIG.COMPANY });
+  res.json({
+    success: true, error: false,
+    reply: "Serveur " + CONFIG.AGENT_NAME + " opérationnel",
+    version: CONFIG.VERSION,
+    company: CONFIG.COMPANY
+  });
 });
 
 app.get("/api/health", async (req, res) => {
@@ -3469,8 +3311,7 @@ app.get("/api/health", async (req, res) => {
     try { await dbGet("SELECT 1"); } catch (e) { dbOk = false; }
 
     res.json({
-      success: !dbOk,
-      error: !dbOk,
+      success: !dbOk, error: !dbOk,
       reply: "Serveur " + CONFIG.AGENT_NAME + " en bonne santé",
       data: {
         timestamp: new Date().toISOString(),
@@ -3479,8 +3320,13 @@ app.get("/api/health", async (req, res) => {
         database: dbOk ? "ok" : "erreur",
         supabase: Boolean(supabase),
         firebaseAuth: firebaseApp ? "admin_sdk" : "api_rest",
-        groq: Boolean(process.env.GROQ_API_KEY),
         version: CONFIG.VERSION,
+        providers: {
+          groq: LLM_PROVIDERS.GROQ.keyPool.length,
+          openrouter: LLM_PROVIDERS.OPENROUTER.keyPool.length,
+          cerebras: LLM_PROVIDERS.CEREBRAS.keyPool.length,
+          gemini: geminiClient ? "actif" : "inactif"
+        },
         features: {
           vision: true,
           quotas: true,
@@ -3497,6 +3343,8 @@ app.get("/api/health", async (req, res) => {
           uidSync: true,
           jarvisTasks: true,
           jarvisYoutube: true,
+          geminiVision: Boolean(geminiClient),
+          cerebrasReasoning: LLM_PROVIDERS.CEREBRAS.keyPool.length > 0,
           persistentStoreIsSupabase: Boolean(supabase)
         },
         modelAvailability: modelAvailabilityReport
@@ -3507,8 +3355,12 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// ==================== ROUTES UTILISATEUR ====================
 app.get("/api/user/whoami", authenticateUser, (req, res) => {
-  return res.status(200).json({ success: true, error: false, userId: req.userId, role: req.userRole });
+  return res.status(200).json({
+    success: true, error: false,
+    userId: req.userId, role: req.userRole
+  });
 });
 
 // ==================== BOOTSTRAP ====================
@@ -3526,6 +3378,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
           .eq("user_id", userId)
           .order("updated_at", { ascending: false })
           .limit(50);
+
         if (!error && supaSessions) {
           conversations = await Promise.all(supaSessions.map(async (conv) => {
             const { data: lastMsgRows } = await supabase
@@ -3545,7 +3398,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
           }));
         }
       } catch (error) {
-        logger.error({ error: error.message }, "Erreur bootstrap conversations Supabase");
+        logger.error({ error: error.message }, "Erreur bootstrap Supabase");
       }
     }
     if (conversations.length === 0) {
@@ -3576,7 +3429,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
             "Tu es Luba, assistant IA façon Jarvis, développé par HIKLON Technology.",
             "Rédige UNE SEULE phrase d'accueil, courte, calme et sûre d'elle.",
             "Si une mémoire long terme existe, montre discrètement que tu reconnais l'utilisateur.",
-            "Réponds STRICTEMENT au format JSON : {\"greeting\": \"...\"}"
+            'Réponds STRICTEMENT au format JSON : {"greeting": "..."}'
           ].join("\n")
         },
         {
@@ -3597,11 +3450,8 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
     }
 
     return res.status(200).json({
-      success: true,
-      error: false,
-      userId,
-      role: req.userRole,
-      greeting,
+      success: true, error: false,
+      userId, role: req.userRole, greeting,
       conversations,
       pendingTasks: tasksResult.tasks,
       quotas: quotaRow || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 },
@@ -3614,7 +3464,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
   }
 });
 
-// ==================== CHAT (✅ CORRIGÉ : quota AVANT appel) ====================
+// ==================== CHAT ====================
 app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFIG.MAX_IMAGES_PER_REQUEST), async (req, res) => {
   try {
     const message = req.body.message;
@@ -3622,7 +3472,7 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
     let isNewConversation = false;
     const modelTier = req.body.modelTier === "v250" ? "v250" : "v100";
 
-    // ✅ CORRIGÉ : Incrémenter le quota AVANT l'appel LLM (anti-contournement)
+    // ✅ Quota AVANT appel LLM (anti-contournement)
     const quotaCheck = await checkUserQuota(req.userId, 'message', req.userRole);
     if (!quotaCheck.allowed) {
       return res.status(429).json({ success: false, error: true, reply: quotaCheck.message || "Limite atteinte.", code: "QUOTA_EXCEEDED" });
@@ -3657,6 +3507,10 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
 
     let images = null;
     if (req.files && req.files.length > 0) {
+      const invalidFile = req.files.find((file) => !isValidImageSignature(file.buffer));
+      if (invalidFile) {
+        return res.status(400).json({ success: false, error: true, reply: "Un des fichiers envoyés n'est pas une image valide.", code: "INVALID_IMAGE_CONTENT" });
+      }
       images = req.files.map((file) => convertImageToBase64(file.buffer, file.mimetype));
       await incrementUserQuota(req.userId, 'image');
     }
@@ -3679,33 +3533,30 @@ app.post("/api/chat", apiLimiter, authenticateUser, upload.array("images", CONFI
   }
 });
 
-// ==================== CONVERSATIONS ====================
+// ==================== HISTORIQUE CONVERSATION ====================
 app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { conversationId } = req.params;
-    
+
     if (!conversationId) {
       return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
     }
-    
+
     try {
       await assertConversationOwnership(conversationId, req.userId);
     } catch (error) {
       return res.status(403).json({ success: false, error: true, reply: error.message, code: "CONVERSATION_OWNERSHIP" });
     }
-    
+
     const wantsFull = req.query.full === "true";
     const requestedLimit = parseInt(req.query.limit, 10);
     const limit = wantsFull ? 500 : (Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 200) : CONFIG.MAX_HISTORY_LENGTH);
 
     const messages = await getFullHistory(conversationId, req.userId, limit);
-    
+
     return res.status(200).json({
-      success: true,
-      error: false,
-      conversationId,
-      messages,
-      count: messages.length
+      success: true, error: false,
+      conversationId, messages, count: messages.length
     });
   } catch (error) {
     logger.error({ error: error.message }, "Erreur récupération historique");
@@ -3713,6 +3564,7 @@ app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUs
   }
 });
 
+// ==================== LISTE CONVERSATIONS ====================
 app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => {
   try {
     if (supabase) {
@@ -3744,12 +3596,12 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
           return res.status(200).json({ success: true, error: false, conversations: enriched });
         }
       } catch (error) {
-        logger.error({ error: error.message }, "Erreur /api/conversations via Supabase");
+        logger.error({ error: error.message }, "Erreur /api/conversations Supabase");
       }
     }
 
     const rows = await dbAll("SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50", [req.userId]);
-    
+
     const enrichedConversations = await Promise.all(rows.map(async (conv) => {
       const lastMessage = await dbGet("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", [conv.session_id]);
       return {
@@ -3767,15 +3619,14 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
   }
 });
 
-// ==================== STATS UTILISATEUR ====================
+// ==================== STATS ====================
 app.get("/api/user/stats", authenticateUser, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const quotaRow = await dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [req.userId, today]);
-    
+
     return res.status(200).json({
-      success: true,
-      error: false,
+      success: true, error: false,
       data: {
         quotas: quotaRow || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 },
         role: req.userRole || 'FREE',
@@ -3789,11 +3640,14 @@ app.get("/api/user/stats", authenticateUser, async (req, res) => {
   }
 });
 
-// ==================== SESSIONS ====================
+// ==================== SESSIONS ACTIVES ====================
 app.post("/api/session/create", authenticateUser, async (req, res) => {
   try {
     const sessionToken = await createActiveSession(req.userId, req.ip, req.headers['user-agent']);
-    return res.status(200).json({ success: true, error: false, data: { sessionToken, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() } });
+    return res.status(200).json({
+      success: true, error: false,
+      data: { sessionToken, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }
+    });
   } catch (error) {
     return res.status(500).json({ success: false, error: true, code: "SESSION_CREATE_ERROR" });
   }
@@ -3802,12 +3656,12 @@ app.post("/api/session/create", authenticateUser, async (req, res) => {
 app.post("/api/session/revoke", authenticateUser, async (req, res) => {
   try {
     const { sessionToken } = req.body;
-    if (sessionToken) {
-      await revokeSession(req.userId, sessionToken);
-    } else {
-      await revokeAllSessions(req.userId);
-    }
-    return res.status(200).json({ success: true, error: false, message: sessionToken ? "Session révoquée." : "Toutes les sessions révoquées." });
+    if (sessionToken) await revokeSession(req.userId, sessionToken);
+    else await revokeAllSessions(req.userId);
+    return res.status(200).json({
+      success: true, error: false,
+      message: sessionToken ? "Session révoquée." : "Toutes les sessions révoquées."
+    });
   } catch (error) {
     return res.status(500).json({ success: false, error: true, code: "SESSION_REVOKE_ERROR" });
   }
@@ -3827,20 +3681,20 @@ app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(['A
   }
 });
 
-// ==================== OUTILS ====================
+// ==================== OUTILS GÉNÉRIQUES ====================
 app.post("/api/tools", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const toolName = req.body.toolName || req.body.action;
     const params = req.body.params || req.body.arguments || req.body.data || {};
-    
+
     if (!toolName) {
       return res.status(400).json({ success: false, error: true, code: "MISSING_TOOL_NAME" });
     }
-    
+
     const googleAccessToken = req.headers["x-google-access-token"] || null;
     const { result, sourceKeys } = await executeTool(toolName, params, { userId: req.userId, googleAccessToken });
     const sources = sourceKeys.map((k) => OPEN_SOURCES[k]).filter(Boolean);
-    
+
     return res.status(200).json({ success: true, error: false, toolName, result, sources });
   } catch (error) {
     return res.status(500).json({ success: false, error: true, code: "TOOL_EXECUTION_ERROR" });
@@ -3903,7 +3757,7 @@ app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) =>
   }
 });
 
-// ==================== VOIX ====================
+// ==================== TRANSCRIPTION VOCALE ====================
 app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.single("audio"), async (req, res) => {
   try {
     if (!req.file) {
@@ -3917,7 +3771,7 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
 
     const result = await transcribeAudioGroq(req.file.buffer, req.file.originalname, req.file.mimetype);
     if (!result.success) {
-      return res.status(502).json({ success: false, error: true, reply: "Impossible de transcrire l'audio : " + result.error, code: "TRANSCRIPTION_FAILED" });
+      return res.status(502).json({ success: false, error: true, reply: "Impossible de transcrire : " + result.error, code: "TRANSCRIPTION_FAILED" });
     }
 
     const cleanText = sanitizeUserText(result.text, 5000);
@@ -3932,22 +3786,22 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
 app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
   try {
     const result = await whatsappManager.initClient(req.userId);
-    
+
     if (result.connected) {
       return res.status(200).json({ success: true, error: false, message: "WhatsApp déjà connecté.", data: { qrCode: null, qrCodeBase64: null } });
     }
-    
+
     let qrCode = null;
     const startTime = Date.now();
     while (!qrCode && Date.now() - startTime < CONFIG.WHATSAPP_QR_TIMEOUT) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       qrCode = whatsappManager.getQRCode(req.userId);
     }
-    
+
     if (qrCode) {
       return res.status(200).json({ success: true, error: false, message: "Connexion initiée", data: { qrCode, qrCodeBase64: qrCode }, qr: qrCode });
     }
-    
+
     return res.status(408).json({ success: false, error: true, message: "Délai dépassé.", code: "QR_TIMEOUT" });
   } catch (error) {
     return res.status(500).json({ success: false, error: true, code: "WHATSAPP_CONNECT_ERROR" });
@@ -3959,15 +3813,15 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
     if (!req.body.to || !req.body.message) {
       return res.status(400).json({ success: false, error: true, code: "MISSING_PARAMS" });
     }
-    
+
     const quotaCheck = await checkUserQuota(req.userId, 'whatsapp', req.userRole);
     if (!quotaCheck.allowed) {
       return res.status(429).json({ success: false, error: true, code: "WHATSAPP_QUOTA_EXCEEDED" });
     }
-    
+
     const result = await whatsappManager.sendMessage(req.userId, req.body.to, req.body.message);
     await incrementUserQuota(req.userId, 'whatsapp');
-    
+
     return res.status(200).json({ success: true, error: false, data: result });
   } catch (error) {
     return res.status(500).json({ success: false, error: true, code: "WHATSAPP_SEND_ERROR" });
@@ -4000,7 +3854,7 @@ app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
   }
 });
 
-// ==================== MÉMOIRE (✅ RGPD) ====================
+// ==================== MÉMOIRE (RGPD) ====================
 app.get("/api/user/memory", authenticateUser, async (req, res) => {
   try {
     const memory = await getUserMemory(req.userId);
@@ -4014,11 +3868,8 @@ app.delete("/api/user/memory", authenticateUser, async (req, res) => {
   try {
     await dbRun("DELETE FROM user_memory WHERE user_id = ?", [req.userId]);
     if (supabase) {
-      try {
-        await supabase.from("user_memory").delete().eq("user_id", req.userId);
-      } catch (error) {
-        logger.error({ error: error.message }, "Erreur suppression mémoire Supabase");
-      }
+      try { await supabase.from("user_memory").delete().eq("user_id", req.userId); }
+      catch (error) { logger.error({ error: error.message }, "Erreur suppression mémoire Supabase"); }
     }
     return res.status(200).json({ success: true, error: false, message: "Mémoire long terme effacée." });
   } catch (error) {
@@ -4038,11 +3889,8 @@ app.post("/api/memory/clear", authenticateUser, async (req, res) => {
     await clearActiveIntent(conversationId);
 
     if (supabase) {
-      try {
-        await supabase.from("messages").delete().eq("session_id", conversationId);
-      } catch (error) {
-        logger.error({ error: error.message }, "Erreur effacement mémoire Supabase");
-      }
+      try { await supabase.from("messages").delete().eq("session_id", conversationId); }
+      catch (error) { logger.error({ error: error.message }, "Erreur effacement mémoire Supabase"); }
     }
 
     return res.status(200).json({ success: true, error: false, reply: "Mémoire effacée." });
@@ -4056,17 +3904,15 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
   try {
     const userId = req.userId;
     const firebaseUid = req.firebaseUid;
-    
+
     try {
       const whatsappSession = whatsappManager.sessions.get(userId);
       if (whatsappSession?.sock) whatsappSession.sock.end(undefined);
       whatsappManager.sessions.delete(userId);
       const authDir = path.join(CONFIG.SESSIONS_PATH, userId);
       if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
-    } catch (error) {
-      logger.warn({ error: error.message }, "Erreur suppression session WhatsApp");
-    }
-    
+    } catch (error) { logger.warn({ error: error.message }, "Erreur suppression session WhatsApp"); }
+
     await dbRun("DELETE FROM messages WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
     await dbRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
     await dbRun("DELETE FROM email_logs WHERE user_id = ? OR firebase_uid = ?", [userId, firebaseUid]);
@@ -4077,7 +3923,7 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
     await dbRun("DELETE FROM user_tasks WHERE user_id = ?", [userId]);
     await dbRun("DELETE FROM user_memory WHERE user_id = ?", [userId]);
     await dbRun("DELETE FROM users WHERE id = ?", [userId]);
-    
+
     if (supabase) {
       try {
         await supabase.from("messages").delete().eq("user_id", userId);
@@ -4086,24 +3932,19 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
         await supabase.from("user_memory").delete().eq("user_id", userId);
         await supabase.from("whatsapp_credentials").delete().eq("user_id", userId);
         await supabase.from("users").delete().eq("firebase_uid", firebaseUid);
-      } catch (error) {
-        logger.error({ error: error.message }, "Erreur suppression Supabase");
-      }
+      } catch (error) { logger.error({ error: error.message }, "Erreur suppression Supabase"); }
     }
-    
+
     let firebaseAccountDeleted = false;
     if (firebaseApp && firebaseAdmin) {
       try {
         await firebaseAdmin.auth(firebaseApp).deleteUser(firebaseUid);
         firebaseAccountDeleted = true;
-      } catch (error) {
-        logger.error({ error: error.message }, "Erreur suppression compte Firebase");
-      }
+      } catch (error) { logger.error({ error: error.message }, "Erreur suppression compte Firebase"); }
     }
-    
+
     return res.status(200).json({
-      success: true,
-      error: false,
+      success: true, error: false,
       message: "Compte supprimé avec succès.",
       code: "ACCOUNT_DELETED",
       firebaseAccountDeleted
@@ -4116,25 +3957,26 @@ app.delete("/api/account", authenticateUser, async (req, res) => {
 // ==================== 404 ====================
 app.use((req, res) => {
   res.status(404).json({
-    success: false,
-    error: true,
+    success: false, error: true,
     reply: "Route non trouvée",
     code: "NOT_FOUND",
     availableRoutes: [
-      "GET /", "GET /api/health", "GET /api/user/whoami", "POST /api/chat", "GET /api/conversations",
-      "GET /api/conversation/:conversationId/messages",
-      "GET /api/user/stats", "POST /api/tools", "POST /api/whatsapp/connect",
-      "POST /api/whatsapp/send", "POST /api/intent/init", "POST /api/memory/clear",
-      "POST /api/session/create", "POST /api/session/revoke", "POST /api/admin/set-role",
+      "GET /", "GET /api/health", "GET /api/user/whoami", "GET /api/session/bootstrap",
+      "POST /api/chat", "GET /api/conversations", "GET /api/conversation/:conversationId/messages",
+      "GET /api/user/stats", "POST /api/tools",
       "GET /api/tasks", "POST /api/tasks", "PUT /api/tasks/:taskId/status", "DELETE /api/tasks/:taskId",
       "GET /api/youtube/search", "POST /api/voice/transcribe",
-      "GET /api/user/memory", "DELETE /api/user/memory",
+      "POST /api/whatsapp/connect", "POST /api/whatsapp/send",
+      "POST /api/intent/init",
+      "GET /api/user/memory", "DELETE /api/user/memory", "POST /api/memory/clear",
+      "POST /api/session/create", "POST /api/session/revoke",
+      "POST /api/admin/set-role",
       "DELETE /api/account"
     ]
   });
 });
 
-// ==================== ERREUR ====================
+// ==================== ERREUR GLOBALE ====================
 app.use((error, req, res, next) => {
   logger.error({ error: error.message, stack: error.stack }, "Erreur non gérée");
   if (res.headersSent) return next(error);
@@ -4160,11 +4002,37 @@ setInterval(runSecurityHousekeeping, HOUSEKEEPING_INTERVAL_MS);
 // ==================== DÉMARRAGE ====================
 const server = app.listen(CONFIG.PORT, () => {
   logger.info("Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " démarré sur le port " + CONFIG.PORT);
-  console.log("🚀 Serveur " + CONFIG.AGENT_NAME + " v" + CONFIG.VERSION + " opérationnel");
-  console.log("🌐 Domaine: " + HOSTING_CONFIG.domain);
-  console.log("🔐 Firebase Admin: " + (firebaseApp ? "activé" : "désactivé (REST)"));
-  console.log("💾 Mémoire: " + (supabase ? "Supabase (persistant)" : "SQLite local (éphémère)"));
-  console.log("🤖 Modèles: Groq + OpenRouter (gratuits vérifiés)");
+
+  console.log("");
+  console.log("╔══════════════════════════════════════════════════════════╗");
+  console.log("║  🚀 LUBA BACKEND v" + CONFIG.VERSION + " — HIKLON TECHNOLOGIES      ║");
+  console.log("╚══════════════════════════════════════════════════════════╝");
+  console.log("🌐 Domaine      : " + HOSTING_CONFIG.domain);
+  console.log("🔐 Firebase     : " + (firebaseApp ? "Admin SDK ✅" : "REST API ⚠️"));
+  console.log("💾 Persistance  : " + (supabase ? "Supabase ✅" : "SQLite (éphémère) ⚠️"));
+  console.log("📧 Email        : " + (emailTransporter ? "SMTP ✅" : (process.env.RESEND_API_KEY ? "Resend ✅" : "Non configuré ⚠️")));
+  console.log("📱 WhatsApp     : " + (process.env.WHATSAPP_ENCRYPTION_KEY ? "Chiffré ✅" : "Clé par défaut ⚠️"));
+  console.log("");
+  console.log("🤖 PROVIDERS LLM :");
+  console.log("   ├─ Groq        : " + LLM_PROVIDERS.GROQ.keyPool.length + " clé(s)");
+  console.log("   ├─ OpenRouter  : " + LLM_PROVIDERS.OPENROUTER.keyPool.length + " clé(s)");
+  console.log("   ├─ Cerebras    : " + LLM_PROVIDERS.CEREBRAS.keyPool.length + " clé(s)");
+  console.log("   └─ Gemini      : " + (geminiClient ? "Actif ✅" : "Inactif ⚠️"));
+  console.log("");
+  console.log("🧠 FONCTIONNALITÉS :");
+  console.log("   ├─ NLP Intent Engine      ✅");
+  console.log("   ├─ MathJS Engine          ✅");
+  console.log("   ├─ RSS Parser             ✅");
+  console.log("   ├─ Web Search (DDG)       ✅");
+  console.log("   ├─ Scraping (Cheerio)     ✅");
+  console.log("   ├─ Mémoire conversation   ✅");
+  console.log("   ├─ Mémoire long terme     ✅");
+  console.log("   ├─ Module Jarvis (tâches) ✅");
+  console.log("   ├─ Vision IA (Gemini)     " + (geminiClient ? "✅" : "⚠️"));
+  console.log("   ├─ YouTube Search         ✅");
+  console.log("   ├─ Transcription vocale   ✅");
+  console.log("   └─ RGPD (effacement)      ✅");
+  console.log("");
 });
 
 // ==================== ARRÊT PROPRE ====================
@@ -4176,12 +4044,15 @@ async function shutdown(signal) {
   logger.info({ signal }, "Arrêt propre du serveur");
 
   await new Promise((resolve) => server.close(resolve));
-  
-  try { await whatsappManager.destroyAll(); } catch (error) { logger.error({ error: error.message }, "Erreur fermeture WhatsApp"); }
-  try { await queueManager.close(); } catch (error) { logger.error({ error: error.message }, "Erreur fermeture files"); }
-  
+
+  try { await whatsappManager.destroyAll(); }
+  catch (error) { logger.error({ error: error.message }, "Erreur fermeture WhatsApp"); }
+
+  try { await queueManager.close(); }
+  catch (error) { logger.error({ error: error.message }, "Erreur fermeture files"); }
+
   await new Promise((resolve) => db.close(() => resolve()));
-  
+
   console.log("✅ Arrêt propre terminé");
   process.exit(0);
 }
