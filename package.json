@@ -1,6 +1,6 @@
 {
   "name": "luba-backend",
-  "version": "13.0.0",
+  "version": "14.0.0",
   "description": "Luba.ia — Assistant IA Enterprise par HIKLON TECHNOLOGIES (Kinshasa, RDC)",
   "main": "index.js",
   "author": "HIKLON TECHNOLOGIES <contact@hiklon.com>",
@@ -20,9 +20,10 @@
     "clean": "rm -rf node_modules package-lock.json data sessions uploads",
     "reinstall": "npm run clean && npm install",
     "health": "curl -s http://localhost:3000/api/health | jq",
-    "test:models": "node -e \"require('dotenv').config(); require('./index.js')\""
+    "postinstall": "node -e \"console.log('✅ Luba Backend v14.0.0 installé')\""
   },
   "dependencies": {
+    "@google/genai": "^1.0.0",
     "@supabase/supabase-js": "^2.45.4",
     "@whiskeysockets/baileys": "^6.7.0",
     "axios": "^1.7.7",
@@ -68,8 +69,12 @@
     "supabase",
     "groq",
     "openrouter",
+    "cerebras",
+    "gemini",
     "whatsapp",
-    "baileys"
+    "baileys",
+    "vision",
+    "llm"
   ],
   "repository": {
     "type": "git",
