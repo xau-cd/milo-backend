@@ -1,81 +1,14 @@
 {
   "name": "luba-backend",
-  "version": "14.0.0",
-  "description": "Luba.ia — Assistant IA Enterprise par HIKLON TECHNOLOGIES (Kinshasa, RDC)",
-  "main": "index.js",
-  "author": "HIKLON TECHNOLOGIES <contact@hiklon.com>",
-  "license": "UNLICENSED",
+  "version": "15.0.0",
   "private": true,
-  "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
+  "description": "LUBA Backend v15 — Agent IA multi-provider (Groq · Gemini · Cerebras · OpenRouter), WhatsApp Baileys, SSE, sandbox code. HIKLON TECHNOLOGIES · Kinshasa · 2026",
+  "author": {
+    "name": "HIKLON TECHNOLOGIES",
+    "url": "https://luba.web.app"
   },
-  "scripts": {
-    "start": "node index.js",
-    "dev": "NODE_ENV=development nodemon index.js",
-    "prod": "NODE_ENV=production node index.js",
-    "lint": "eslint index.js",
-    "audit": "npm audit --production",
-    "audit:fix": "npm audit fix",
-    "clean": "rm -rf node_modules package-lock.json data sessions uploads",
-    "reinstall": "npm run clean && npm install",
-    "health": "curl -s http://localhost:3000/api/health | jq",
-    "postinstall": "node -e \"console.log('✅ Luba Backend v14.0.0 installé')\""
-  },
-  "dependencies": {
-    "@google/genai": "^1.0.0",
-    "@supabase/supabase-js": "^2.45.4",
-    "@whiskeysockets/baileys": "^6.7.0",
-    "axios": "^1.7.7",
-    "cheerio": "^1.0.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "duck-duck-scrape": "^2.2.6",
-    "express": "^4.21.1",
-    "express-rate-limit": "^7.4.1",
-    "firebase-admin": "^12.6.0",
-    "form-data": "^4.0.1",
-    "helmet": "^8.0.0",
-    "mathjs": "^13.2.0",
-    "multer": "^1.4.5-lts.1",
-    "natural": "^8.0.1",
-    "nodemailer": "^6.9.15",
-    "pino": "^9.5.0",
-    "qrcode": "^1.5.4",
-    "rss-parser": "^3.13.0",
-    "sqlite3": "^5.1.7"
-  },
-  "optionalDependencies": {
-    "bullmq": "^5.21.2",
-    "ioredis": "^5.4.1",
-    "pino-pretty": "^11.3.0"
-  },
-  "devDependencies": {
-    "eslint": "^9.13.0",
-    "nodemon": "^3.1.7"
-  },
-  "overrides": {
-    "ws": "^8.18.0"
-  },
-  "keywords": [
-    "luba",
-    "hiklon",
-    "ai",
-    "assistant",
-    "jarvis",
-    "kinshasa",
-    "rdc",
-    "firebase",
-    "supabase",
-    "groq",
-    "openrouter",
-    "cerebras",
-    "gemini",
-    "whatsapp",
-    "baileys",
-    "vision",
-    "llm"
-  ],
+  "license": "UNLICENSED",
+  "homepage": "https://luba.web.app",
   "repository": {
     "type": "git",
     "url": "https://github.com/hiklon/luba-backend.git"
@@ -83,5 +16,91 @@
   "bugs": {
     "url": "https://github.com/hiklon/luba-backend/issues"
   },
-  "homepage": "https://luba.web.app"
+
+  "main": "index.js",
+  "type": "commonjs",
+
+  "engines": {
+    "node": ">=20.10.0",
+    "npm": ">=10.0.0"
+  },
+
+  "scripts": {
+    "start": "node index.js",
+    "dev": "NODE_ENV=development node --watch index.js",
+    "check": "node --check index.js && echo '✅ Syntaxe index.js OK'",
+    "smoke": "node -e \"const m=require('./index.js'); console.log('✅ Chargement OK — v'+m.CONFIG.VERSION); process.exit(0);\"",
+    "test": "node tests/integration.test.js",
+    "test:ci": "NODE_ENV=test node tests/integration.test.js",
+    "db:reset": "rm -rf data/luba.db data/luba.db-wal data/luba.db-shm && echo '🗑️  DB reset'",
+    "clean": "rm -rf node_modules data/sessions/* uploads/* .pino*",
+    "clean:install": "npm run clean && npm install",
+    "predeploy": "npm run check && npm run test:ci"
+  },
+
+  "dependencies": {
+    "@google/genai": "^0.21.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "duck-duck-scrape": "^2.2.6",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "firebase-admin": "^12.5.0",
+    "form-data": "^4.0.1",
+    "helmet": "^8.0.0",
+    "lru-cache": "10.4.3",
+    "mathjs": "^13.2.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.15",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4",
+    "rss-parser": "^3.13.0",
+    "sqlite3": "^5.1.7"
+  },
+
+  "optionalDependencies": {
+    "bullmq": "^5.13.0",
+    "ioredis": "^5.4.1",
+    "rate-limit-redis": "^4.2.0",
+    "@e2b/sdk": "^1.0.0"
+  },
+
+  "devDependencies": {
+    "pino-pretty": "^11.2.2"
+  },
+
+  "overrides": {
+    "lru-cache": "10.4.3"
+  },
+
+  "keywords": [
+    "luba",
+    "hiklon",
+    "ai",
+    "agent",
+    "groq",
+    "gemini",
+    "cerebras",
+    "openrouter",
+    "whatsapp",
+    "baileys",
+    "sse",
+    "streaming",
+    "express",
+    "supabase",
+    "firebase",
+    "kinshasa",
+    "rdc"
+  ],
+
+  "files": [
+    "index.js",
+    "package.json",
+    "README.md",
+    ".env.example"
+  ]
 }
