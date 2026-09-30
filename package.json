@@ -11,10 +11,10 @@
   "homepage": "https://luba.web.app",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hiklon/luba-backend.git"
+    "url": "https://github.com/xau-cd/milo-backend.git"
   },
   "bugs": {
-    "url": "https://github.com/hiklon/luba-backend/issues"
+    "url": "https://github.com/xau-cd/milo-backend/issues"
   },
 
   "main": "index.js",
@@ -39,14 +39,14 @@
   },
 
   "dependencies": {
-    "@google/genai": "^0.21.0",
+    "@google/genai": "^2.23.0",
     "@supabase/supabase-js": "^2.45.0",
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "^6.7.24",
     "axios": "^1.7.7",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "duck-duck-scrape": "^2.2.6",
+    "duck-duck-scrape": "^2.2.7",
     "express": "^4.21.0",
     "express-rate-limit": "^7.4.0",
     "firebase-admin": "^12.5.0",
@@ -78,23 +78,11 @@
   },
 
   "keywords": [
-    "luba",
-    "hiklon",
-    "ai",
-    "agent",
-    "groq",
-    "gemini",
-    "cerebras",
-    "openrouter",
-    "whatsapp",
-    "baileys",
-    "sse",
-    "streaming",
-    "express",
-    "supabase",
-    "firebase",
-    "kinshasa",
-    "rdc"
+    "luba", "hiklon", "ai", "agent",
+    "groq", "gemini", "cerebras", "openrouter",
+    "whatsapp", "baileys", "sse", "streaming",
+    "express", "supabase", "firebase",
+    "kinshasa", "rdc"
   ],
 
   "files": [
@@ -103,4 +91,4 @@
     "README.md",
     ".env.example"
   ]
-}
+  }
