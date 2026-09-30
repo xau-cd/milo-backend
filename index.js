@@ -1,18 +1,17 @@
 // ================================================================================
-// LUBA BACKEND v15.0.0 — Enterprise Edition
+// LUBA BACKEND v15.1.0 — Enterprise Edition
 // HIKLON TECHNOLOGIES · Kinshasa, RDC · 2026
 // ================================================================================
-// REFONTE v15 (voir historique de migration plus bas) :
-//   ✅ Math : LaTeX brut (plus de JSON), normalizeMath, évaluateur isolé en Worker
-//   ✅ Streaming SSE opt-in, timeouts stricts (AbortController partout)
-//   ✅ Circuit breaker par (provider + modèle + clé), HALF_OPEN sérialisé
-//   ✅ Auth : cache token 5 min, plus de checkRevoked par défaut, chemin critique allégé
-//   ✅ DB : timestamps INTEGER (ms), outbox, mutex par conversation, ids UUID
-//   ✅ Supabase = source de vérité, SQLite = cache + outbox ; {error} TOUJOURS vérifié
-//   ✅ Intentions : tool calling natif, pré-routeur \b…\b, GENERAL par défaut
-//   ✅ Images : allSettled, cache conditionnel, UA Wikimedia conforme, searchImages DDG
-//   ✅ run_code : sandbox externe (Piston/Judge0/E2B), jamais d'eval/exec local
-//   ✅ WhatsApp : creds complets + clés Signal, déconnexion propre, quota + liste blanche
+// NOUVEAUTÉS v15.1 :
+//   ✅ Historique persisté Supabase SYNCHRONE + route backfill
+//   ✅ Sport via Google News (fini TheSportsDB) + extraction de score
+//   ✅ Reasoning SSE + Code structuré SSE (blocs typés)
+//   ✅ Agent étendu (5 itérations, timeout 90s)
+//   ✅ run_code fallback neutre si sandbox absent
+//   ✅ Images Wikimedia réelles (gsrnamespace=6, thumburl API, UA conforme)
+//   ✅ DDG searchImages (pas search web)
+//   ✅ allSettledWithDeadline par source (une source lente ne jette plus tout)
+//   ✅ Prompt anti-hallucination stricte
 // ================================================================================
 
 require("dotenv").config();
@@ -33,13 +32,13 @@ const pino           = require("pino");
 const multer         = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const { EventEmitter } = require("events");
-const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
+const { Worker }     = require("worker_threads");
 const Parser         = require("rss-parser");
 const FormData       = require("form-data");
 const cheerio        = require("cheerio");
 const { LRUCache }   = require("lru-cache");
 
-// ==================== OPTIONNELS (non bloquants) ====================
+// ==================== OPTIONNELS ====================
 let GoogleGenAI = null;
 try { GoogleGenAI = require("@google/genai").GoogleGenAI; }
 catch { console.warn("⚠️ @google/genai non installé — Gemini désactivé"); }
@@ -60,7 +59,7 @@ catch { console.warn("⚠️ duck-duck-scrape non installé"); }
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000", 10),
   ENV: process.env.NODE_ENV || "production",
-  VERSION: "15.0.0",
+  VERSION: "15.1.0",
   AGENT_NAME: "Luba",
   COMPANY: "HIKLON TECHNOLOGIES",
 
@@ -73,22 +72,32 @@ const CONFIG = {
   MAX_IMAGE_SIZE_MB: parseInt(process.env.MAX_IMAGE_SIZE_MB || "10", 10),
   MAX_IMAGES_PER_REQUEST: parseInt(process.env.MAX_IMAGES_PER_REQUEST || "3", 10),
 
-  // Retry / timeouts (⚠️ PHASE 1 : bornes strictes pour éviter les minutes de blocage)
+  // Agent étendu (v15.1)
+  AGENT_MAX_ITERATIONS: parseInt(process.env.AGENT_MAX_ITERATIONS || "5", 10),
+  AGENT_MAX_TOOL_CALLS_PER_STEP: parseInt(process.env.AGENT_MAX_TOOL_CALLS_PER_STEP || "6", 10),
+
+  // Sport News (v15.1)
+  SPORT_NEWS_MAX_ARTICLES: parseInt(process.env.SPORT_NEWS_MAX_ARTICLES || "6", 10),
+  SPORT_CACHE_TTL_MS: parseInt(process.env.SPORT_CACHE_TTL_MS || "600000", 10),
+  GOOGLE_NEWS_LANG: process.env.GOOGLE_NEWS_LANG || "fr",
+  GOOGLE_NEWS_REGION: process.env.GOOGLE_NEWS_REGION || "FR",
+
+  // Retry / timeouts
   MAX_RETRY_ATTEMPTS: parseInt(process.env.MAX_RETRY_ATTEMPTS || "2", 10),
   RETRY_BASE_DELAY_MS: parseInt(process.env.RETRY_BASE_DELAY_MS || "400", 10),
   RETRY_MAX_DELAY_MS: parseInt(process.env.RETRY_MAX_DELAY_MS || "2000", 10),
-  CHAT_ATTEMPT_TIMEOUT_MS: parseInt(process.env.CHAT_ATTEMPT_TIMEOUT_MS || "10000", 10),
-  CHAT_GLOBAL_TIMEOUT_MS: parseInt(process.env.CHAT_GLOBAL_TIMEOUT_MS || "40000", 10),
+  CHAT_ATTEMPT_TIMEOUT_MS: parseInt(process.env.CHAT_ATTEMPT_TIMEOUT_MS || "15000", 10),
+  CHAT_GLOBAL_TIMEOUT_MS: parseInt(process.env.CHAT_GLOBAL_TIMEOUT_MS || "90000", 10),
   V250_ROUTE_TIMEOUT_MS: parseInt(process.env.V250_ROUTE_TIMEOUT || "60000", 10),
   TOOL_TIMEOUT_MS: parseInt(process.env.TOOL_TIMEOUT_MS || "8000", 10),
 
   // Circuit breaker
   CIRCUIT_BREAKER_THRESHOLD: parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD || "4", 10),
   CIRCUIT_BREAKER_RESET_MS: parseInt(process.env.CIRCUIT_BREAKER_RESET_MS || "45000", 10),
-  CIRCUIT_BREAKER_HALF_OPEN_MAX: 1, // une seule requête de test en HALF_OPEN
+  CIRCUIT_BREAKER_HALF_OPEN_MAX: 1,
 
   // Auth
-  AUTH_TOKEN_CACHE_TTL_MS: parseInt(process.env.AUTH_TOKEN_CACHE_TTL_MS || "300000", 10), // 5 min
+  AUTH_TOKEN_CACHE_TTL_MS: parseInt(process.env.AUTH_TOKEN_CACHE_TTL_MS || "300000", 10),
   AUTH_CHECK_REVOKED: process.env.AUTH_CHECK_REVOKED === "true",
   MAX_LOGIN_ATTEMPTS: parseInt(process.env.MAX_LOGIN_ATTEMPTS || "20", 10),
   LOGIN_BLOCK_DURATION_MS: parseInt(process.env.LOGIN_BLOCK_DURATION || "900000", 10),
@@ -99,34 +108,36 @@ const CONFIG = {
   SESSIONS_PATH: path.join(__dirname, "sessions"),
   UPLOADS_PATH: path.join(__dirname, "uploads"),
 
-  // Images
+  // Images (v15.1)
   IMAGE_CACHE_TTL_MS: parseInt(process.env.IMAGE_CACHE_TTL_MS || String(20 * 60 * 1000), 10),
-  IMAGE_SOURCE_DEADLINE_MS: parseInt(process.env.IMAGE_SOURCE_DEADLINE_MS || "3500", 10),
-  WIKIMEDIA_USER_AGENT:
-    process.env.WIKIMEDIA_USER_AGENT ||
-    `LubaAI/${"15.0.0"} (https://luba.web.app; ${process.env.CONTACT_EMAIL || "contact@luba.web.app"})`,
+  IMAGE_SOURCE_DEADLINE_MS: parseInt(process.env.IMAGE_SOURCE_DEADLINE_MS || "4000", 10),
+  IMAGE_WIKIMEDIA_LIMIT: parseInt(process.env.IMAGE_WIKIMEDIA_LIMIT || "8", 10),
+  IMAGE_DDG_LIMIT: parseInt(process.env.IMAGE_DDG_LIMIT || "4", 10),
+  CONTACT_EMAIL: process.env.CONTACT_EMAIL || "contact@luba.web.app",
+  WIKIMEDIA_USER_AGENT: process.env.WIKIMEDIA_USER_AGENT ||
+    `LubaAI/15.1.0 (https://luba.web.app; contact@luba.web.app)`,
 
   // WhatsApp
   WHATSAPP_QR_TIMEOUT: parseInt(process.env.WHATSAPP_QR_TIMEOUT || "30000", 10),
   WHATSAPP_RETRY_DELAY: parseInt(process.env.WHATSAPP_RETRY_DELAY || "4000", 10),
 
-  // Modèles vision (à valider via /api/health → modelAvailability.issues)
+  // Modèles vision
   VISION_MODEL_GROQ: process.env.VISION_MODEL_GROQ || "qwen/qwen3.6-27b",
   VISION_MODEL_OPENROUTER: process.env.VISION_MODEL_OPENROUTER || "inclusionai/ling-3.0-flash-vl:free",
   VISION_MODEL_GEMINI: process.env.VISION_MODEL_GEMINI || "gemini-3.6-flash",
 
   ALLOWED_IMAGE_TYPES: ["image/jpeg", "image/png", "image/gif", "image/webp"],
   ALLOWED_AUDIO_TYPES: ["audio/mpeg","audio/mp4","audio/wav","audio/webm","audio/ogg","audio/m4a","audio/x-m4a","audio/aac"],
-  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || `LubaAI-App/${"15.0.0"}`,
+  HTTP_USER_AGENT: process.env.HTTP_USER_AGENT || `LubaAI-App/15.1.0`,
 
-  // Sandbox d'exécution de code (jamais d'eval local)
-  CODE_SANDBOX_PROVIDER: process.env.CODE_SANDBOX_PROVIDER || "", // "piston" | "judge0" | "e2b" | ""
+  // Sandbox code
+  CODE_SANDBOX_PROVIDER: process.env.CODE_SANDBOX_PROVIDER || "",
   PISTON_URL: process.env.PISTON_URL || "",
   JUDGE0_URL: process.env.JUDGE0_URL || "",
   E2B_API_KEY: process.env.E2B_API_KEY || ""
 };
 
-// ==================== FIREBASE CONFIG (aucun secret en dur) ====================
+// ==================== FIREBASE CONFIG ====================
 const FIREBASE_CONFIG = {
   apiKey: process.env.FIREBASE_API_KEY || null,
   projectId: process.env.FIREBASE_PROJECT_ID || "luba-ia-636",
@@ -172,56 +183,41 @@ const logger = pino({
     : undefined,
   base: { service: "luba-backend", version: CONFIG.VERSION },
   redact: {
-    paths: [
-      "req.headers.authorization",
-      "req.headers['x-google-access-token']",
-      "*.apiKey",
-      "*.key",
-      "*.token",
-      "*.access_token",
-      "*.refresh_token"
-    ],
+    paths: ["req.headers.authorization","req.headers['x-google-access-token']","*.apiKey","*.key","*.token","*.access_token","*.refresh_token"],
     censor: "[REDACTED]"
   }
 });
 
-// ==================== VALIDATION ENVIRONNEMENT (fail-fast) ====================
+// ==================== VALIDATION ENVIRONNEMENT ====================
 function validateEnvironment() {
   const problems = [];
-
   const hasFirebaseAdmin = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   const hasFirebaseRestKey = Boolean(process.env.FIREBASE_API_KEY);
   if (!hasFirebaseAdmin && !hasFirebaseRestKey) {
-    problems.push("Aucune authentification Firebase configurée : définissez FIREBASE_SERVICE_ACCOUNT_JSON (recommandé) ou FIREBASE_API_KEY.");
+    problems.push("Aucune authentification Firebase configurée.");
   }
-
   const hasAnyLLMKey = Boolean(
     process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY ||
     process.env.CEREBRAS_API_KEY || process.env.GEMINI_API_KEY
   );
-  if (!hasAnyLLMKey) {
-    problems.push("Aucune clé de provider LLM configurée (GROQ_API_KEY / OPENROUTER_API_KEY / CEREBRAS_API_KEY / GEMINI_API_KEY).");
-  }
+  if (!hasAnyLLMKey) problems.push("Aucune clé LLM configurée.");
 
   if (CONFIG.ENV === "production") {
     const key = process.env.WHATSAPP_ENCRYPTION_KEY;
     const iv = process.env.WHATSAPP_ENCRYPTION_IV;
     if (!key || key.length < 32 || !iv || iv.length < 16) {
-      problems.push("WHATSAPP_ENCRYPTION_KEY (32+) et WHATSAPP_ENCRYPTION_IV (16+) obligatoires en production.");
+      problems.push("WHATSAPP_ENCRYPTION_KEY (32+) et WHATSAPP_ENCRYPTION_IV (16+) obligatoires.");
     }
     if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-      problems.push("SUPABASE_URL / SUPABASE_KEY absents : SQLite seul n'est PAS une persistance fiable en production.");
+      problems.push("SUPABASE_URL / SUPABASE_KEY absents.");
     }
   }
-
   if (problems.length > 0) {
     for (const p of problems) console.error("❌ CONFIG MANQUANTE : " + p);
     if (CONFIG.ENV === "production") {
       console.error("🛑 Démarrage interrompu (production).");
       process.exit(1);
-    } else {
-      console.warn("⚠️ Démarrage en mode dégradé.");
-    }
+    } else console.warn("⚠️ Démarrage en mode dégradé.");
   }
 }
 validateEnvironment();
@@ -245,18 +241,13 @@ if (firebaseAdmin && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
       projectId: FIREBASE_CONFIG.projectId
     });
     logger.info("✅ Firebase Admin initialisé");
-  } catch (e) {
-    logger.error({ err: e.message }, "❌ Erreur initialisation Firebase Admin");
-  }
+  } catch (e) { logger.error({ err: e.message }, "❌ Erreur init Firebase Admin"); }
 } else {
   logger.warn("⚠️ Firebase Admin non initialisé — mode REST");
 }
 
 // ================================================================================
-// ==================== BASE DE DONNÉES SQLITE (v2 — timestamps INTEGER) ========
-// ================================================================================
-// ⚠️ RÈGLE ABSOLUE v15 : tout timestamp est stocké en INTEGER = Date.now() (ms UTC).
-// Cela élimine les faux négatifs de la v14 (comparaison textuelle ISO vs 'YYYY-MM-DD HH:MM:SS').
+// ==================== SQLITE v2 (timestamps INTEGER ms) =======================
 // ================================================================================
 
 const db = new sqlite3.Database(CONFIG.DB_PATH, (err) => {
@@ -274,61 +265,43 @@ db.run("PRAGMA wal_autocheckpoint = 1000;");
 
 // ==================== SCHÉMA ====================
 db.serialize(() => {
-  // -------- USERS --------
   db.run(`CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    firebase_uid TEXT UNIQUE,
-    email TEXT UNIQUE,
-    display_name TEXT,
-    role TEXT DEFAULT 'FREE',
-    email_verified INTEGER DEFAULT 0,
-    whatsapp_connected INTEGER DEFAULT 0,
-    whatsapp_session_id TEXT,
+    id TEXT PRIMARY KEY, firebase_uid TEXT UNIQUE, email TEXT UNIQUE,
+    display_name TEXT, role TEXT DEFAULT 'FREE', email_verified INTEGER DEFAULT 0,
+    whatsapp_connected INTEGER DEFAULT 0, whatsapp_session_id TEXT,
     last_seen_at INTEGER,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000),
     updated_at INTEGER DEFAULT (strftime('%s','now')*1000)
   )`);
 
-  // -------- SESSIONS --------
   db.run(`CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    firebase_uid TEXT,
+    session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, firebase_uid TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000),
     updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
-    active_intent TEXT,
-    intent_data TEXT,
-    intent_expires_at INTEGER,
+    active_intent TEXT, intent_data TEXT, intent_expires_at INTEGER,
     metadata TEXT DEFAULT '{}',
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    user_id TEXT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
-    content TEXT NOT NULL,
-    tool_calls TEXT,
-    tool_call_id TEXT,
-    images TEXT DEFAULT '[]',
-    metadata TEXT DEFAULT '{}',
+    content TEXT NOT NULL, tool_calls TEXT, tool_call_id TEXT,
+    images TEXT DEFAULT '[]', metadata TEXT DEFAULT '{}',
     created_at INTEGER DEFAULT (strftime('%s','now')*1000),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
   )`);
 
-  // -------- INDEX --------
   db.run("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, created_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_sessions_firebase ON sessions(firebase_uid)");
 
-  // -------- AUDIT / LOGS --------
   db.run(`CREATE TABLE IF NOT EXISTS email_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, firebase_uid TEXT, to_email TEXT NOT NULL,
-    subject TEXT, status TEXT DEFAULT 'pending', provider TEXT,
-    error_message TEXT, created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+    subject TEXT, status TEXT DEFAULT 'pending', provider TEXT, error_message TEXT,
+    created_at INTEGER DEFAULT (strftime('%s','now')*1000)
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS llm_audit_log (
@@ -345,14 +318,11 @@ db.serialize(() => {
     fingerprint TEXT, ip_address TEXT, user_agent TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000)
   )`);
-  // ⚠️ FIX v15 : on remplace le LIKE '%fingerprint%' par une colonne indexée.
   db.run("CREATE INDEX IF NOT EXISTS idx_security_fingerprint ON security_logs(user_id, event_type, fingerprint)");
   db.run("CREATE INDEX IF NOT EXISTS idx_security_user_time ON security_logs(user_id, created_at DESC)");
 
-  // -------- QUOTAS --------
   db.run(`CREATE TABLE IF NOT EXISTS user_quotas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL, date TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, date TEXT NOT NULL,
     messages_count INTEGER DEFAULT 0, images_count INTEGER DEFAULT 0,
     whatsapp_count INTEGER DEFAULT 0, emails_count INTEGER DEFAULT 0,
     updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
@@ -361,12 +331,9 @@ db.serialize(() => {
   )`);
   db.run("CREATE INDEX IF NOT EXISTS idx_user_quotas_user_date ON user_quotas(user_id, date)");
 
-  // -------- SESSIONS ACTIVES --------
   db.run(`CREATE TABLE IF NOT EXISTS active_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    session_token_hash TEXT UNIQUE,
-    ip_address TEXT, user_agent TEXT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+    session_token_hash TEXT UNIQUE, ip_address TEXT, user_agent TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000),
     last_activity INTEGER DEFAULT (strftime('%s','now')*1000),
     expires_at INTEGER, is_revoked INTEGER DEFAULT 0,
@@ -375,7 +342,6 @@ db.serialize(() => {
   db.run("CREATE INDEX IF NOT EXISTS idx_active_sessions_user ON active_sessions(user_id, created_at DESC)");
   db.run("CREATE INDEX IF NOT EXISTS idx_active_sessions_lookup ON active_sessions(user_id, session_token_hash, is_revoked, expires_at)");
 
-  // -------- TENTATIVES DE LOGIN / IP BLOQUÉES --------
   db.run(`CREATE TABLE IF NOT EXISTS login_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, ip_address TEXT, success INTEGER DEFAULT 0,
@@ -391,7 +357,6 @@ db.serialize(() => {
   )`);
   db.run("CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip ON blocked_ips(ip_address, blocked_until)");
 
-  // -------- MÉMOIRE LONG TERME --------
   db.run(`CREATE TABLE IF NOT EXISTS user_memory (
     user_id TEXT PRIMARY KEY, summary TEXT DEFAULT '',
     messages_since_update INTEGER DEFAULT 0,
@@ -399,13 +364,10 @@ db.serialize(() => {
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
 
-  // -------- TÂCHES (UUID côté serveur — ⚠️ FIX v15 : plus d'AUTOINCREMENT exposé) --------
   db.run(`CREATE TABLE IF NOT EXISTS user_tasks (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    title TEXT NOT NULL, notes TEXT,
-    due_at INTEGER, status TEXT DEFAULT 'pending',
-    notified_at INTEGER,
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+    title TEXT NOT NULL, notes TEXT, due_at INTEGER,
+    status TEXT DEFAULT 'pending', notified_at INTEGER,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000),
     updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -413,23 +375,19 @@ db.serialize(() => {
   db.run("CREATE INDEX IF NOT EXISTS idx_user_tasks_user ON user_tasks(user_id, status, due_at)");
   db.run("CREATE INDEX IF NOT EXISTS idx_user_tasks_due ON user_tasks(status, due_at)");
 
-  // -------- NEWS CACHE --------
   db.run(`CREATE TABLE IF NOT EXISTS news_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL, title TEXT, link TEXT, pub_date TEXT,
-    description TEXT, source TEXT, created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+    description TEXT, source TEXT,
+    created_at INTEGER DEFAULT (strftime('%s','now')*1000)
   )`);
 
-  // -------- ⚠️ OUTBOX (nouveau v15) — file d'écriture différée Supabase --------
-  // Idempotence : clé (table_name, op, idempotency_key) → une seule exécution.
   db.run(`CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     table_name TEXT NOT NULL,
     op TEXT NOT NULL CHECK (op IN ('insert','update','upsert','delete')),
-    payload TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL,
-    attempts INTEGER DEFAULT 0,
-    last_error TEXT,
+    payload TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    attempts INTEGER DEFAULT 0, last_error TEXT,
     next_attempt_at INTEGER DEFAULT (strftime('%s','now')*1000),
     status TEXT DEFAULT 'pending',
     created_at INTEGER DEFAULT (strftime('%s','now')*1000),
@@ -438,23 +396,16 @@ db.serialize(() => {
   )`);
   db.run("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, next_attempt_at)");
 
-  // -------- TOKEN CACHE (⚠️ FIX v15 : cache process-local des tokens Firebase) --------
-  // Évite verifyIdToken() à chaque requête (5 min de TTL).
   db.run(`CREATE TABLE IF NOT EXISTS token_cache (
-    token_hash TEXT PRIMARY KEY,
-    uid TEXT NOT NULL,
-    email TEXT, display_name TEXT,
-    email_verified INTEGER DEFAULT 0,
-    role TEXT DEFAULT 'FREE',
-    expires_at INTEGER NOT NULL,
+    token_hash TEXT PRIMARY KEY, uid TEXT NOT NULL,
+    email TEXT, display_name TEXT, email_verified INTEGER DEFAULT 0,
+    role TEXT DEFAULT 'FREE', expires_at INTEGER NOT NULL,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000)
   )`);
   db.run("CREATE INDEX IF NOT EXISTS idx_token_cache_expiry ON token_cache(expires_at)");
 
-  // -------- CONVERSATION MUTEX (⚠️ FIX v15 : verrou par conversation) --------
   db.run(`CREATE TABLE IF NOT EXISTS conversation_locks (
-    conversation_id TEXT PRIMARY KEY,
-    locked_until INTEGER NOT NULL,
+    conversation_id TEXT PRIMARY KEY, locked_until INTEGER NOT NULL,
     owner_request_id TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now')*1000)
   )`);
@@ -487,10 +438,6 @@ function dbExec(query) {
   });
 }
 
-/**
- * Transaction atomique SQLite. Le callback reçoit les mêmes helpers dbGet/dbAll/dbRun
- * mais ils s'exécutent dans la transaction courante.
- */
 async function dbTransaction(fn) {
   await dbExec("BEGIN IMMEDIATE");
   try {
@@ -517,41 +464,26 @@ function sha256(input) {
   return crypto.createHash("sha256").update(String(input)).digest("hex");
 }
 function hashSessionToken(token) { return sha256(token); }
-
 function nowMs() { return Date.now(); }
 
-/** 🔒 Échappe le HTML (emails / affichage). Ne PAS utiliser sur le texte du chat. */
 function escapeHtml(str) {
   return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-/**
- * 🧼 Nettoyage MINIMAL pour entrée LLM : ne mutile PAS le code (contrairement à v14).
- * On retire uniquement les caractères de contrôle dangereux + longueur.
- * L'échappement HTML est fait à la SORTIE (affichage/email), jamais à l'entrée.
- */
 function sanitizeForLLM(input, maxLength = CONFIG.MAX_MESSAGE_LENGTH) {
   if (input === null || input === undefined) return "";
   let text = String(input);
-  // Retire NUL, VERTICAL TAB, FF, et 0x0E-0x1F (garde \n \t \r)
   text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
-  // Limite la profondeur de répétition (anti-DoS par message géant)
   if (text.length > maxLength) text = text.slice(0, maxLength);
   return text.trim();
 }
 
-/** Nettoyage renforcé pour les champs structurés (nom, sujet d'email, etc.) */
 function sanitizeStrict(input, maxLength = 500) {
   if (input === null || input === undefined) return "";
   let text = String(input).trim();
-  // Caractères de contrôle (y compris \n)
   text = text.replace(/[\u0000-\u001F\u007F]/g, "");
-  // Balises dangereuses
   text = text.replace(/<script[\s\S]*?<\/script>/gi, "");
   text = text.replace(/<iframe[\s\S]*?<\/iframe>/gi, "");
   if (text.length > maxLength) text = text.slice(0, maxLength);
@@ -559,56 +491,32 @@ function sanitizeStrict(input, maxLength = 500) {
 }
 
 /**
- * 🧮 normalizeMath — ⚠️ PHASE 1 : corrige les caractères de contrôle introduits
- * par JSON.parse sur du LaTeX (\frac → U+000C, \theta → \t, etc.).
- * À appeler SYSTÉMATIQUEMENT sur la réponse LLM avant tout traitement.
- *
- * Transformations :
- *   - \( … \)   → $ … $
- *   - \[ … \]   → $$ … $$
- *   - Caractères de contrôle U+0000-U+001F (sauf \n \t) supprimés
- *   - Entités HTML (&amp;, &lt;, &gt;, &quot;, &#39;) décodées HORS blocs de code
- *   - Lignes vides multiples réduites
+ * 🧮 normalizeMath — corrige les caractères de contrôle LaTeX
  */
 function normalizeMath(input) {
   if (typeof input !== "string" || input.length === 0) return "";
 
-  // Découpage par blocs de code (``` ... ```) → on ne touche pas l'intérieur
   const parts = [];
   const codeBlockRegex = /```[\s\S]*?```|`[^`\n]*`/g;
   let lastIndex = 0;
   let match;
 
   while ((match = codeBlockRegex.exec(input)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({ type: "text", content: input.slice(lastIndex, match.index) });
-    }
+    if (match.index > lastIndex) parts.push({ type: "text", content: input.slice(lastIndex, match.index) });
     parts.push({ type: "code", content: match[0] });
     lastIndex = match.index + match[0].length;
   }
-  if (lastIndex < input.length) {
-    parts.push({ type: "text", content: input.slice(lastIndex) });
-  }
+  if (lastIndex < input.length) parts.push({ type: "text", content: input.slice(lastIndex) });
 
   const processed = parts.map(({ type, content }) => {
     if (type === "code") return content;
-
     let text = content;
-    // 1) Caractères de contrôle (⚠️ ceux que JSON.parse introduit dans LaTeX)
     text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
-    // 2) LaTeX : \( \) → $ $
     text = text.replace(/\\\(([\s\S]*?)\\\)/g, (_, inner) => `$${inner.trim()}$`);
-    // 3) LaTeX : \[ \] → $$ $$
     text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, inner) => `$$${inner.trim()}$$`);
-    // 4) Entités HTML résiduelles
     text = text
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&nbsp;/g, " ");
-    // 5) Réduit les lignes vides multiples
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
     text = text.replace(/\n{3,}/g, "\n\n");
     return text;
   }).join("");
@@ -616,10 +524,6 @@ function normalizeMath(input) {
   return processed.trim();
 }
 
-/**
- * 🧠 Retire les balises <think>...</think> (raisonnement interne du modèle)
- * du texte destiné à l'utilisateur. Conserve éventuellement le contenu pour logs.
- */
 function stripThinkTags(input) {
   if (typeof input !== "string") return { text: "", thinking: "" };
   const thinks = [];
@@ -628,12 +532,11 @@ function stripThinkTags(input) {
       thinks.push(inner.trim());
       return "";
     })
-    .replace(/<think(?:ing)?>[\s\S]*$/i, "") // think non fermé → tronqué
+    .replace(/<think(?:ing)?>[\s\S]*$/i, "")
     .trim();
   return { text, thinking: thinks.join("\n---\n") };
 }
 
-/** Décodage d'entités XML (RSS) */
 function decodeXmlEntities(str) {
   return String(str)
     .replace(/<!\[CDATA\[/g, "").replace(/\]\]>/g, "")
@@ -642,24 +545,20 @@ function decodeXmlEntities(str) {
     .replace(/\s+/g, " ").trim();
 }
 
-/** Empreinte appareil (SHA-256 tronqué). */
 function computeDeviceFingerprint(ip, userAgent) {
   return sha256(`${ip || "?"}::${userAgent || "?"}`).slice(0, 32);
 }
 
-/** Validation signature binaire image (anti-mimetype falsifié). */
 function isValidImageSignature(buffer) {
   if (!buffer || buffer.length < 12) return false;
   const hex = buffer.subarray(0, 12).toString("hex");
-  if (hex.startsWith("ffd8ff")) return true;                      // JPEG
-  if (hex.startsWith("89504e470d0a1a0a")) return true;            // PNG
-  if (hex.startsWith("47494638")) return true;                    // GIF
-  if (hex.startsWith("52494646") &&
-      buffer.subarray(8, 12).toString("ascii") === "WEBP") return true; // WEBP
+  if (hex.startsWith("ffd8ff")) return true;
+  if (hex.startsWith("89504e470d0a1a0a")) return true;
+  if (hex.startsWith("47494638")) return true;
+  if (hex.startsWith("52494646") && buffer.subarray(8, 12).toString("ascii") === "WEBP") return true;
   return false;
 }
 
-/** Conversion image → base64 (structure pour providers). */
 function convertImageToBase64(buffer, mimetype) {
   return {
     dataUrl: `data:${mimetype};base64,${buffer.toString("base64")}`,
@@ -669,7 +568,6 @@ function convertImageToBase64(buffer, mimetype) {
   };
 }
 
-/** Race avec deadline et fallback (pour appels réseau). */
 function withDeadline(promise, deadlineMs, fallbackValue) {
   return Promise.race([
     promise,
@@ -677,7 +575,7 @@ function withDeadline(promise, deadlineMs, fallbackValue) {
   ]);
 }
 
-/** allSettled avec deadline PAR PROMESSE (⚠️ PHASE 5 : ne jette plus tout si 1 traîne). */
+/** allSettled avec deadline PAR PROMESSE (une source lente ne jette plus tout) */
 async function allSettledWithDeadline(promises, deadlineMs) {
   const wrapped = promises.map((p) =>
     Promise.race([
@@ -689,75 +587,58 @@ async function allSettledWithDeadline(promises, deadlineMs) {
   return Promise.all(wrapped);
 }
 
-/** Sleep simple. */
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/** Backoff exponentiel avec jitter. */
 function backoffDelay(attempt, base = 400, max = 8000) {
   const exp = Math.min(base * Math.pow(2, attempt), max);
   return exp + Math.floor(Math.random() * 200);
 }
 
-/** Regex email validée. */
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PHONE_REGEX = /^\+?[1-9]\d{6,14}$/; // E.164 souple
+const PHONE_REGEX = /^\+?[1-9]\d{6,14}$/;
 
-// ================================================================================
-// ==================== DATES (⚠️ PHASE 2 : plus de comparaison textuelle) ======
-// ================================================================================
-
-/** Retourne le début du jour (UTC) en ms, utilisé pour les quotas. */
 function todayKeyMs() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
+/** Chunk de texte UTF-8 safe (jamais au milieu d'une paire de substitution) */
+function safeChunkText(text, targetSize = 24) {
+  if (!text) return [];
+  const chunks = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + targetSize, text.length);
+    const code = text.charCodeAt(end - 1);
+    if (code >= 0xD800 && code <= 0xDBFF && end < text.length) end++;
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+
 // ================================================================================
-// ==================== ÉVALUATEUR MATH ISOLÉ (Worker) =========================
+// ==================== ÉVALUATEUR MATH (Worker isolé) =========================
 // ================================================================================
-// ⚠️ PHASE 2 : math.evaluate() sur entrée utilisateur = DoS (zeros(1e9), factorielle géante).
-// Solution : pool de Workers avec timeout strict + scope math restreint.
 
 const MATH_WORKER_SOURCE = `
   const { parentPort, workerData } = require('worker_threads');
   const math = require('mathjs');
-
-  // ⚠️ Instance restreinte : pas d'import, createUnit, parse arbitraire, eval.
-  const safeMath = math.create({
-    number: 'number',
-    precision: 64,
-    matrix: 'Matrix',
-    predictable: true
-  });
-  // Bloque les fonctions connues pour être DoS
+  const safeMath = math.create({ number: 'number', precision: 64, matrix: 'Matrix', predictable: true });
   safeMath.import({
     import: function () { throw new Error('import interdit'); },
     createUnit: function () { throw new Error('createUnit interdit'); },
-    evaluate: function () { throw new Error('evaluate interdit dans le sandbox'); },
+    evaluate: function () { throw new Error('evaluate interdit'); },
     parse: function () { throw new Error('parse interdit'); },
     simplify: function () { throw new Error('simplify interdit'); },
     derivative: function () { throw new Error('derivative interdit'); },
-    zeros: function (n) {
-      const size = Number(n);
-      if (size > 10000) throw new Error('zeros trop grand');
-      return math.zeros(size);
-    },
-    ones: function (n) {
-      const size = Number(n);
-      if (size > 10000) throw new Error('ones trop grand');
-      return math.ones(size);
-    },
-    factorial: function (n) {
-      const size = Number(n);
-      if (size > 500) throw new Error('factorielle trop grande');
-      return math.factorial(size);
-    }
+    zeros: function (n) { const s = Number(n); if (s > 10000) throw new Error('zeros trop grand'); return math.zeros(s); },
+    ones: function (n) { const s = Number(n); if (s > 10000) throw new Error('ones trop grand'); return math.ones(s); },
+    factorial: function (n) { const s = Number(n); if (s > 500) throw new Error('factorielle trop grande'); return math.factorial(s); }
   }, { override: true });
-
   try {
     const expr = String(workerData.expression || '').slice(0, 2000);
     if (!expr) throw new Error('Expression vide');
-    if (/[;]/.test(expr.replace(/\\\\(?!.)/g, ''))) {} // pas bloquant, juste info
     const result = safeMath.evaluate(expr);
     parentPort.postMessage({ ok: true, result: safeMath.format(result, { precision: 14 }) });
   } catch (e) {
@@ -765,22 +646,13 @@ const MATH_WORKER_SOURCE = `
   }
 `;
 
-let mathWorkerPool = null;
-function getMathWorkerPool(size = 2) {
-  if (mathWorkerPool) return mathWorkerPool;
-  mathWorkerPool = { size, available: [], busy: 0, queue: [] };
-  return mathWorkerPool;
-}
-
-/** Exécute une expression math en Worker avec timeout strict (jamais dans le process principal). */
 function evaluateMathSafe(expression, timeoutMs = 1500) {
   return new Promise((resolve) => {
     const expr = String(expression || "").slice(0, 2000);
     if (!expr.trim()) return resolve({ success: false, expression: expr, error: "Expression vide" });
 
     const worker = new Worker(MATH_WORKER_SOURCE, {
-      eval: true,
-      workerData: { expression: expr },
+      eval: true, workerData: { expression: expr },
       resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16 }
     });
 
@@ -795,30 +667,24 @@ function evaluateMathSafe(expression, timeoutMs = 1500) {
 
     worker.on("message", (msg) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+      settled = true; clearTimeout(timer);
       worker.terminate().catch(() => {});
       if (msg.ok) resolve({ success: true, expression: expr, result: msg.result, formatted: msg.result });
       else resolve({ success: false, expression: expr, error: msg.error });
     });
-
     worker.on("error", (err) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+      settled = true; clearTimeout(timer);
       resolve({ success: false, expression: expr, error: err.message });
     });
-
     worker.on("exit", (code) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+      settled = true; clearTimeout(timer);
       resolve({ success: false, expression: expr, error: `Worker sorti (code ${code})` });
     });
   });
 }
 
-/** Détection d'expressions mathématiques simples (regex, prompt-safe). */
 function detectMathExpressions(message) {
   const patterns = [
     /(\d+(?:\.\d+)?(?:\s*[\+\-\*\/\^]\s*\d+(?:\.\d+)?)+)/g,
@@ -835,10 +701,8 @@ function detectMathExpressions(message) {
 }
 
 // ================================================================================
-// ==================== CIRCUIT BREAKER (par provider + modèle + clé) =========
+// ==================== CIRCUIT BREAKER (provider:model:key) ===================
 // ================================================================================
-// ⚠️ PHASE 1 : un 404 sur un modèle ne doit PAS ouvrir le breaker pour toute la clé.
-// La clé = `${provider}:${model}:${keyLabel}`.
 
 class CircuitBreaker {
   constructor(name, options = {}) {
@@ -856,14 +720,12 @@ class CircuitBreaker {
     if (this.state === "CLOSED") return true;
     if (this.state === "OPEN") {
       if (Date.now() - this.lastFailureTime >= this.resetTimeout) {
-        this.state = "HALF_OPEN";
-        this.halfOpenInFlight = 0;
+        this.state = "HALF_OPEN"; this.halfOpenInFlight = 0;
         logger.info({ circuit: this.name }, "Circuit HALF_OPEN");
         return true;
       }
       return false;
     }
-    // HALF_OPEN : une seule requête de test à la fois
     if (this.halfOpenInFlight >= CONFIG.CIRCUIT_BREAKER_HALF_OPEN_MAX) return false;
     return true;
   }
@@ -876,7 +738,6 @@ class CircuitBreaker {
     }
     const isHalfOpen = this.state === "HALF_OPEN";
     if (isHalfOpen) this.halfOpenInFlight++;
-
     try {
       const result = await fn();
       this.onSuccess();
@@ -890,8 +751,7 @@ class CircuitBreaker {
   }
 
   onSuccess() {
-    this.failureCount = 0;
-    this.state = "CLOSED";
+    this.failureCount = 0; this.state = "CLOSED";
     this.emitter.emit("success", { name: this.name });
   }
 
@@ -907,61 +767,43 @@ class CircuitBreaker {
   }
 }
 
-/** Registre global des breakers (clé = provider:model:keyLabel). */
 const circuitRegistry = new Map();
 function getCircuit(provider, model, keyLabel) {
   const key = `${provider}:${model}:${keyLabel}`;
   let cb = circuitRegistry.get(key);
-  if (!cb) {
-    cb = new CircuitBreaker(key);
-    circuitRegistry.set(key, cb);
-  }
+  if (!cb) { cb = new CircuitBreaker(key); circuitRegistry.set(key, cb); }
   return cb;
 }
 
 // ================================================================================
-// ==================== CLIENT SUPABASE + OUTBOX ================================
+// ==================== SUPABASE + OUTBOX =======================================
 // ================================================================================
-// ⚠️ PHASE 3 : supabase-js ne LÈVE PAS, il renvoie {error}. TOUS les appels DOIVENT
-// vérifier et loguer l'erreur. Les échecs sont mis en outbox pour rejeu.
 
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
   supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
     db: { schema: "public" },
-    global: { headers: { "x-application-name": "luba-backend-v15" } }
+    global: { headers: { "x-application-name": "luba-backend-v15.1" } }
   });
   logger.info("✅ Supabase initialisé (source de vérité)");
 } else {
   logger.warn("⚠️ Supabase non configuré — SQLite local uniquement");
 }
 
-/**
- * 📤 Enfile une opération Supabase échouée pour rejeu avec backoff.
- * Idempotence : upsert sur clé stable OU clé composite (table, op, idempotency_key).
- */
 async function enqueueOutbox(tableName, op, payload, idempotencyKey) {
   try {
     await dbRun(
       `INSERT INTO outbox (table_name, op, payload, idempotency_key, attempts, next_attempt_at, status)
        VALUES (?, ?, ?, ?, 0, ?, 'pending')
        ON CONFLICT(table_name, op, idempotency_key) DO UPDATE SET
-         payload = excluded.payload,
-         next_attempt_at = excluded.next_attempt_at,
-         status = 'pending',
-         updated_at = ?`,
+         payload = excluded.payload, next_attempt_at = excluded.next_attempt_at,
+         status = 'pending', updated_at = ?`,
       [tableName, op, JSON.stringify(payload), idempotencyKey, Date.now(), Date.now()]
     );
-  } catch (e) {
-    logger.error({ err: e.message, tableName, op }, "Erreur enqueue outbox");
-  }
+  } catch (e) { logger.error({ err: e.message, tableName, op }, "Erreur enqueue outbox"); }
 }
 
-/**
- * Écrit dans Supabase. En cas d'erreur → outbox. Idempotency_key DOIT être stable
- * (par ex. `user_id:${id}:task_id:${taskId}`).
- */
 async function supabaseWriteSafe({ table, op, payload, idempotencyKey, matchColumn = null, matchValue = null }) {
   if (!supabase) return { success: false, reason: "no_supabase" };
   try {
@@ -985,9 +827,9 @@ async function supabaseWriteSafe({ table, op, payload, idempotencyKey, matchColu
   }
 }
 
-/** Boucle de rejeu de l'outbox (backoff exponentiel, max 5 minutes entre tentatives). */
 const OUTBOX_MAX_ATTEMPTS = 12;
 const OUTBOX_BATCH_SIZE = 20;
+
 async function processOutbox() {
   if (!supabase) return;
   let rows = [];
@@ -1011,7 +853,6 @@ async function processOutbox() {
       else if (row.op === "delete") result = await supabase.from(row.table_name).delete().eq(payload.matchColumn, payload.matchValue);
 
       if (result?.error) throw new Error(result.error.message);
-
       await dbRun(`UPDATE outbox SET status = 'done', updated_at = ? WHERE id = ?`, [Date.now(), row.id]);
     } catch (e) {
       const attempts = row.attempts + 1;
@@ -1039,7 +880,7 @@ async function markOutboxDead(id, error) {
 setInterval(processOutbox, 15000).unref?.();
 
 // ================================================================================
-// ==================== CACHE TOKEN AUTH (⚠️ PHASE 1 : 5 min TTL) ===============
+// ==================== CACHE TOKEN AUTH ========================================
 // ================================================================================
 
 const tokenCache = new LRUCache({
@@ -1048,34 +889,25 @@ const tokenCache = new LRUCache({
   updateAgeOnGet: false
 });
 
-function cacheGetToken(token) {
-  return tokenCache.get(sha256(token)) || null;
-}
-function cacheSetToken(token, user) {
-  tokenCache.set(sha256(token), user);
-}
+function cacheGetToken(token) { return tokenCache.get(sha256(token)) || null; }
+function cacheSetToken(token, user) { tokenCache.set(sha256(token), user); }
 
 // ================================================================================
 // ==================== VÉRIFICATION FIREBASE ===================================
 // ================================================================================
 
 async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH_CHECK_REVOKED } = {}) {
-  // 1) Cache mémoire (5 min) — évite verifyIdToken à chaque requête
   const cached = cacheGetToken(token);
   if (cached) return cached;
 
-  // 2) Admin SDK
   if (firebaseApp && firebaseAdmin) {
     try {
       const decoded = await firebaseAdmin.auth(firebaseApp).verifyIdToken(token, checkRevoked);
       const user = {
-        uid: decoded.uid,
-        email: decoded.email || null,
-        displayName: decoded.name || null,
-        photoURL: decoded.picture || null,
+        uid: decoded.uid, email: decoded.email || null,
+        displayName: decoded.name || null, photoURL: decoded.picture || null,
         emailVerified: decoded.email_verified || false,
-        role: decoded.role || "FREE",
-        customClaims: decoded
+        role: decoded.role || "FREE", customClaims: decoded
       };
       cacheSetToken(token, user);
       return user;
@@ -1085,7 +917,6 @@ async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH_CHECK_REV
     }
   }
 
-  // 3) Repli REST
   if (!FIREBASE_CONFIG.apiKey) {
     const e = new Error("Aucune configuration Firebase disponible");
     e.code = "auth/configuration-not-found";
@@ -1094,18 +925,14 @@ async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH_CHECK_REV
   try {
     const response = await axios.post(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
-      { idToken: token },
-      { timeout: 8000 }
+      { idToken: token }, { timeout: 8000 }
     );
     if (response.data.users && response.data.users.length > 0) {
       const u = response.data.users[0];
       const user = {
-        uid: u.localId,
-        email: u.email || null,
-        displayName: u.displayName || null,
-        photoURL: u.photoUrl || null,
-        emailVerified: u.emailVerified || false,
-        role: "FREE"
+        uid: u.localId, email: u.email || null,
+        displayName: u.displayName || null, photoURL: u.photoUrl || null,
+        emailVerified: u.emailVerified || false, role: "FREE"
       };
       cacheSetToken(token, user);
       return user;
@@ -1141,10 +968,6 @@ async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTo
   } catch (e) { logger.error({ err: e.message }, "Erreur audit LLM"); }
 }
 
-/**
- * Détection nouvel appareil (⚠️ PHASE 1 : plus de LIKE '%..%' → colonne fingerprint indexée).
- * Fire-and-forget, jamais bloquant.
- */
 function detectAndLogNewDeviceAsync(userId, ip, userAgent) {
   setImmediate(async () => {
     try {
@@ -1153,16 +976,14 @@ function detectAndLogNewDeviceAsync(userId, ip, userAgent) {
         `SELECT id FROM security_logs WHERE user_id = ? AND event_type = 'DEVICE_SEEN' AND fingerprint = ? LIMIT 1`,
         [userId, fingerprint]
       );
-      if (!existing) {
-        await logSecurityEvent(userId, "NEW_DEVICE_DETECTED", { fingerprint }, ip, userAgent, fingerprint);
-      }
+      if (!existing) await logSecurityEvent(userId, "NEW_DEVICE_DETECTED", { fingerprint }, ip, userAgent, fingerprint);
       await logSecurityEvent(userId, "DEVICE_SEEN", {}, ip, userAgent, fingerprint);
     } catch (e) { logger.error({ err: e.message }, "Erreur détection appareil"); }
   });
 }
 
 // ================================================================================
-// ==================== SESSIONS ACTIVES (Tokens hashés) ========================
+// ==================== SESSIONS ACTIVES ========================================
 // ================================================================================
 
 async function createActiveSession(userId, ipAddress, userAgent) {
@@ -1174,11 +995,9 @@ async function createActiveSession(userId, ipAddress, userAgent) {
     [userId, Date.now()]
   );
   if ((active?.count || 0) >= CONFIG.MAX_SESSIONS_PER_USER) {
-    // Révoque la plus ancienne
     await dbRun(
       `UPDATE active_sessions SET is_revoked = 1 WHERE id = (
-         SELECT id FROM active_sessions WHERE user_id = ? AND is_revoked = 0
-         ORDER BY created_at ASC LIMIT 1
+         SELECT id FROM active_sessions WHERE user_id = ? AND is_revoked = 0 ORDER BY created_at ASC LIMIT 1
        )`,
       [userId]
     );
@@ -1189,7 +1008,6 @@ async function createActiveSession(userId, ipAddress, userAgent) {
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [userId, hashSessionToken(sessionToken), ipAddress, userAgent, expiresAt, Date.now(), Date.now()]
   );
-
   return sessionToken;
 }
 
@@ -1217,7 +1035,7 @@ async function revokeAllSessions(userId) {
 }
 
 // ================================================================================
-// ==================== PROTECTION ANTI-BRUTE-FORCE (dates en ms) ===============
+// ==================== ANTI-BRUTE-FORCE ========================================
 // ================================================================================
 
 async function checkLoginAttempts(ipAddress) {
@@ -1236,19 +1054,15 @@ async function checkLoginAttempts(ipAddress) {
       `INSERT INTO blocked_ips (ip_address, reason, strike_count, blocked_until, created_at)
        VALUES (?, 'Trop de tentatives échouées', ?, ?, ?)
        ON CONFLICT(ip_address) DO UPDATE SET
-         reason = excluded.reason,
-         strike_count = excluded.strike_count,
-         blocked_until = excluded.blocked_until`,
+         reason = excluded.reason, strike_count = excluded.strike_count, blocked_until = excluded.blocked_until`,
       [ipAddress, strikeCount, Date.now() + escalated, Date.now()]
     );
-
     if (strikeCount >= 3) logger.warn({ ipAddress, strikeCount }, "🚨 IP récidiviste");
     return { blocked: true, message: "Trop de tentatives échouées. IP temporairement bloquée." };
   }
   return { blocked: false };
 }
 
-/** ⚠️ PHASE 2 : "Token manquant" n'est PAS un échec de login (ne bloque pas les IP partagées). */
 async function recordLoginAttempt(ipAddress, userId, success, errorMessage = null, { countFailure = true } = {}) {
   if (!success && !countFailure) return;
   try {
@@ -1292,7 +1106,6 @@ async function checkUserQuota(userId, action, userRole = "FREE") {
     return { allowed: true, remaining: max - current, current, max };
   } catch (e) {
     logger.error({ err: e.message }, "Erreur checkUserQuota");
-    // Fail-open prudent : si la DB est cassée, on laisse passer (mieux que bloquer tout le monde).
     return { allowed: true, remaining: null };
   }
 }
@@ -1314,7 +1127,6 @@ async function incrementUserQuota(userId, action) {
 // ================================================================================
 // ==================== MUTEX PAR CONVERSATION ==================================
 // ================================================================================
-// ⚠️ PHASE 3 : deux messages rapides ne doivent pas s'entrelacer.
 
 async function acquireConversationLock(conversationId, ownerRequestId, ttlMs = 30000) {
   const now = Date.now();
@@ -1324,19 +1136,15 @@ async function acquireConversationLock(conversationId, ownerRequestId, ttlMs = 3
       `INSERT INTO conversation_locks (conversation_id, locked_until, owner_request_id, created_at)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(conversation_id) DO UPDATE SET
-         locked_until = excluded.locked_until,
-         owner_request_id = excluded.owner_request_id
+         locked_until = excluded.locked_until, owner_request_id = excluded.owner_request_id
        WHERE conversation_locks.locked_until < ?`,
       [conversationId, expires, ownerRequestId, now, now]
     );
-    const row = await dbGet(
-      `SELECT owner_request_id, locked_until FROM conversation_locks WHERE conversation_id = ?`,
-      [conversationId]
-    );
+    const row = await dbGet(`SELECT owner_request_id, locked_until FROM conversation_locks WHERE conversation_id = ?`, [conversationId]);
     return Boolean(row && row.owner_request_id === ownerRequestId && row.locked_until >= now);
   } catch (e) {
     logger.error({ err: e.message }, "Erreur acquireConversationLock");
-    return true; // fail-open
+    return true;
   }
 }
 
@@ -1350,51 +1158,33 @@ async function releaseConversationLock(conversationId, ownerRequestId) {
 }
 
 // ================================================================================
-// ==================== ENTITÉS (⚠️ PHASE 4 : extraction pour images/sport/YouTube)
+// ==================== ENTITÉS =================================================
 // ================================================================================
 
-/**
- * Extraction d'entité minimaliste : on cherche la partie la plus informative de la
- * requête utilisateur (nom propre, lieu, équipe, sujet) sans passer la phrase entière
- * aux API externes.
- *
- * Heuristique : on privilégie les séquences de mots capitalisés (hors début de phrase),
- * sinon on nettoie les verbes interrogatifs/déictiques.
- */
 function extractEntity(message) {
   if (!message || typeof message !== "string") return "";
   let m = message.trim().replace(/[?!.,;:]+$/g, "");
 
-  // Supprime les amorces d'interrogation usuelles
   m = m.replace(
     /^(qui est|c'?est qui|qui était|montre-moi|montre moi|cherche|trouve-moi|trouve moi|parle-moi de|parle moi de|donne-moi|donne moi|photo de|image de|clip de|vidéo de|video de|chanson de|à quoi ressemble|a quoi ressemble|quelle est|quel est|où se trouve|ou se trouve)\s+/i,
     ""
   ).trim();
 
-  // Récupère la séquence de mots capitalisés la plus longue (au moins 1 mot)
   const capitalSeq = m.match(/\b([A-ZÀ-Ý][a-zà-ÿ]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ]+){0,3})\b/g);
-  if (capitalSeq && capitalSeq.length > 0) {
-    return capitalSeq.sort((a, b) => b.length - a.length)[0];
-  }
+  if (capitalSeq && capitalSeq.length > 0) return capitalSeq.sort((a, b) => b.length - a.length)[0];
 
-  // Repli : premier groupe nominal simple (max 60 chars)
   return m.split(/\s+/).slice(0, 8).join(" ").slice(0, 60);
 }
 
 // ================================================================================
-// ==================== PRÉ-ROUTEUR D'INTENTION (⚠️ PHASE 4 : \b…\b) =============
+// ==================== PRÉ-ROUTEUR INTENTION ===================================
 // ================================================================================
-// ⚠️ L'ancien analyzeIntent utilisait includes() : "comment" contenait "om", "capitale"
-// contenait "api", "vue" → CODE, etc. On remplace par une correspondance de MOTS ENTIERS,
-// normalisée (accents retirés), avec GENERAL par défaut. Le tool calling natif
-// (Partie 2) prendra le relais pour les cas complexes.
 
 function normalizeForMatch(s) {
   return String(s).toLowerCase()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9\s'-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\s+/g, " ").trim();
 }
 
 function containsWholeWords(haystack, needles) {
@@ -1402,7 +1192,6 @@ function containsWholeWords(haystack, needles) {
   for (const n of needles) {
     const token = normalizeForMatch(n);
     if (!token) continue;
-    // Mot entier (espace avant/après, ou tiret / apostrophe en bord)
     const re = new RegExp(`(^|[\\s'\\-])${token.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}([\\s'\\-]|$)`);
     if (re.test(h)) return true;
   }
@@ -1412,45 +1201,37 @@ function containsWholeWords(haystack, needles) {
 const INTENT_KEYWORDS = {
   MATHS: ["calcule", "calculer", "resous", "equation", "integrale", "derivee", "factorielle", "matrice", "limite", "theoreme", "algebre"],
   ACTUALITE: ["actualite", "actualites", "news", "journal", "derniere", "dernieres", "presse"],
-  SPORT: ["score", "match", "football", "basket", "tennis", "nba", "ligue", "championnat", "classement", "resultat"],
+  SPORT: ["score", "match", "football", "basket", "tennis", "nba", "ligue", "championnat", "classement", "resultat", "leopards", "leopard"],
   CODE: ["code", "coder", "javascript", "python", "java", "typescript", "react", "angular", "vuejs", "nodejs", "sql", "algorithme", "bug", "debug"],
   VIDEO: ["clip", "video", "youtube", "chanson", "musique", "regarder", "ecouter"],
   TASK: ["rappelle-moi", "rappel", "tache", "taches", "planifie", "agenda", "rendez-vous"],
   PERSONNE: ["qui est", "photo de", "biographie de", "portrait de", "c'est qui"]
 };
 
-/**
- * Pré-routeur : renvoie { intent, entity } ou { intent: "GENERAL", entity }.
- * Ne renvoie JAMAIS SPORT/CODE/PERSONNE par effet de bord (mots entiers uniquement).
- */
 function preRouteIntent(message) {
   const text = String(message || "").trim();
   const entity = extractEntity(text);
-
   if (!text) return { intent: "GENERAL", entity };
 
-  if (containsWholeWords(text, INTENT_KEYWORDS.TASK))    return { intent: "TASK",     entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.VIDEO))   return { intent: "VIDEO",    entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.MATHS))   return { intent: "MATHS",    entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.SPORT))   return { intent: "SPORT",    entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.ACTUALITE)) return { intent: "ACTUALITE", entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.CODE))    return { intent: "CODE",     entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.PERSONNE))return { intent: "PERSONNE", entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.TASK))     return { intent: "TASK",     entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.VIDEO))    return { intent: "VIDEO",    entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.MATHS))    return { intent: "MATHS",    entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.SPORT))    return { intent: "SPORT",    entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.ACTUALITE))return { intent: "ACTUALITE",entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.CODE))     return { intent: "CODE",     entity };
+  if (containsWholeWords(text, INTENT_KEYWORDS.PERSONNE)) return { intent: "PERSONNE", entity };
 
   return { intent: "GENERAL", entity };
 }
 
 // ================================================================================
-// ==================== REGISTRE DES PROVIDERS LLM ==============================
+// ==================== PROVIDERS LLM ===========================================
 // ================================================================================
 
 function buildKeyPool(keys, prefix) {
   return keys
     .filter((k) => typeof k === "string" && k.trim().length > 0)
-    .map((apiKey, idx) => ({
-      apiKey: apiKey.trim(),
-      label: `${prefix}_key_${idx + 1}`
-    }));
+    .map((apiKey, idx) => ({ apiKey: apiKey.trim(), label: `${prefix}_key_${idx + 1}` }));
 }
 
 let geminiClient = null;
@@ -1458,9 +1239,7 @@ if (GoogleGenAI && process.env.GEMINI_API_KEY) {
   try {
     geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     logger.info("✅ Client Gemini initialisé");
-  } catch (e) {
-    logger.error({ err: e.message }, "❌ Erreur init Gemini");
-  }
+  } catch (e) { logger.error({ err: e.message }, "❌ Erreur init Gemini"); }
 } else if (!process.env.GEMINI_API_KEY) {
   logger.warn("⚠️ GEMINI_API_KEY absent — Gemini désactivé");
 }
@@ -1468,18 +1247,12 @@ if (GoogleGenAI && process.env.GEMINI_API_KEY) {
 const LLM_PROVIDERS = {
   GROQ: {
     baseURL: "https://api.groq.com/openai/v1",
-    defaultTimeout: 10000,
-    maxTokens: 4000,
-    temperature: 0.7,
-    supportsTools: true,
+    defaultTimeout: 10000, maxTokens: 4000, temperature: 0.7, supportsTools: true,
     keyPool: buildKeyPool([process.env.GROQ_API_KEY, process.env.GROQ_API_KEY_2], "groq")
   },
   OPENROUTER: {
     baseURL: "https://openrouter.ai/api/v1",
-    defaultTimeout: 12000,
-    maxTokens: 4000,
-    temperature: 0.7,
-    supportsTools: true,
+    defaultTimeout: 12000, maxTokens: 4000, temperature: 0.7, supportsTools: true,
     keyPool: buildKeyPool(
       [process.env.OPENROUTER_API_KEY, process.env.OPENROUTER_API_KEY_2, process.env.OPENROUTER_API_KEY_3],
       "openrouter"
@@ -1487,20 +1260,13 @@ const LLM_PROVIDERS = {
   },
   CEREBRAS: {
     baseURL: "https://api.cerebras.ai/v1",
-    defaultTimeout: 10000,
-    maxTokens: 4000,
-    temperature: 0.7,
-    supportsTools: true,
+    defaultTimeout: 10000, maxTokens: 4000, temperature: 0.7, supportsTools: true,
     keyPool: buildKeyPool([process.env.CEREBRAS_API_KEY, process.env.CEREBRAS_API_KEY_2], "cerebras")
   },
   GEMINI: {
     baseURL: "https://generativelanguage.googleapis.com/v1beta",
-    defaultTimeout: 12000,
-    maxTokens: 8000,
-    temperature: 0.7,
-    isGemini: true,
-    client: geminiClient,
-    supportsTools: true,
+    defaultTimeout: 12000, maxTokens: 8000, temperature: 0.7, isGemini: true,
+    client: geminiClient, supportsTools: true,
     keyPool: buildKeyPool([process.env.GEMINI_API_KEY], "gemini")
   }
 };
@@ -1515,13 +1281,11 @@ else logger.info(`✅ ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s) Cerebras`
 // ================================================================================
 // ==================== TIERS DE MODÈLES ========================================
 // ================================================================================
-// ⚠️ PHASE 1 : jsonMode = false pour le chat conversationnel.
-// Le chat répond en TEXTE BRUT + suggestions extraites par délimiteur.
 
 const MODEL_TIERS = {
   v100: {
     name: "Mwamba",
-    jsonMode: false, // ⚠️ v15 : texte brut (fin des U+000C / tabulations en maths)
+    jsonMode: false,
     providers: [
       { provider: "groq",       model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile",                   maxTokens: 4000, timeout: 10000, temperature: 0.7, failoverPriority: 0 },
       { provider: "gemini",     model: process.env.GEMINI_MODEL_V100 || "gemini-3.6-flash",                        maxTokens: 8000, timeout: 12000, temperature: 0.7, failoverPriority: 1 },
@@ -1535,8 +1299,8 @@ const MODEL_TIERS = {
     jsonMode: false,
     reasoning: {
       providers: [
-        { provider: "gemini",     model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-3.6-flash",                    maxTokens: 8000, timeout: 20000, temperature: 0.3, failoverPriority: 0 },
-        { provider: "cerebras",   model: process.env.CEREBRAS_MODEL_V250_REASONING || "qwen-3.8-27b",                      maxTokens: 8000, timeout: 18000, temperature: 0.3, failoverPriority: 1, reasoningEffort: "high" },
+        { provider: "gemini",     model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-3.6-flash",                     maxTokens: 8000, timeout: 20000, temperature: 0.3, failoverPriority: 0 },
+        { provider: "cerebras",   model: process.env.CEREBRAS_MODEL_V250_REASONING || "qwen-3.8-27b",                       maxTokens: 8000, timeout: 18000, temperature: 0.3, failoverPriority: 1, reasoningEffort: "high" },
         { provider: "openrouter", model: process.env.OPENROUTER_MODEL_V250_REASONING || "nvidia/nemotron-3-super-120b:free", maxTokens: 8000, timeout: 20000, temperature: 0.3, failoverPriority: 2 }
       ]
     },
@@ -1561,7 +1325,7 @@ const MODEL_TIERS = {
 };
 
 // ================================================================================
-// ==================== VALIDATION / SANITIZE MODÈLES OPENROUTER ================
+// ==================== VALIDATION MODÈLES OPENROUTER ===========================
 // ================================================================================
 
 function validateAndSanitizeOpenRouterModel(model) {
@@ -1598,33 +1362,29 @@ class LLMErrorInterceptor {
     return "UNKNOWN_ERROR";
   }
 
-  /** Providers à retirer du routage pour cette requête (ne pas insister). */
   static shouldSkipProvider(error) {
     const code = this.getErrorCode(error);
     return ["HTTP_400","HTTP_401","HTTP_403","HTTP_402","HTTP_404","MISSING_API_KEY"].includes(code);
   }
 
-  /** ⚠️ PHASE 1 : 429/5xx/timeout → rotation IMMÉDIATE vers la clé/modèle suivant. */
   static shouldRotateImmediately(error) {
     const code = this.getErrorCode(error);
     return ["HTTP_429","HTTP_500","HTTP_502","HTTP_503","HTTP_504","TIMEOUT","DNS_ERROR","CONNECTION_REFUSED","CIRCUIT_OPEN"].includes(code);
   }
 }
 
-// ================================================================================
-// ==================== SÉLECTION D'UN MESSAGE AMICAL POUR L'UTILISATEUR ========
-// ================================================================================
-
 function userFacingErrorMessage(error) {
   const code = LLMErrorInterceptor.getErrorCode(error);
-  if (code === "HTTP_429") return "Je suis très sollicité. Réessayez dans quelques instants.";
-  if (code === "TIMEOUT" || code === "HTTP_504") return "Je mets un peu trop de temps à répondre. Réessayez, ça devrait aller mieux.";
-  if (code === "CIRCUIT_OPEN") return "Je suis temporairement indisponible. Réessayez dans une minute.";
-  return "Je suis momentanément indisponible. Réessayez dans un instant.";
+  if (code === "HTTP_429") return "Je suis très sollicité en ce moment. Réessayez dans quelques instants. 🙏";
+  if (code === "TIMEOUT" || code === "HTTP_504") return "Cette demande est complexe et prend plus de temps que prévu. Reformulez-la en étapes plus petites, ou réessayez.";
+  if (code === "CIRCUIT_OPEN") return "Je suis temporairement surchargé. Patientez une minute puis réessayez.";
+  if (code === "HTTP_400") return "Je n'ai pas bien compris la requête. Pouvez-vous la reformuler ?";
+  if (code === "HTTP_401" || code === "HTTP_403") return "Problème d'authentification côté fournisseur. Contactez le support si le problème persiste.";
+  return "Je rencontre une difficulté technique. Reformulez votre demande, ou réessayez dans un instant.";
 }
 
 // ================================================================================
-// ==================== VÉRIFICATION DISPONIBILITÉ MODÈLES ======================
+// ==================== DISPONIBILITÉ MODÈLES ===================================
 // ================================================================================
 
 let modelAvailabilityReport = { checkedAt: null, issues: [], ok: true };
@@ -1642,7 +1402,6 @@ function collectConfiguredOpenRouterModels() {
 async function checkModelAvailability() {
   const issues = [];
 
-  // OpenRouter
   try {
     const r = await axios.get("https://openrouter.ai/api/v1/models", { timeout: 8000 });
     const catalog = r.data?.data || [];
@@ -1656,12 +1415,10 @@ async function checkModelAvailability() {
     }
   } catch (e) { logger.warn({ err: e.message }, "Vérif OpenRouter impossible"); }
 
-  // Groq
   try {
     if (LLM_PROVIDERS.GROQ.keyPool.length > 0) {
       const r = await axios.get("https://api.groq.com/openai/v1/models", {
-        timeout: 8000,
-        headers: { Authorization: `Bearer ${LLM_PROVIDERS.GROQ.keyPool[0].apiKey}` }
+        timeout: 8000, headers: { Authorization: `Bearer ${LLM_PROVIDERS.GROQ.keyPool[0].apiKey}` }
       });
       const ids = new Set((r.data?.data || []).map(m => m.id));
       const configured = new Set([
@@ -1674,12 +1431,10 @@ async function checkModelAvailability() {
     }
   } catch (e) { logger.warn({ err: e.message }, "Vérif Groq impossible"); }
 
-  // Cerebras
   try {
     if (LLM_PROVIDERS.CEREBRAS.keyPool.length > 0) {
       const r = await axios.get("https://api.cerebras.ai/v1/models", {
-        timeout: 8000,
-        headers: { Authorization: `Bearer ${LLM_PROVIDERS.CEREBRAS.keyPool[0].apiKey}` }
+        timeout: 8000, headers: { Authorization: `Bearer ${LLM_PROVIDERS.CEREBRAS.keyPool[0].apiKey}` }
       });
       const ids = new Set((r.data?.data || []).map(m => m.id));
       const configured = new Set([
@@ -1691,12 +1446,10 @@ async function checkModelAvailability() {
     }
   } catch (e) { logger.warn({ err: e.message }, "Vérif Cerebras impossible"); }
 
-  // Gemini
   if (geminiClient && process.env.GEMINI_API_KEY) {
     try {
       const r = await axios.get("https://generativelanguage.googleapis.com/v1beta/models", {
-        timeout: 8000,
-        headers: { "x-goog-api-key": process.env.GEMINI_API_KEY }
+        timeout: 8000, headers: { "x-goog-api-key": process.env.GEMINI_API_KEY }
       });
       const ids = new Set((r.data?.models || []).map(m => m.name?.replace("models/", "")));
       const configured = new Set([
@@ -1709,7 +1462,7 @@ async function checkModelAvailability() {
   }
 
   modelAvailabilityReport = { checkedAt: new Date().toISOString(), issues, ok: issues.length === 0 };
-  if (issues.length > 0) logger.warn({ issues }, "🚨 Modèles problématiques — voir GET /api/health → modelAvailability");
+  if (issues.length > 0) logger.warn({ issues }, "🚨 Modèles problématiques");
   else logger.info("✅ Tous les modèles vérifiés");
 }
 
@@ -1717,7 +1470,7 @@ checkModelAvailability();
 setInterval(checkModelAvailability, 6 * 60 * 60 * 1000).unref?.();
 
 // ================================================================================
-// ==================== EMAIL (transport) =======================================
+// ==================== EMAIL TRANSPORT =========================================
 // ================================================================================
 
 let emailTransporter = null;
@@ -1728,7 +1481,6 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     port: parseInt(process.env.SMTP_PORT || "587", 10),
     secure: process.env.SMTP_PORT === "465",
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    // ⚠️ PHASE 2 : rejectUnauthorized:true par défaut ; à ne désactiver qu'en dev explicite.
     tls: { rejectUnauthorized: tlsRejectUnauthorized },
     pool: true, maxConnections: 3, maxMessages: 50
   });
@@ -1773,35 +1525,31 @@ const rssParser = new Parser({
 // ================================================================================
 
 const OPEN_SOURCES = {
-  wikipedia:        { name: "Wikipédia",         url: "https://fr.wikipedia.org",       logo: "https://www.google.com/s2/favicons?sz=64&domain=wikipedia.org" },
-  wikimediacommons: { name: "Wikimedia Commons", url: "https://commons.wikimedia.org",  logo: "https://www.google.com/s2/favicons?sz=64&domain=wikimedia.org" },
-  googlenews:       { name: "Google News",       url: "https://news.google.com",        logo: "https://www.google.com/s2/favicons?sz=64&domain=news.google.com" },
-  thesportsdb:      { name: "TheSportsDB",       url: "https://www.thesportsdb.com",    logo: "https://www.google.com/s2/favicons?sz=64&domain=thesportsdb.com" },
-  arxiv:            { name: "arXiv",             url: "https://arxiv.org",              logo: "https://www.google.com/s2/favicons?sz=64&domain=arxiv.org" },
-  reddit:           { name: "Reddit",            url: "https://reddit.com",             logo: "https://www.google.com/s2/favicons?sz=64&domain=reddit.com" },
-  openmeteo:        { name: "Open-Meteo",        url: "https://open-meteo.com",         logo: "https://www.google.com/s2/favicons?sz=64&domain=open-meteo.com" },
-  youtube:          { name: "YouTube",           url: "https://youtube.com",            logo: "https://www.google.com/s2/favicons?sz=64&domain=youtube.com" },
-  duckduckgo:       { name: "DuckDuckGo",        url: "https://duckduckgo.com",         logo: "https://www.google.com/s2/favicons?sz=64&domain=duckduckgo.com" }
+  wikipedia:        { name: "Wikipédia",         url: "https://fr.wikipedia.org",      logo: "https://www.google.com/s2/favicons?sz=64&domain=wikipedia.org" },
+  wikimediacommons: { name: "Wikimedia Commons", url: "https://commons.wikimedia.org", logo: "https://www.google.com/s2/favicons?sz=64&domain=wikimedia.org" },
+  googlenews:       { name: "Google News",       url: "https://news.google.com",       logo: "https://www.google.com/s2/favicons?sz=64&domain=news.google.com" },
+  thesportsdb:      { name: "TheSportsDB",       url: "https://www.thesportsdb.com",   logo: "https://www.google.com/s2/favicons?sz=64&domain=thesportsdb.com" },
+  arxiv:            { name: "arXiv",             url: "https://arxiv.org",             logo: "https://www.google.com/s2/favicons?sz=64&domain=arxiv.org" },
+  reddit:           { name: "Reddit",            url: "https://reddit.com",            logo: "https://www.google.com/s2/favicons?sz=64&domain=reddit.com" },
+  openmeteo:        { name: "Open-Meteo",        url: "https://open-meteo.com",        logo: "https://www.google.com/s2/favicons?sz=64&domain=open-meteo.com" },
+  youtube:          { name: "YouTube",           url: "https://youtube.com",           logo: "https://www.google.com/s2/favicons?sz=64&domain=youtube.com" },
+  duckduckgo:       { name: "DuckDuckGo",        url: "https://duckduckgo.com",        logo: "https://www.google.com/s2/favicons?sz=64&domain=duckduckgo.com" }
 };
 
 // ================================================================================
-// ==================== CACHE IMAGES (⚠️ PHASE 5 : ne jamais cacher un vide) ====
+// ==================== CACHE IMAGES (v15.1 : jamais de vide) ===================
 // ================================================================================
 
-const imageSearchCache = new LRUCache({
-  max: 500,
-  ttl: CONFIG.IMAGE_CACHE_TTL_MS
-});
+const imageSearchCache = new LRUCache({ max: 500, ttl: CONFIG.IMAGE_CACHE_TTL_MS });
 
 function getCachedImages(key) { return imageSearchCache.get(key) || null; }
 function setCachedImages(key, value) {
-  // ⚠️ On ne met en cache QUE si on a au moins 1 image valide.
   if (!value?.images || value.images.length === 0) return;
   imageSearchCache.set(key, value);
 }
 
 // ================================================================================
-// ==================== FILE MANAGER (BullMQ ou mémoire) ========================
+// ==================== QUEUE MANAGER ===========================================
 // ================================================================================
 
 class QueueManager {
@@ -1813,8 +1561,7 @@ class QueueManager {
 
     if (this.useRedis) {
       this.connection = new IORedis(process.env.REDIS_URL, {
-        maxRetriesPerRequest: null,
-        enableReadyCheck: true,
+        maxRetriesPerRequest: null, enableReadyCheck: true,
         retryStrategy: (times) => Math.min(times * 200, 5000)
       });
       logger.info("✅ Redis initialisé");
@@ -1849,9 +1596,7 @@ class QueueManager {
         }
         processing = false;
       };
-      this.inMemoryQueues.set(name, {
-        add: async (data) => { inMemory.push(data); processNext(); }
-      });
+      this.inMemoryQueues.set(name, { add: async (data) => { inMemory.push(data); processNext(); } });
     }
   }
 
@@ -1883,17 +1628,15 @@ class QueueManager {
 
 const queueManager = new QueueManager();
 
-// File bornée pour la mémoire long terme (⚠️ PHASE 1 : jamais en concurrence avec le chat)
+let runMemorySummary = async () => {};
+
 queueManager.createQueue("memory-summary", async (job) => {
   const data = job?.data ?? job;
   await runMemorySummary(data);
 }, { concurrency: 1, limiter: { max: 1, duration: 2000 } });
 
-// ⚠️ Signature remplie en Partie 3 (mémoire long terme) — stub ici pour éviter les crashes.
-let runMemorySummary = async () => {};
-
 // ================================================================================
-// ==================== ARRÊT PROPRE (⚠️ PHASE 2 : exit(1) sur uncaught) =======
+// ==================== ARRÊT PROPRE ============================================
 // ================================================================================
 
 let isShuttingDown = false;
@@ -1913,104 +1656,74 @@ async function shutdown(signal, exitCode = 0) {
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-
 process.on("uncaughtException", (error) => {
-  logger.fatal({ err: error.message, stack: error.stack }, "uncaughtException — arrêt du process");
-  // ⚠️ PHASE 2 : ne JAMAIS continuer dans un état indéfini.
+  logger.fatal({ err: error.message, stack: error.stack }, "uncaughtException");
   shutdown("uncaughtException", 1);
 });
-
 process.on("unhandledRejection", (reason) => {
   logger.error({ reason: String(reason) }, "unhandledRejection");
-  // Pas d'exit : rejet non critique, on logue et on continue.
 });
 
 // ================================================================================
-// ==================== EXPORTS (pour tests + Partie 2 à 4) ====================
+// ==================== EXPORTS PARTIE 1 ========================================
 // ================================================================================
 
 module.exports = {
-  // Config
   CONFIG, FIREBASE_CONFIG, HOSTING_CONFIG, USER_QUOTAS, OPEN_SOURCES, MODEL_TIERS,
-
-  // Infra
   logger, db, dbGet, dbAll, dbRun, dbExec, dbTransaction,
   queueManager, supabase,
-
-  // Sécurité
   sanitizeForLLM, sanitizeStrict, escapeHtml, normalizeMath, stripThinkTags,
   isValidImageSignature, computeDeviceFingerprint, hashSessionToken, sha256,
   EMAIL_REGEX, PHONE_REGEX,
-
-  // Sessions & quotas
   createActiveSession, validateActiveSession, revokeSession, revokeAllSessions,
   checkLoginAttempts, recordLoginAttempt, isIPBlocked,
   checkUserQuota, incrementUserQuota,
   acquireConversationLock, releaseConversationLock,
-
-  // Auth
   verifyFirebaseToken, cacheGetToken, cacheSetToken, tokenCache,
-
-  // IA
   LLM_PROVIDERS, MODEL_TIERS, CircuitBreaker, getCircuit, LLMErrorInterceptor,
   userFacingErrorMessage, validateAndSanitizeOpenRouterModel,
   evaluateMathSafe, detectMathExpressions,
-
-  // Intentions & entités
   preRouteIntent, extractEntity, normalizeForMatch, containsWholeWords,
-
-  // Supabase / outbox
   supabaseWriteSafe, enqueueOutbox, processOutbox,
-
-  // Utils
   generateRequestId, generateConversationId, generateSessionToken, generateUUID, generateTaskId,
-  nowMs, todayKeyMs, withDeadline, allSettledWithDeadline, sleep, backoffDelay,
-
-  // Model availability
+  nowMs, todayKeyMs, withDeadline, allSettledWithDeadline, sleep, backoffDelay, safeChunkText,
   modelAvailabilityReport, checkModelAvailability,
-
-  // Mémoire long terme (rempli en Partie 3)
   setRunMemorySummary: (fn) => { runMemorySummary = fn; }
 };
+
+// ==================== FIN PARTIE 1 ============================================
 // ================================================================================
-// ==================== PARTIE 2 : AUTH DURCI · TOOL CALLING · SANDBOX ==========
+// ==================== PARTIE 2 : AUTH · TOOL CALLING · SANDBOX · WHATSAPP =====
 // ================================================================================
 // Sommaire :
-//   §2.1  Limites de corps (JSON 1 Mo par défaut, 20 Mo sur uploads seulement)
-//   §2.2  Rate limiters (memory + Redis opt-in) + strictLimiter
-//   §2.3  authenticateUser durci (cache 5 min, fire-and-forget, path critique court)
-//   §2.4  requireRole + vérifications admin
-//   §2.5  Schémas JSON des OUTILS (native tool calling)
-//   §2.6  Exécuteur d'outils (dispatch, whitelist, paramètres validés)
-//   §2.7  Outils à effet de bord + confirmation
-//   §2.8  run_code SANDBOX (Piston / Judge0 / E2B) — jamais d'eval local
-//   §2.9  Boucle agent bornée (write → run → read error → fix)
-//   §2.10 Appels LLM natifs (tools + tool_calls)
+//   §2.1  Body parsers (1 Mo défaut, 20 Mo opt-in)
+//   §2.2  Rate limiters
+//   §2.3  authenticateUser durci (cache 5 min, fire-and-forget)
+//   §2.4  requireRole
+//   §2.5  TOOL_SCHEMAS — Tool calling natif
+//   §2.6  executeToolNative — dispatch + validation
+//   §2.7  Confirmations pour outils à effet de bord
+//   §2.8  runCodeSandbox — Piston/Judge0
+//   §2.9  runToolLoop — boucle agent bornée avec reasoning SSE
+//   §2.10 callProviderWithTools + callProviderRawWithTools
 //   §2.11 Scheduler de rappels (due_at)
-//   §2.12 WhatsApp durci (creds complets, déconnexion, whitelist, quota)
-//   §2.13 Enregistrement des tâches de fond (queues)
+//   §2.12 WhatsApp Baileys durci
 // ================================================================================
 
 const util = require("util");
 
 // ================================================================================
-// §2.1 — LIMITES DE CORPS (⚠️ PHASE 2 : 20 Mo avant auth = DoS)
+// §2.1 — BODY PARSERS
 // ================================================================================
 
-/** Body JSON générique : 1 Mo (le vrai contenu passe par multipart pour les images). */
 const jsonBodySmall = express.json({ limit: "1mb" });
-/** Body JSON large : réservé aux routes qui en ont besoin (upload base64 non utilisé ici). */
 const jsonBodyLarge = express.json({ limit: "20mb" });
 const urlEncoded = express.urlencoded({ extended: true, limit: "1mb" });
 
 function mountBodyParsers(app) {
-  // ⚠️ RÈGLE : par défaut, TOUTES les routes reçoivent le body "small".
-  // Les routes multipart (multer) gèrent leur propre limite fichier.
   app.use((req, res, next) => {
-    // Ne parse PAS les multipart ici : multer s'en occupe.
     const ct = req.headers["content-type"] || "";
     if (ct.startsWith("multipart/form-data")) return next();
-    // Routes qui ont explicitement besoin du gros body (déclarer en amont si besoin) :
     if (req.path === "/api/import/conversations") return jsonBodyLarge(req, res, next);
     return jsonBodySmall(req, res, next);
   });
@@ -2020,9 +1733,6 @@ function mountBodyParsers(app) {
 // ================================================================================
 // §2.2 — RATE LIMITERS
 // ================================================================================
-// ⚠️ En multi-instance, il FAUT un store partagé (Redis). Sinon la limite réelle
-//    est multipliée par le nombre d'instances. Le store Redis est branché si
-//    REDIS_URL est présent (optionnel, silencieux sinon).
 
 let redisRateLimitStore = null;
 try {
@@ -2060,8 +1770,6 @@ const toolLimiter   = makeLimiter({ windowMs: 60 * 1000,       max:  40, code: "
 // ================================================================================
 // §2.3 — authenticateUser DURCI
 // ================================================================================
-// ⚠️ PHASE 1 : on sort du chemin critique les écritures (log success, device, sync Supabase).
-// Le cache LRU évite verifyIdToken à chaque requête.
 
 const AUTH_ERROR_MESSAGES = {
   MISSING_TOKEN:  "Authentification requise.",
@@ -2072,8 +1780,6 @@ const AUTH_ERROR_MESSAGES = {
 };
 
 async function fastUpsertUser(uid, user, userRole) {
-  // ⚠️ FIX v14 : ne JAMAIS écraser le rôle avec FREE en mode REST.
-  // En Admin SDK, le rôle vient des custom claims (source de vérité) → on peut l'écrire.
   const hasAdmin = Boolean(firebaseApp && firebaseAdmin);
   try {
     const existing = await dbGet("SELECT id, role FROM users WHERE id = ?", [uid]);
@@ -2085,7 +1791,6 @@ async function fastUpsertUser(uid, user, userRole) {
       );
       logger.info({ userId: uid }, "✅ Nouvel utilisateur créé");
     } else {
-      // ⚠️ FIX : en REST, on n'écrase PAS le rôle existant (il était remis à FREE à chaque req).
       const newRole = hasAdmin ? userRole : (existing.role || "FREE");
       await dbRun(
         `UPDATE users SET last_seen_at = ?, email = COALESCE(?, email),
@@ -2098,26 +1803,20 @@ async function fastUpsertUser(uid, user, userRole) {
 }
 
 function authenticateUser(req, res, next) {
-  // Wrapper async, sans try/catch externe lourd.
   (async () => {
     const ip = req.ip;
     const ua = req.headers["user-agent"];
 
-    // 1) Blocage IP (index)
     if (await isIPBlocked(ip)) {
-      await recordLoginAttempt(ip, null, false, "IP bloquée", { countFailure: false });
       return res.status(403).json({ success: false, error: true, reply: AUTH_ERROR_MESSAGES.IP_BLOCKED, code: "IP_BLOCKED" });
     }
 
-    // 2) Extraction token
     const authHeader = req.headers.authorization || req.headers.Authorization || "";
     const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
     if (!bearerToken) {
-      // ⚠️ "Token manquant" N'EST PAS un échec de login (IP partagées mobiles).
       return res.status(401).json({ success: false, error: true, reply: AUTH_ERROR_MESSAGES.MISSING_TOKEN, code: "MISSING_TOKEN" });
     }
 
-    // 3) Vérification (avec cache)
     let user;
     try {
       user = await verifyFirebaseToken(bearerToken);
@@ -2126,7 +1825,6 @@ function authenticateUser(req, res, next) {
       const isRevoked = error?.code === "auth/id-token-revoked";
       const isMalformed = error?.code === "auth/argument-error" || /malformed/i.test(error?.message || "");
 
-      // ⚠️ Uniquement les erreurs "dures" comptent pour le blocage IP.
       const countAsFailure = !isExpired && !isRevoked;
       await recordLoginAttempt(ip, null, false, error.message, { countFailure: countAsFailure });
 
@@ -2136,7 +1834,7 @@ function authenticateUser(req, res, next) {
       }
       return res.status(401).json({
         success: false, error: true,
-        reply: isExpired ? AUTH_ERROR_MESSAGES.TOKEN_EXPIRED : (isMalformed ? AUTH_ERROR_MESSAGES.INVALID_TOKEN : AUTH_ERROR_MESSAGES.INVALID_TOKEN),
+        reply: isExpired ? AUTH_ERROR_MESSAGES.TOKEN_EXPIRED : AUTH_ERROR_MESSAGES.INVALID_TOKEN,
         code: isExpired ? "TOKEN_EXPIRED" : "INVALID_TOKEN"
       });
     }
@@ -2146,7 +1844,6 @@ function authenticateUser(req, res, next) {
       return res.status(401).json({ success: false, error: true, reply: AUTH_ERROR_MESSAGES.INVALID_TOKEN, code: "INVALID_TOKEN" });
     }
 
-    // 4) Contexte requête
     req.uid = user.uid;
     req.userId = user.uid;
     req.firebaseUid = user.uid;
@@ -2154,7 +1851,6 @@ function authenticateUser(req, res, next) {
     req.userRole = user.role || "FREE";
     req.emailVerified = user.emailVerified;
 
-    // 5) ⚠️ Fire-and-forget : ne bloque PAS la requête
     setImmediate(() => {
       Promise.allSettled([
         recordLoginAttempt(ip, user.uid, true),
@@ -2164,7 +1860,6 @@ function authenticateUser(req, res, next) {
       ]).catch(() => {});
     });
 
-    // 6) Sync Supabase en arrière-plan (si elle échoue, l'outbox prend le relais)
     if (supabase) {
       setImmediate(() => {
         supabaseWriteSafe({
@@ -2211,21 +1906,19 @@ function requireRole(allowedRoles) {
 }
 
 // ================================================================================
-// §2.5 — SCHÉMAS JSON DES OUTILS (native tool calling)
+// §2.5 — TOOL_SCHEMAS (Tool calling natif)
 // ================================================================================
-// ⚠️ PHASE 4 : le modèle choisit l'outil. On ne simule plus toolCalls dans un JSON.
-// Chaque outil a un schéma strict (JSON Schema) → le provider le valide.
 
 const TOOL_SCHEMAS = {
   search_images: {
     type: "function",
     function: {
       name: "search_images",
-      description: "Recherche des images réelles pour une personne, un lieu, un objet ou un concept précis.",
+      description: "Recherche des images réelles (Wikimedia Commons, Wikipédia, DuckDuckGo Images) pour une personne, un lieu, un objet, une équipe ou un concept précis.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Entité précise à illustrer (nom propre, lieu, objet). PAS la phrase entière." }
+          query: { type: "string", description: "Entité précise (nom propre, lieu, équipe). PAS la phrase entière." }
         },
         required: ["query"],
         additionalProperties: false
@@ -2236,7 +1929,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "search_web",
-      description: "Recherche web générale (Wikipedia + actualités + DDG).",
+      description: "Recherche web générale (Wikipédia + actualités Google News + DuckDuckGo).",
       parameters: {
         type: "object",
         properties: { query: { type: "string" } },
@@ -2249,7 +1942,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "search_news",
-      description: "Dernières actualités sur un sujet.",
+      description: "Dernières actualités sur un sujet via Google News.",
       parameters: {
         type: "object",
         properties: { query: { type: "string" } },
@@ -2262,10 +1955,10 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "search_sports_scores",
-      description: "Derniers résultats d'une équipe.",
+      description: "Derniers résultats d'une équipe via Google News (extraction de score).",
       parameters: {
         type: "object",
-        properties: { team: { type: "string", description: "Nom exact de l'équipe (ex. 'PSG', 'Lakers')." } },
+        properties: { team: { type: "string", description: "Nom de l'équipe (ex: 'Léopards RDC', 'PSG')." } },
         required: ["team"],
         additionalProperties: false
       }
@@ -2301,7 +1994,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "get_weather",
-      description: "Météo actuelle pour un lieu.",
+      description: "Météo actuelle pour un lieu (Open-Meteo).",
       parameters: {
         type: "object",
         properties: { location: { type: "string" } },
@@ -2314,7 +2007,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "execute_math",
-      description: "Calcul mathématique exact (arithmétique, algèbre, trigonométrie). Ne PAS l'utiliser pour du texte.",
+      description: "Calcul mathématique exact (arithmétique, algèbre, trigonométrie).",
       parameters: {
         type: "object",
         properties: { expression: { type: "string", description: "Expression mathjs valide, 2000 char max." } },
@@ -2340,13 +2033,13 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "create_task",
-      description: "Crée un rappel / une tâche pour l'utilisateur. Utilise due_at en ISO 8601 si une date est mentionnée.",
+      description: "Crée un rappel / une tâche. due_at en ISO 8601 si une date est mentionnée.",
       parameters: {
         type: "object",
         properties: {
           title: { type: "string", maxLength: 200 },
           notes: { type: "string", maxLength: 2000 },
-          due_at: { type: "string", description: "Date ISO 8601 (ex. '2026-05-01T14:00:00Z'). Omettre si aucune date." }
+          due_at: { type: "string", description: "Date ISO 8601 (ex: '2026-05-01T14:00:00Z'). Omettre si aucune date." }
         },
         required: ["title"],
         additionalProperties: false
@@ -2369,7 +2062,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "complete_task",
-      description: "Marque une tâche comme terminée. Outil à effet de bord — nécessite confirmation.",
+      description: "Marque une tâche comme terminée. Nécessite confirmation.",
       parameters: {
         type: "object",
         properties: { task_id: { type: "string" } },
@@ -2382,7 +2075,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "delete_task",
-      description: "Supprime une tâche. Outil à effet de bord — nécessite confirmation.",
+      description: "Supprime une tâche. Nécessite confirmation.",
       parameters: {
         type: "object",
         properties: { task_id: { type: "string" } },
@@ -2395,7 +2088,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "send_email",
-      description: "Envoie un email. Outil à effet de bord — nécessite confirmation explicite de l'utilisateur.",
+      description: "Envoie un email. Nécessite confirmation explicite.",
       parameters: {
         type: "object",
         properties: {
@@ -2412,11 +2105,11 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "send_whatsapp_message",
-      description: "Envoie un message WhatsApp. Outil à effet de bord — nécessite confirmation.",
+      description: "Envoie un message WhatsApp. Nécessite confirmation.",
       parameters: {
         type: "object",
         properties: {
-          phone_number: { type: "string", description: "Format international sans espaces (ex. +243812345678)." },
+          phone_number: { type: "string", description: "Format international (ex: +243812345678)." },
           message: { type: "string", maxLength: 2000 }
         },
         required: ["phone_number", "message"],
@@ -2428,7 +2121,7 @@ const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "run_code",
-      description: "Exécute un extrait de code dans un SANDBOX EXTERNE isolé (pas de réseau, timeout strict). Utilise-le pour vérifier qu'un code fonctionne ou diagnostiquer une erreur.",
+      description: "Exécute un code dans un SANDBOX EXTERNE (pas de réseau, timeout strict). Utile pour vérifier un code ou diagnostiquer une erreur.",
       parameters: {
         type: "object",
         properties: {
@@ -2443,7 +2136,6 @@ const TOOL_SCHEMAS = {
   }
 };
 
-// Whitelist par contexte (chat vs /api/tools). On expose moins d'outils en direct.
 const TOOLS_BY_CONTEXT = {
   chat: [
     "search_images", "search_web", "search_news", "search_sports_scores",
@@ -2458,7 +2150,6 @@ const TOOLS_BY_CONTEXT = {
   ]
 };
 
-// ⚠️ Outils à effet de bord : confirmation obligatoire avant exécution.
 const SIDE_EFFECT_TOOLS = new Set(["send_email", "send_whatsapp_message", "delete_task", "complete_task"]);
 
 function getToolSchemas(context = "chat") {
@@ -2467,10 +2158,8 @@ function getToolSchemas(context = "chat") {
 }
 
 // ================================================================================
-// §2.6 — EXÉCUTEUR D'OUTILS (dispatch + whitelist + validation params)
+// §2.6 — executeToolNative
 // ================================================================================
-// ⚠️ PHASE 2 : validation stricte des paramètres AVANT tout appel réseau/DB.
-// Toute erreur est retournée en { success:false, error } et journalisée SANS fuite.
 
 function validateToolArgs(name, args) {
   const schema = TOOL_SCHEMAS[name]?.function?.parameters;
@@ -2481,30 +2170,18 @@ function validateToolArgs(name, args) {
       return { ok: false, error: `Paramètre manquant : ${key}` };
     }
   }
-  // Type checks (léger)
   for (const [key, prop] of Object.entries(schema.properties || {})) {
     if (args?.[key] === undefined) continue;
-    if (prop.type === "string" && typeof args[key] !== "string") {
-      return { ok: false, error: `Paramètre ${key} doit être une chaîne` };
-    }
-    if (prop.type === "string" && prop.maxLength && args[key].length > prop.maxLength) {
-      return { ok: false, error: `Paramètre ${key} trop long` };
-    }
-    if (prop.enum && !prop.enum.includes(args[key])) {
-      return { ok: false, error: `Paramètre ${key} doit valoir l'une des valeurs : ${prop.enum.join(", ")}` };
-    }
+    if (prop.type === "string" && typeof args[key] !== "string") return { ok: false, error: `Paramètre ${key} doit être une chaîne` };
+    if (prop.type === "string" && prop.maxLength && args[key].length > prop.maxLength) return { ok: false, error: `Paramètre ${key} trop long` };
+    if (prop.enum && !prop.enum.includes(args[key])) return { ok: false, error: `Paramètre ${key} doit valoir l'une des valeurs : ${prop.enum.join(", ")}` };
   }
   return { ok: true };
 }
 
-/**
- * Exécute un outil par nom.
- * @returns {Promise<{result:any, sourceKeys:string[], toolName:string}>}
- */
 async function executeToolNative(toolName, rawArgs, context = {}) {
   const { userId, googleAccessToken, agentMode = false } = context;
 
-  // ⚠️ Whitelist globale (tous contextes confondus) + contexte
   const allowed = new Set([...TOOLS_BY_CONTEXT.chat, ...TOOLS_BY_CONTEXT.api]);
   if (!allowed.has(toolName)) {
     return { result: { success: false, error: "Outil non autorisé" }, sourceKeys: [], toolName };
@@ -2539,7 +2216,7 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
       }
       case "search_sports_scores": {
         result = await searchSportsScores(args.team);
-        if (result.events?.length) sourceKeys.push("thesportsdb");
+        if (result.events?.length) sourceKeys.push("googlenews");
         break;
       }
       case "search_science": {
@@ -2558,7 +2235,6 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
         break;
       }
       case "execute_math": {
-        // ⚠️ Sandbox Worker (Partie 1)
         result = await evaluateMathSafe(args.expression, 1500);
         break;
       }
@@ -2592,13 +2268,7 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
         if (!agentMode) return { result: { success: false, error: "Confirmation requise", code: "NEEDS_CONFIRMATION" }, sourceKeys: [], toolName };
         const quota = await checkUserQuota(userId, "email");
         if (!quota.allowed) { result = { success: false, error: quota.message }; break; }
-        result = await dispatchSendEmail({
-          googleAccessToken,
-          recipient: args.recipient,
-          subject: args.subject,
-          body: args.body,
-          userId
-        });
+        result = await dispatchSendEmail({ googleAccessToken, recipient: args.recipient, subject: args.subject, body: args.body, userId });
         if (result.success) await incrementUserQuota(userId, "email");
         break;
       }
@@ -2612,6 +2282,12 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
       }
       case "run_code": {
         result = await runCodeSandbox({ language: args.language, code: args.code, stdin: args.stdin });
+        if (!result.success && /non configuré/i.test(result.error || "")) {
+          result = {
+            success: true, stdout: "", stderr: "", exitCode: null, provider: "none",
+            note: "Sandbox non disponible. Le code N'A PAS été exécuté. Rédige ta réponse finale — ne prétends pas avoir exécuté le code."
+          };
+        }
         break;
       }
       default:
@@ -2626,26 +2302,18 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
 }
 
 // ================================================================================
-// §2.7 — CONFIRMATION POUR OUTILS À EFFET DE BORD
+// §2.7 — CONFIRMATIONS (outils à effet de bord)
 // ================================================================================
-// ⚠️ PHASE 2 : injection de prompt via contenu web → le LLM ne doit JAMAIS
-// déclencher send_email / send_whatsapp / delete_task sans validation explicite.
 
-const pendingConfirmations = new Map(); // conversationId → { toolName, args, userId, expiresAt, token }
-
+const pendingConfirmations = new Map();
 const CONFIRMATION_TTL_MS = 2 * 60 * 1000;
 
 function makeConfirmationToken() { return `cfm_${crypto.randomBytes(12).toString("hex")}`; }
 
 function queueConfirmation(conversationId, userId, toolName, args) {
   const token = makeConfirmationToken();
-  pendingConfirmations.set(conversationId, {
-    token, toolName, args, userId, expiresAt: Date.now() + CONFIRMATION_TTL_MS
-  });
-  // Purge légère
-  for (const [k, v] of pendingConfirmations) {
-    if (v.expiresAt < Date.now()) pendingConfirmations.delete(k);
-  }
+  pendingConfirmations.set(conversationId, { token, toolName, args, userId, expiresAt: Date.now() + CONFIRMATION_TTL_MS });
+  for (const [k, v] of pendingConfirmations) if (v.expiresAt < Date.now()) pendingConfirmations.delete(k);
   return token;
 }
 
@@ -2658,39 +2326,30 @@ function consumeConfirmation(conversationId, token) {
   return { ok: true, entry };
 }
 
-/** Message utilisateur proposé pour demander une confirmation claire. */
 function buildConfirmationPrompt(toolName, args) {
   switch (toolName) {
-    case "send_email":
-      return `Je vais envoyer un email à **${args.recipient}** — sujet : « ${args.subject} ». Confirmer ?`;
-    case "send_whatsapp_message":
-      return `Je vais envoyer un message WhatsApp au **${args.phone_number}** : « ${(args.message || "").slice(0, 120)}… ». Confirmer ?`;
-    case "delete_task":
-      return `Je vais supprimer la tâche \`${args.task_id}\`. Confirmer ?`;
-    case "complete_task":
-      return `Je vais marquer la tâche \`${args.task_id}\` comme terminée. Confirmer ?`;
-    default:
-      return `Confirmer l'action « ${toolName} » ?`;
+    case "send_email": return `Je vais envoyer un email à **${args.recipient}** — sujet : « ${args.subject} ». Confirmer ?`;
+    case "send_whatsapp_message": return `Je vais envoyer un message WhatsApp au **${args.phone_number}** : « ${(args.message || "").slice(0, 120)}… ». Confirmer ?`;
+    case "delete_task": return `Je vais supprimer la tâche \`${args.task_id}\`. Confirmer ?`;
+    case "complete_task": return `Je vais marquer la tâche \`${args.task_id}\` comme terminée. Confirmer ?`;
+    default: return `Confirmer l'action « ${toolName} » ?`;
   }
 }
 
 // ================================================================================
-// §2.8 — run_code : SANDBOX EXTERNE
+// §2.8 — runCodeSandbox (Piston / Judge0)
 // ================================================================================
-// ⚠️ PHASE 6 : JAMAIS eval/exec/child_process local sur du code utilisateur.
-// On passe par un service externe : Piston (open source), Judge0, ou E2B.
 
 const SUPPORTED_SANDBOX_LANGS = {
-  python:     { piston: "python",     judge0: 71,  e2b: "python" },
-  javascript: { piston: "javascript", judge0: 63,  e2b: "node" },
-  typescript: { piston: "typescript", judge0: 74,  e2b: "node" },
-  bash:       { piston: "bash",       judge0: 42,  e2b: null }
+  python:     { piston: "python",     judge0: 71 },
+  javascript: { piston: "javascript", judge0: 63 },
+  typescript: { piston: "typescript", judge0: 74 },
+  bash:       { piston: "bash",       judge0: 42 }
 };
 
 async function runCodeSandbox({ language, code, stdin = "" }) {
   const provider = CONFIG.CODE_SANDBOX_PROVIDER;
   if (!provider) return { success: false, error: "Sandbox d'exécution non configuré" };
-
   if (!SUPPORTED_SANDBOX_LANGS[language]) return { success: false, error: "Langage non supporté" };
   if (typeof code !== "string" || code.length === 0) return { success: false, error: "Code vide" };
   if (code.length > 20000) return { success: false, error: "Code trop long (max 20 000 caractères)" };
@@ -2700,17 +2359,9 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
   if (provider === "piston") {
     if (!CONFIG.PISTON_URL) return { success: false, error: "PISTON_URL manquant" };
     try {
-      const langMeta = SUPPORTED_SANDBOX_LANGS[language].piston;
       const response = await axios.post(
         `${CONFIG.PISTON_URL.replace(/\/$/, "")}/api/v2/execute`,
-        {
-          language: langMeta,
-          version: "*",
-          files: [{ content: code }],
-          stdin,
-          run_timeout: timeoutMs,
-          compile_timeout: timeoutMs
-        },
+        { language: SUPPORTED_SANDBOX_LANGS[language].piston, version: "*", files: [{ content: code }], stdin, run_timeout: timeoutMs, compile_timeout: timeoutMs },
         { timeout: timeoutMs + 3000 }
       );
       const run = response.data?.run || {};
@@ -2719,8 +2370,7 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
         stdout: String(run.stdout || "").slice(0, 20000),
         stderr: String(run.stderr || "").slice(0, 20000),
         exitCode: typeof run.code === "number" ? run.code : null,
-        provider: "piston",
-        language
+        provider: "piston", language
       };
     } catch (e) {
       logger.warn({ err: e.message }, "Piston échec");
@@ -2743,8 +2393,7 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
         stdout: String(d.stdout || "").slice(0, 20000),
         stderr: String(d.stderr || d.compile_output || "").slice(0, 20000),
         exitCode: d.status?.id ?? null,
-        provider: "judge0",
-        language
+        provider: "judge0", language
       };
     } catch (e) {
       logger.warn({ err: e.message }, "Judge0 échec");
@@ -2752,51 +2401,38 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
     }
   }
 
-  if (provider === "e2b") {
-    if (!CONFIG.E2B_API_KEY) return { success: false, error: "E2B_API_KEY manquant" };
-    // ⚠️ E2B nécessite le SDK officiel ; on n'ajoute PAS de dépendance obligatoire ici.
-    return { success: false, error: "E2B non intégré dans ce build (utilise Piston ou Judge0)" };
-  }
-
   return { success: false, error: "Provider sandbox inconnu" };
 }
 
 // ================================================================================
-// §2.9 — BOUCLE AGENT BORNÉE (write → run → read error → fix)
+// §2.9 — runToolLoop (boucle agent bornée + reasoning SSE)
 // ================================================================================
-// ⚠️ PHASE 6 : max 3 itérations, chaque itération = un appel LLM avec tools.
 
-const AGENT_MAX_ITERATIONS = 3;
-const AGENT_MAX_TOOL_CALLS_PER_STEP = 5;
+const AGENT_MAX_ITERATIONS = CONFIG.AGENT_MAX_ITERATIONS;
+const AGENT_MAX_TOOL_CALLS_PER_STEP = CONFIG.AGENT_MAX_TOOL_CALLS_PER_STEP;
 
-/**
- * Orchestration : le modèle reçoit les tools, on boucle tant qu'il demande des outils.
- * Bornes strictes pour éviter les boucles infinies.
- */
 async function runToolLoop({
   messages,
   providerConfig,
-  executeFn,          // async ({ toolName, args }) => { result, sourceKeys }
+  executeFn,
   maxIterations = AGENT_MAX_ITERATIONS,
-  images = null
+  images = null,
+  sse = null
 }) {
   let iterations = 0;
   const usedSources = new Set();
   const collectedImages = [];
   const collectedVideos = [];
   const toolCallTrace = [];
-
   let workingMessages = [...messages];
   let finalText = "";
 
   while (iterations < maxIterations) {
     iterations++;
+    if (sse) sse.status("reasoning", { iteration: iterations });
 
     const llmResult = await callProviderWithTools({
-      providerConfig,
-      messages: workingMessages,
-      tools: getToolSchemas("chat"),
-      images
+      providerConfig, messages: workingMessages, tools: getToolSchemas("chat"), images
     });
 
     if (!llmResult.success) {
@@ -2805,78 +2441,82 @@ async function runToolLoop({
 
     const assistantMessage = llmResult.message || {};
     const toolCalls = assistantMessage.tool_calls || [];
+    const rawContent = assistantMessage.content || "";
 
-    // Pas d'appel d'outil → réponse finale
+    // Streamer la réflexion <think>
+    if (sse && rawContent) {
+      const thinkMatches = rawContent.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi);
+      if (thinkMatches) {
+        for (const t of thinkMatches) {
+          const inner = t.replace(/<\/?think(?:ing)?>/gi, "").trim();
+          if (inner) {
+            const chunks = safeChunkText(inner, 32);
+            for (const c of chunks) {
+              if (sse.closed) break;
+              sse.reasoning(c);
+              await sleep(4);
+            }
+            sse.reasoning("\n");
+          }
+        }
+      }
+    }
+
+    // Streamer les blocs de code détectés
+    if (sse && rawContent) {
+      const codeRegex = /```(\w+)?(?::([^\n]+))?\n([\s\S]*?)```/g;
+      let m;
+      while ((m = codeRegex.exec(rawContent)) !== null) {
+        sse.codeBlock({ language: m[1] || "text", filename: m[2] || null, code: m[3], done: true });
+      }
+    }
+
     if (toolCalls.length === 0) {
-      finalText = normalizeMath(stripThinkTags(assistantMessage.content || "").text);
+      finalText = normalizeMath(stripThinkTags(rawContent).text);
       break;
     }
 
-    // Ajoute le message assistant AVEC tool_calls (obligatoire pour cohérence)
-    workingMessages.push({
-      role: "assistant",
-      content: assistantMessage.content || "",
-      tool_calls: toolCalls
-    });
+    workingMessages.push({ role: "assistant", content: rawContent, tool_calls: toolCalls });
 
-    // Exécute les outils (borné)
     const bounded = toolCalls.slice(0, AGENT_MAX_TOOL_CALLS_PER_STEP);
     for (const call of bounded) {
       const toolName = call.function?.name;
       let args = {};
       try { args = JSON.parse(call.function?.arguments || "{}"); } catch { args = {}; }
-
       toolCallTrace.push({ name: toolName, args });
+      if (sse) sse.status("tool", { name: toolName });
 
       const { result, sourceKeys } = await executeFn({ toolName, args });
       sourceKeys.forEach((k) => usedSources.add(k));
 
       if (toolName === "search_images" && result?.images) {
         collectedImages.push(...result.images.map((i) => i.url).filter(Boolean));
+        if (sse) sse.images(result.images);
       }
       if (toolName === "search_youtube" && result?.videos) {
         collectedVideos.push(...result.videos);
+        if (sse) sse.videos(result.videos);
+      }
+      if (sse && toolName === "run_code" && (result?.stdout || result?.stderr)) {
+        sse.send("code", { language: args.language, stdout: result.stdout || "", stderr: result.stderr || "", done: true, execution: true });
       }
 
-      // ⚠️ Message "tool" AVEC tool_call_id (sinon HTTP 400 côté providers)
-      workingMessages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        name: toolName,
-        content: JSON.stringify(result).slice(0, 8000) // borne la taille du retour
-      });
+      workingMessages.push({ role: "tool", tool_call_id: call.id, name: toolName, content: JSON.stringify(result).slice(0, 8000) });
     }
 
-    // Sécurité : si trop de tool calls demandés, on continue mais on prévient
     if (toolCalls.length > AGENT_MAX_TOOL_CALLS_PER_STEP) {
-      workingMessages.push({
-        role: "system",
-        content: `Limite de ${AGENT_MAX_TOOL_CALLS_PER_STEP} appels d'outils par étape atteinte. Formule maintenant ta réponse finale.`
-      });
+      workingMessages.push({ role: "system", content: `Limite de ${AGENT_MAX_TOOL_CALLS_PER_STEP} appels atteinte. Formule ta réponse finale.` });
     }
   }
 
-  // Si on a atteint la borne sans réponse finale, on force une dernière synthèse
   if (!finalText) {
-    workingMessages.push({
-      role: "system",
-      content: "Synthétise ta réponse finale à partir des résultats déjà obtenus. Pas de nouvel appel d'outil."
-    });
-    const finalCall = await callProviderWithTools({
-      providerConfig,
-      messages: workingMessages,
-      tools: [], // pas de tools → contrainte de réponse texte
-      images
-    });
-    finalText = finalCall.success
-      ? normalizeMath(stripThinkTags(finalCall.message?.content || "").text)
-      : "Je n'ai pas pu terminer la réponse.";
+    workingMessages.push({ role: "system", content: "Synthétise ta réponse finale. Pas de nouvel appel d'outil." });
+    const finalCall = await callProviderWithTools({ providerConfig, messages: workingMessages, tools: [], images });
+    finalText = finalCall.success ? normalizeMath(stripThinkTags(finalCall.message?.content || "").text) : "Je n'ai pas pu terminer la réponse.";
   }
 
   return {
-    success: true,
-    text: finalText,
-    iterations,
+    success: true, text: finalText, iterations,
     usedSources: [...usedSources],
     images: [...new Set(collectedImages)],
     videos: dedupeVideos(collectedVideos),
@@ -2894,10 +2534,9 @@ function dedupeVideos(list) {
 }
 
 // ================================================================================
-// §2.10 — APPELS LLM NATIFS (tools + tool_calls)
+// §2.10 — callProviderWithTools + callProviderRawWithTools
 // ================================================================================
 
-/** Enveloppe de retry/rotation immédiate par provider (respecte Partie 1). */
 async function callProviderWithTools({ providerConfig, messages, tools = null, images = null, jsonMode = false }) {
   const providerName = providerConfig.provider;
   const providerInfo = LLM_PROVIDERS[providerName.toUpperCase()];
@@ -2923,16 +2562,11 @@ async function callProviderWithTools({ providerConfig, messages, tools = null, i
     try {
       const result = await cb.execute(() => {
         return callProviderRawWithTools({
-          provider: providerName,
-          model,
-          messages,
-          tools,
-          jsonMode,
+          provider: providerName, model, messages, tools, jsonMode,
           timeout: providerConfig.timeout || providerInfo.defaultTimeout,
           maxTokens: providerConfig.maxTokens || providerInfo.maxTokens,
           temperature: providerConfig.temperature ?? providerInfo.temperature,
-          images,
-          apiKey: keyEntry.apiKey,
+          images, apiKey: keyEntry.apiKey,
           reasoningEffort: providerConfig.reasoningEffort || null
         });
       });
@@ -2940,13 +2574,10 @@ async function callProviderWithTools({ providerConfig, messages, tools = null, i
     } catch (error) {
       lastError = error;
       const code = LLMErrorInterceptor.getErrorCode(error);
-
-      // ⚠️ Rotation immédiate : pas de retry sur la même clé si 429/5xx/timeout/circuit.
       if (LLMErrorInterceptor.shouldRotateImmediately(error)) {
         logger.warn({ provider: providerName, model, keyLabel: keyEntry.label, code }, "Rotation immédiate");
         continue;
       }
-      // Erreur non récupérable → on abandonne ce provider, on passe au suivant.
       break;
     }
   }
@@ -2954,11 +2585,6 @@ async function callProviderWithTools({ providerConfig, messages, tools = null, i
   return { success: false, error: lastError };
 }
 
-/**
- * Appel bas niveau.
- * - OpenAI-compatible (groq, cerebras, openrouter) : tools= paramètre, tool_calls dans réponse.
- * - Gemini : functionDeclarations + functionCall.
- */
 async function callProviderRawWithTools({
   provider, model, messages, tools, jsonMode = false,
   timeout, maxTokens, temperature, images, apiKey, reasoningEffort
@@ -2980,7 +2606,6 @@ async function callProviderRawWithTools({
   }
 }
 
-/** Format OpenAI-compatible (Groq, Cerebras, OpenRouter). */
 async function callOpenAICompatibleRaw({
   provider, model, messages, tools, jsonMode, timeout, maxTokens, temperature, images, apiKey, reasoningEffort, signal
 }) {
@@ -2990,7 +2615,6 @@ async function callOpenAICompatibleRaw({
 
   if (!apiKey) { const e = new Error("Clé API manquante pour " + provider); e.code = "MISSING_API_KEY"; throw e; }
 
-  // Conversion des images (dernier message user uniquement)
   let formattedMessages = messages;
   if (images && images.length > 0) {
     const idx = messages.length - 1;
@@ -3005,11 +2629,7 @@ async function callOpenAICompatibleRaw({
   const payload = { model, messages: formattedMessages, temperature, max_tokens: maxTokens };
   if (jsonMode) payload.response_format = { type: "json_object" };
   if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
-  // ⚠️ Tool calling natif
-  if (tools && tools.length > 0) {
-    payload.tools = tools;
-    payload.tool_choice = "auto";
-  }
+  if (tools && tools.length > 0) { payload.tools = tools; payload.tool_choice = "auto"; }
 
   const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
   if (provider === "openrouter") {
@@ -3017,23 +2637,18 @@ async function callOpenAICompatibleRaw({
     headers["X-Title"] = "Luba.ia Assistant";
   }
 
-  const response = await axios.post(cfg.baseURL + "/chat/completions", payload, {
-    headers, timeout, signal
-  });
+  const response = await axios.post(cfg.baseURL + "/chat/completions", payload, { headers, timeout, signal });
 
   const choice = response?.data?.choices?.[0];
   const message = choice?.message;
   if (!message) throw new Error(`Réponse ${provider} vide`);
 
-  // ⚠️ On retourne TOUJOURS le message complet (content + tool_calls)
   return { message, raw: response.data };
 }
 
-/** Format Gemini natif (contents/parts, functionDeclarations). */
 async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeout, maxTokens, temperature, images, signal }) {
   if (!geminiClient) throw new Error("Client Gemini non initialisé");
 
-  // ----- Conversion OpenAI → Gemini -----
   let systemInstruction = null;
   const contents = [];
 
@@ -3043,17 +2658,11 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
       continue;
     }
     if (msg.role === "tool") {
-      // ⚠️ Gemini utilise functionResponse dans un message "user"
       let parsed;
       try { parsed = JSON.parse(msg.content || "{}"); } catch { parsed = { raw: msg.content }; }
       contents.push({
         role: "user",
-        parts: [{
-          functionResponse: {
-            name: msg.name || "tool",
-            response: typeof parsed === "object" ? parsed : { value: parsed }
-          }
-        }]
+        parts: [{ functionResponse: { name: msg.name || "tool", response: typeof parsed === "object" ? parsed : { value: parsed } } }]
       });
       continue;
     }
@@ -3088,9 +2697,7 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
   if (images && images.length > 0) {
     const last = contents[contents.length - 1];
     if (last?.role === "user") {
-      for (const img of images) {
-        last.parts.push({ inlineData: { mimeType: img.mimetype || "image/jpeg", data: img.base64 } });
-      }
+      for (const img of images) last.parts.push({ inlineData: { mimeType: img.mimetype || "image/jpeg", data: img.base64 } });
     }
   }
 
@@ -3100,26 +2707,20 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
     responseMimeType: jsonMode ? "application/json" : "text/plain"
   };
   if (systemInstruction) config.systemInstruction = { parts: [{ text: systemInstruction }] };
-  // ⚠️ Tool calling Gemini
   if (tools && tools.length > 0) {
     config.tools = [{
       functionDeclarations: tools.map((t) => ({
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters
+        name: t.function.name, description: t.function.description, parameters: t.function.parameters
       }))
     }];
   }
 
-  // ⚠️ AbortController réel côté Gemini via Promise.race (SDK n'accepte pas signal partout)
   const geminiPromise = geminiClient.models.generateContent({ model, contents, config });
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(Object.assign(new Error("Timeout Gemini"), { code: "ECONNABORTED" })), timeout).unref?.()
   );
-
   const response = await Promise.race([geminiPromise, timeoutPromise]);
 
-  // Reconstitution d'un message compatible OpenAI
   const candidate = response?.candidates?.[0];
   const parts = candidate?.content?.parts || [];
   let text = "";
@@ -3128,12 +2729,8 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
     if (part.text) text += part.text;
     if (part.functionCall) {
       toolCalls.push({
-        id: `call_${crypto.randomUUID()}`,
-        type: "function",
-        function: {
-          name: part.functionCall.name,
-          arguments: JSON.stringify(part.functionCall.args || {})
-        }
+        id: `call_${crypto.randomUUID()}`, type: "function",
+        function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args || {}) }
       });
     }
   }
@@ -3145,7 +2742,7 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
 }
 
 // ================================================================================
-// §2.11 — SCHEDULER DE RAPPELS (⚠️ PHASE 4 : due_at n'était jamais déclenché)
+// §2.11 — SCHEDULER DE RAPPELS
 // ================================================================================
 
 const REMINDER_TICK_MS = parseInt(process.env.REMINDER_TICK_MS || "60000", 10);
@@ -3163,53 +2760,35 @@ async function reminderTick() {
 
     for (const task of due) {
       try {
-        // Marque AVANT émission (idempotent en cas de course multi-instance)
         const result = await dbRun(
           `UPDATE user_tasks SET notified_at = ? WHERE id = ? AND (notified_at IS NULL OR notified_at < due_at)`,
           [Date.now(), task.id]
         );
-        if (result.changes === 0) continue; // déjà notifié
+        if (result.changes === 0) continue;
+        logger.info({ taskId: task.id, userId: task.user_id, title: task.title }, "🔔 Rappel échu");
 
-        // Enqueue la notification (WhatsApp ou event à brancher par le front)
-        if (task.user_id) {
-          // Fallback : on émet un event interne — le front peut aussi poller /api/tasks
-          logger.info({ taskId: task.id, userId: task.user_id, title: task.title }, "🔔 Rappel échu");
-
-          // Si un numéro WhatsApp est lié au compte, on peut envoyer :
-          // (désactivé par défaut pour éviter spam ; active via REMINDER_WHATSAPP_ENABLED=true)
-          if (process.env.REMINDER_WHATSAPP_ENABLED === "true") {
-            const user = await dbGet("SELECT whatsapp_session_id FROM users WHERE id = ?", [task.user_id]);
-            if (user?.whatsapp_session_id) {
-              await queueManager.add("whatsapp-outbound", {
-                userId: task.user_id,
-                phoneNumber: user.whatsapp_session_id,
-                message: `🔔 Rappel : ${task.title}${task.notes ? "\n" + task.notes : ""}`
-              }, { attempts: 3 }).catch(() => {});
-            }
+        if (process.env.REMINDER_WHATSAPP_ENABLED === "true") {
+          const user = await dbGet("SELECT whatsapp_session_id FROM users WHERE id = ?", [task.user_id]);
+          if (user?.whatsapp_session_id) {
+            await queueManager.add("whatsapp-outbound", {
+              userId: task.user_id, phoneNumber: user.whatsapp_session_id,
+              message: `🔔 Rappel : ${task.title}${task.notes ? "\n" + task.notes : ""}`
+            }, { attempts: 3 }).catch(() => {});
           }
         }
       } catch (e) { logger.error({ err: e.message, taskId: task.id }, "Erreur rappel"); }
     }
-  } catch (e) {
-    logger.error({ err: e.message }, "reminderTick — erreur globale");
-  }
+  } catch (e) { logger.error({ err: e.message }, "reminderTick — erreur globale"); }
 }
 
 setInterval(reminderTick, REMINDER_TICK_MS).unref?.();
 
 // ================================================================================
-// §2.12 — WHATSAPP DURCI
+// §2.12 — WHATSAPP Baileys durci
 // ================================================================================
-// ⚠️ PHASE 7 :
-//   - creds.update sauvegarde `state.creds` COMPLET (pas le delta)
-//   - Clés Signal persistées via saveCreds()
-//   - loggedOut → suppression credentials locaux + Supabase + pas de boucle
-//   - Liste blanche d'expéditeurs + quota
-//   - Le userId WhatsApp est lié à un VRAI compte (sinon FK ON fait échouer l'INSERT)
 
 const WHATSAPP_WHITELIST = new Set(
-  (process.env.WHATSAPP_WHITELIST || "")
-    .split(",").map((s) => s.trim().replace(/[^\d]/g, "")).filter(Boolean)
+  (process.env.WHATSAPP_WHITELIST || "").split(",").map((s) => s.trim().replace(/[^\d]/g, "")).filter(Boolean)
 );
 
 function isWhatsAppAllowed(phoneNumber) {
@@ -3220,11 +2799,8 @@ function isWhatsAppAllowed(phoneNumber) {
 function getWhatsAppCryptoKey() {
   const key = process.env.WHATSAPP_ENCRYPTION_KEY;
   const iv = process.env.WHATSAPP_ENCRYPTION_IV;
-
   if (!key || key.length < 32 || !iv || iv.length < 16) {
-    if (CONFIG.ENV === "production") {
-      throw new Error("WHATSAPP_ENCRYPTION_KEY (32+) et WHATSAPP_ENCRYPTION_IV (16+) requis en production");
-    }
+    if (CONFIG.ENV === "production") throw new Error("WHATSAPP_ENCRYPTION_KEY (32+) et WHATSAPP_ENCRYPTION_IV (16+) requis en production");
     logger.warn("⚠️ Clé WhatsApp par défaut — JAMAIS en prod");
   }
   return {
@@ -3239,23 +2815,17 @@ async function saveWhatsAppCredentials(userId, credentialsData) {
     const { key } = getWhatsAppCryptoKey();
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-
     let encrypted = cipher.update(JSON.stringify(credentialsData), "utf8", "hex");
     encrypted += cipher.final("hex");
     const authTag = cipher.getAuthTag().toString("hex");
 
     return await supabaseWriteSafe({
-      table: "whatsapp_credentials",
-      op: "upsert",
+      table: "whatsapp_credentials", op: "upsert",
       payload: {
-        user_id: userId,
-        encrypted_data: encrypted,
-        auth_tag: authTag,
-        iv: iv.toString("hex"),
-        updated_at: new Date().toISOString()
+        user_id: userId, encrypted_data: encrypted, auth_tag: authTag,
+        iv: iv.toString("hex"), updated_at: new Date().toISOString()
       },
-      matchColumn: "user_id",
-      idempotencyKey: `whatsapp_creds:${userId}`
+      matchColumn: "user_id", idempotencyKey: `whatsapp_creds:${userId}`
     }).then((r) => r.success);
   } catch (e) {
     logger.error({ err: e.message }, "Erreur save WhatsApp creds");
@@ -3266,11 +2836,8 @@ async function saveWhatsAppCredentials(userId, credentialsData) {
 async function loadWhatsAppCredentials(userId) {
   if (!supabase) return null;
   try {
-    const { data, error } = await supabase
-      .from("whatsapp_credentials")
-      .select("encrypted_data, auth_tag, iv")
-      .eq("user_id", userId)
-      .maybeSingle();
+    const { data, error } = await supabase.from("whatsapp_credentials")
+      .select("encrypted_data, auth_tag, iv").eq("user_id", userId).maybeSingle();
     if (error || !data) return null;
 
     const { key } = getWhatsAppCryptoKey();
@@ -3288,11 +2855,8 @@ async function loadWhatsAppCredentials(userId) {
 async function deleteWhatsAppCredentials(userId) {
   if (!supabase) return;
   await supabaseWriteSafe({
-    table: "whatsapp_credentials",
-    op: "delete",
-    payload: {},
-    matchColumn: "user_id",
-    matchValue: userId,
+    table: "whatsapp_credentials", op: "delete", payload: {},
+    matchColumn: "user_id", matchValue: userId,
     idempotencyKey: `whatsapp_creds_delete:${userId}`
   }).catch(() => {});
 }
@@ -3302,11 +2866,9 @@ function toPlainWhatsAppText(markdown) {
     .replace(/!\[.*?\]\(.*?\)/g, "")
     .replace(/\[!\[.*?\]\(.*?\)\]\(.*?\)/g, "")
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .replace(/\n{3,}/g, "\n\n").trim();
 }
 
-/** Résolution : WhatsApp phone → vrai userId LUBA (crée un "shadow user" si autorisé). */
 async function resolveWhatsAppUser(phoneNumber) {
   const placeholderUid = `wa_${phoneNumber}`;
   const existing = await dbGet("SELECT id FROM users WHERE firebase_uid = ? OR id = ?", [placeholderUid, placeholderUid]);
@@ -3349,21 +2911,18 @@ class BaileysManager {
     try { version = (await fetchLatestBaileysVersion()).version; } catch { version = undefined; }
 
     const sock = makeWASocket({
-      version,
-      auth: state,
+      version, auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Luba.ia", "Chrome", "15.0.0"]
+      browser: ["Luba.ia", "Chrome", "15.1.0"]
     });
 
     const sessionData = { sock, qrCode: null, ready: false };
     this.sessions.set(userId, sessionData);
 
-    // ⚠️ FIX v15 : sauvegarde l'état COMPLET des creds, pas le delta
     sock.ev.on("creds.update", async () => {
       try {
         await saveCreds();
-        // ⚠️ On lit l'état complet depuis le fichier (contient creds + clés Signal)
         const completeCredsPath = path.join(authDir, "creds.json");
         if (fs.existsSync(completeCredsPath)) {
           const completeCreds = JSON.parse(fs.readFileSync(completeCredsPath, "utf8"));
@@ -3392,14 +2951,11 @@ class BaileysManager {
       if (connection === "close") {
         sessionData.ready = false;
         await dbRun("UPDATE users SET whatsapp_connected = 0 WHERE id = ?", [userId]).catch(() => {});
-
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-
         this.sessions.delete(userId);
 
         if (isLoggedOut) {
-          // ⚠️ PHASE 7 : suppression des credentials locaux + Supabase, pas de reconnexion
           try {
             const authDir2 = path.join(CONFIG.SESSIONS_PATH, userId);
             if (fs.existsSync(authDir2)) fs.rmSync(authDir2, { recursive: true, force: true });
@@ -3407,7 +2963,6 @@ class BaileysManager {
           } catch (e) { logger.warn({ err: e.message }, "Nettoyage post-logout"); }
           logger.info({ userId }, "WhatsApp déconnecté (loggedOut) — pas de reconnexion");
         } else {
-          // Reconnexion avec backoff
           setTimeout(() => {
             this.initClient(userId).catch((e) => logger.error({ err: e.message }, "Erreur reconnexion WhatsApp"));
           }, CONFIG.WHATSAPP_RETRY_DELAY);
@@ -3423,43 +2978,30 @@ class BaileysManager {
           const remoteJid = msg.key.remoteJid;
           if (!remoteJid || remoteJid.endsWith("@g.us")) continue;
 
-          const text = msg.message.conversation
-            || msg.message.extendedTextMessage?.text
-            || msg.message.imageMessage?.caption
-            || null;
+          const text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || null;
           if (!text) continue;
 
           const phoneNumber = remoteJid.replace(/@.*$/, "");
-
-          // ⚠️ PHASE 7 : liste blanche + quota
           if (!isWhatsAppAllowed(phoneNumber)) {
             logger.info({ phoneNumber }, "WhatsApp : expéditeur hors liste blanche");
             continue;
           }
 
-          // ⚠️ PHASE 7 : userId WhatsApp lié à un vrai compte (shadow user OK)
           const waUserId = await resolveWhatsAppUser(phoneNumber);
-          if (!waUserId) {
-            logger.warn({ phoneNumber }, "WhatsApp : impossible de résoudre/créer l'utilisateur");
-            continue;
-          }
+          if (!waUserId) continue;
 
-          // ⚠️ Quota WhatsApp (messages entrants comptent aussi)
           const quota = await checkUserQuota(waUserId, "whatsapp");
           if (!quota.allowed) {
-            await sock.sendMessage(remoteJid, { text: "Limite de messages atteinte pour aujourd'hui. Réessayez demain." });
+            await sock.sendMessage(remoteJid, { text: "Limite de messages atteinte pour aujourd'hui." });
             continue;
           }
           await incrementUserQuota(waUserId, "whatsapp");
 
           const conversationId = `whatsapp_${phoneNumber}`;
           const result = await handleChat({
-            conversationId,
-            userId: waUserId,
-            firebaseUid: null,
+            conversationId, userId: waUserId, firebaseUid: null,
             message: String(text).slice(0, CONFIG.MAX_MESSAGE_LENGTH),
-            channel: "whatsapp",
-            modelTier: "v100"
+            channel: "whatsapp", modelTier: "v100"
           });
 
           if (result?.reply) {
@@ -3485,8 +3027,7 @@ class BaileysManager {
       e.code = "INVALID_RECIPIENT";
       throw e;
     }
-    const jid = `${cleanNumber}@s.whatsapp.net`;
-    await session.sock.sendMessage(jid, { text: message });
+    await session.sock.sendMessage(`${cleanNumber}@s.whatsapp.net`, { text: message });
     return { success: true, to: cleanNumber };
   }
 
@@ -3517,89 +3058,66 @@ async function sendWhatsAppSmart(userId, phoneNumber, message) {
 }
 
 // ================================================================================
-// §2.13 — EXPORTS COMPLÉMENTAIRES (Partie 2)
+// §2.13 — EXPORTS PARTIE 2
 // ================================================================================
 
 Object.assign(module.exports, {
-  // Middlewares
   mountBodyParsers,
   apiLimiter, strictLimiter, chatLimiter, authLimiter, toolLimiter,
   authenticateUser, requireRole,
-
-  // Tool calling
   TOOL_SCHEMAS, TOOLS_BY_CONTEXT, SIDE_EFFECT_TOOLS,
   getToolSchemas, validateToolArgs, executeToolNative,
-  callProviderWithTools, callProviderRawWithTools, runToolLoop,
-
-  // Confirmation
+  callProviderWithTools, callProviderRawWithTools, runToolLoop, dedupeVideos,
   queueConfirmation, consumeConfirmation, buildConfirmationPrompt, pendingConfirmations,
-
-  // Sandbox
   runCodeSandbox,
-
-  // Scheduler
   reminderTick,
-
-  // WhatsApp
   whatsappManager, sendWhatsAppSmart, isWhatsAppAllowed,
   saveWhatsAppCredentials, loadWhatsAppCredentials, deleteWhatsAppCredentials,
   toPlainWhatsAppText, resolveWhatsAppUser
 });
 
-// ================================================================================
 // ==================== FIN PARTIE 2 ============================================
 // ================================================================================
-// Ce que la Partie 3 va ajouter :
-//   - handleChat réécrit : non-bloquant, sans doublon d'historique, sans double
-//     exécution d'outils, avec SSE opt-in (events status/images/videos/token/
-//     suggestions/sources/done).
-//   - Vision via callProviderWithTools + Gemini natif.
-//   - searchImagesWithFallback v15 (allSettled, cache conditionnel, UA Wikimedia).
-//   - searchDuckDuckGoImages via ddgScrape.searchImages.
-//   - Mémoire long terme (runMemorySummary) branchée sur queueManager.
-//   - Hydratation Supabase → SQLite au démarrage.
-//   - getFullHistory filtré par user_id dans les deux branches.
-//   - assertConversationOwnership étendu à Supabase.
-// ================================================================================
-// ================================================================================
-// ==================== PARTIE 3 : handleChat v15 · SSE · IMAGES · MÉMOIRE ======
+// ==================== PARTIE 3 : handleChat · SSE · IMAGES · MÉMOIRE ==========
 // ================================================================================
 // Sommaire :
-//   §3.1  Utilitaires de streaming SSE
-//   §3.2  searchImagesWithFallback v15 (allSettled, cache conditionnel, UA WM)
-//   §3.3  searchDuckDuckGoImages via searchImages
-//   §3.4  Search helpers (web, news, sport, science, social, météo, YouTube)
-//   §3.5  Wikipedia summary
-//   §3.6  Tasks CRUD v15 (UUID, Supabase-first, outbox)
-//   §3.7  Mémoire long terme (runMemorySummary branchée sur queueManager)
-//   §3.8  Sessions + ActiveIntent (expiration 5 min, annulation)
-//   §3.9  Historique : getFullHistory filtré user_id (local + Supabase)
-//   §3.10 assertConversationOwnership étendu à Supabase
-//   §3.11 saveMessageWithUser v15 (Supabase-first, outbox, pas de doublon)
-//   §3.12 Email dispatch (Gmail échappé, Resend, SMTP)
-//   §3.13 Whisper transcription
-//   §3.14 handleChat v15 — non bloquant, parallélisé, sans doublons
-//   §3.15 handleChatStreaming — SSE opt-in
-//   §3.16 handleActiveIntent — annulation + expiration
-//   §3.17 Hydratation Supabase → SQLite
+//   §3.1  SSEWriter — événements typés (status/reasoning/code/images/token/suggestions/sources/done)
+//   §3.2  Google News + extraction de score (sport)
+//   §3.3  Images Wikimedia RÉELLES (gsrnamespace=6, thumburl API) + DDG searchImages + Wikipedia thumb
+//   §3.4  Search helpers (web, news, science, social, weather, YouTube)
+//   §3.5  Tasks CRUD v15.1 (UUID, Supabase-first)
+//   §3.6  Mémoire long terme
+//   §3.7  Sessions + ActiveIntent (expiration 5 min)
+//   §3.8  getFullHistory + assertConversationOwnership (Supabase étendu)
+//   §3.9  saveMessageWithUser (Supabase SYNCHRONE + outbox)
+//   §3.10 Email dispatch (Gmail échappé, Resend, SMTP)
+//   §3.11 Whisper transcription
+//   §3.12 LUBA_SYSTEM_PROMPT (anti-hallucination)
+//   §3.13 Suggestions (extract + generate)
+//   §3.14 enrichContextWithIntent (images en parallèle pour SPORT/ACTU/PERSONNE)
+//   §3.15 handleChat v15.1 (non-bloquant, parallélisé)
+//   §3.16 handleActiveIntent (annulation + expiration)
+//   §3.17 hydrateUserFromSupabase
 //   §3.18 Exports
 // ================================================================================
 
 const { PassThrough } = require("stream");
 
 // ================================================================================
-// §3.1 — SSE UTILITIES
+// §3.1 — SSEWriter
 // ================================================================================
 // Contrat d'événements :
-//   event: status       data: { stage, message? }
-//   event: images       data: { images: [{url,title,source}] }
-//   event: videos       data: { videos: [{videoId,title,url,embedUrl,...}] }
-//   event: token        data: { text: "chunk utf8-safe" }
-//   event: suggestions  data: { suggestions: ["...","...","..."] }
-//   event: sources      data: { sources: [{name,url,logo}] }
-//   event: error        data: { reply, code }       (code interne, pas exposé au user)
-//   event: done         data: { conversationId, isNewConversation, providerUsed, modelTier,
-//                               degraded, visionEnabled, intent, contextLength, messageId? }
+//   status       { stage, message?, iteration?, name? }
+//   reasoning    { text }                                     — réflexion <think>
+//   code         { language, filename?, code?, stdout?, stderr?, done, execution? }
+//   images       { images: [{url,title,source,pageUrl}] }
+//   videos       { videos: [{videoId,title,url,embedUrl,thumbnail,channel}] }
+//   token        { text }
+//   suggestions  { suggestions: ["...","...","..."] }
+//   sources      { sources: [{name,url,logo}] }
+//   error        { reply, code? }
+//   done         { conversationId, isNewConversation, providerUsed, modelTier,
+//                  degraded, visionEnabled, intent, contextLength }
 
 class SSEWriter {
   constructor(res) {
@@ -3608,19 +3126,16 @@ class SSEWriter {
     this.res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     this.res.setHeader("Cache-Control", "no-cache, no-transform");
     this.res.setHeader("Connection", "keep-alive");
-    this.res.setHeader("X-Accel-Buffering", "no"); // Nginx : pas de buffering
+    this.res.setHeader("X-Accel-Buffering", "no");
     this.res.flushHeaders?.();
-    this.res.write(":ok\n\n"); // commentaire initial → force le flush côté proxy
-
+    this.res.write(":ok\n\n");
     this.res.on("close", () => { this.closed = true; });
   }
 
-  /** Écrit un événement SSE typé. Les retours \n internes sont encodés. */
   send(event, data) {
     if (this.closed) return false;
     try {
       const payload = typeof data === "string" ? data : JSON.stringify(data ?? {});
-      // Chaque ligne "data:" ; SSE tolère des \n dans data si chaque ligne commence par data:
       const safe = payload.replace(/\r/g, "").split("\n").map(l => `data: ${l}`).join("\n");
       this.res.write(`event: ${event}\n${safe}\n\n`);
       return true;
@@ -3631,6 +3146,8 @@ class SSEWriter {
   }
 
   status(stage, extra = {}) { this.send("status", { stage, ...extra }); }
+  reasoning(text)           { if (text) this.send("reasoning", { text }); }
+  codeBlock(payload)        { this.send("code", payload); }
   token(text)               { if (text) this.send("token", { text }); }
   images(list)              { if (list?.length) this.send("images", { images: list }); }
   videos(list)              { if (list?.length) this.send("videos", { videos: list }); }
@@ -3646,31 +3163,7 @@ class SSEWriter {
   }
 }
 
-/**
- * Découpe un texte en chunks sûrs (UTF-8) pour le streaming token par token.
- * On ne coupe jamais au milieu d'une séquence UTF-8 multi-octets.
- */
-function safeChunkText(text, targetSize = 24) {
-  if (!text) return [];
-  const chunks = [];
-  let i = 0;
-  while (i < text.length) {
-    let end = Math.min(i + targetSize, text.length);
-    // Évite de couper une paire de substitution (surrogate pair)
-    const code = text.charCodeAt(end - 1);
-    if (code >= 0xD800 && code <= 0xDBFF && end < text.length) end++;
-    chunks.push(text.slice(i, end));
-    i = end;
-  }
-  return chunks;
-}
-
-/**
- * Stream progressif : au lieu d'envoyer la réponse d'un coup, on simule un flux
- * naturel de tokens à partir du texte final. Utile quand le provider ne streame
- * pas nativement (Groq/Cerebras/OpenRouter en mode non-stream).
- */
-async function streamTextAsTokens(sse, text, { paceMs = 8, chunkSize = 24 } = {}) {
+async function streamTextAsTokens(sse, text, { paceMs = 4, chunkSize = 28 } = {}) {
   const chunks = safeChunkText(text, chunkSize);
   for (const chunk of chunks) {
     if (sse.closed) return;
@@ -3680,16 +3173,195 @@ async function streamTextAsTokens(sse, text, { paceMs = 8, chunkSize = 24 } = {}
 }
 
 // ================================================================================
-// §3.2 — searchImagesWithFallback v15
+// §3.2 — GOOGLE NEWS + extraction de score
 // ================================================================================
-// ⚠️ PHASE 5 :
-//   - allSettled avec deadline PAR SOURCE (une source lente ne jette pas tout)
-//   - Ne met JAMAIS en cache un résultat vide
-//   - Commons : gsrnamespace=6, timeout ≥ 4s, thumburl API (jamais reconstruit)
-//   - UA Wikimedia conforme (URL + contact)
+
+async function fetchGoogleNews(query, { limit = 8, lang, region } = {}) {
+  const L = lang || CONFIG.GOOGLE_NEWS_LANG;
+  const R = region || CONFIG.GOOGLE_NEWS_REGION;
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${L}&gl=${R}&ceid=${R}:${L}`;
+  try {
+    const response = await axios.get(url, { timeout: 9000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
+    const xml = response.data || "";
+    const items = [];
+    const re = /<item>([\s\S]*?)<\/item>/g;
+    let match;
+    while ((match = re.exec(xml)) !== null && items.length < limit) {
+      const block = match[1];
+      const title = (block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "";
+      const link = (block.match(/<link>([\s\S]*?)<\/link>/) || [])[1] || "";
+      const pubDate = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || "";
+      const description = (block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "";
+      const source = (block.match(/<source[^>]*>([\s\S]*?)<\/source>/) || [])[1] || "";
+      if (title) {
+        items.push({
+          title: decodeXmlEntities(title),
+          link: link.trim(),
+          pubDate: pubDate.trim(),
+          pubDateMs: pubDate ? Date.parse(pubDate) || 0 : 0,
+          description: decodeXmlEntities(description).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+          source: decodeXmlEntities(source).trim()
+        });
+      }
+    }
+    return items;
+  } catch (e) {
+    logger.warn({ err: e.message, query }, "Google News échec");
+    return [];
+  }
+}
+
+const sportCache = new LRUCache({ max: 200, ttl: CONFIG.SPORT_CACHE_TTL_MS });
+
+/**
+ * Extrait un score depuis un texte : "RDC 3-1 Zimbabwe", "victoire 2 à 1", "score : 3-1"
+ */
+function extractScoreFromText(text) {
+  if (!text) return null;
+  const clean = String(text).replace(/\u00A0/g, " ").trim();
+
+  const patterns = [
+    /([A-ZÀ-Ý][\w\sÀ-ÿ'.-]{2,30}?)\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\s+([A-ZÀ-Ý][\w\sÀ-ÿ'.-]{2,30})/,
+    /(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(?:face|contre|devant|à|au|vs|v)\s+([A-ZÀ-Ý][\w\sÀ-ÿ'.-]{2,30})/,
+    /(?:score|résultat|victoire|défaite|match nul)[^\d]{0,40}(\d{1,2})\s*[-–]\s*(\d{1,2})/i,
+    /(\d{1,2})\s+buts?\s+(?:à|a)\s+(\d{1,2})/i
+  ];
+
+  for (const p of patterns) {
+    const m = clean.match(p);
+    if (m && m.length >= 3) {
+      if (m.length === 5 && !isNaN(m[2]) && !isNaN(m[3])) {
+        return {
+          home: m[1].trim(),
+          homeScore: parseInt(m[2], 10),
+          awayScore: parseInt(m[3], 10),
+          away: m[4].trim(),
+          raw: m[0]
+        };
+      }
+      if (m.length === 4 && !isNaN(m[1]) && !isNaN(m[2])) {
+        return {
+          home: null,
+          homeScore: parseInt(m[1], 10),
+          awayScore: parseInt(m[2], 10),
+          away: m[3].trim(),
+          raw: m[0]
+        };
+      }
+    }
+  }
+  return null;
+}
+
+const SPORT_SYNONYMS = {
+  "léopards": ["Léopards RDC", "RD Congo football", "Congo DR football"],
+  "leopards": ["Léopards RDC", "RD Congo football", "Congo DR football"],
+  "rdc": ["RD Congo football", "Léopards RDC"],
+  "congo": ["RD Congo football", "Congo Brazzaville football"],
+  "léopards rdc": ["Léopards RDC"],
+  "léopards de la rdc": ["Léopards RDC"],
+  "psg": ["Paris Saint-Germain"],
+  "om": ["Olympique de Marseille"],
+  "real": ["Real Madrid"],
+  "barca": ["FC Barcelona"],
+  "barça": ["FC Barcelona"],
+  "manchester": ["Manchester United", "Manchester City"]
+};
+
+async function searchSportsViaGoogleNews(team) {
+  if (!team) return { events: [], error: "Aucune équipe précisée" };
+
+  const cacheKey = `sport:${String(team).toLowerCase().trim()}`;
+  const cached = sportCache.get(cacheKey);
+  if (cached) return cached;
+
+  const normalized = String(team).toLowerCase().trim();
+  const candidates = [team];
+  for (const [key, aliases] of Object.entries(SPORT_SYNONYMS)) {
+    if (normalized.includes(key)) candidates.push(...aliases);
+  }
+  const entity = extractEntity(team);
+  if (entity && !candidates.includes(entity)) candidates.unshift(entity);
+
+  const allArticles = [];
+  const seenLinks = new Set();
+  const seenTitles = new Set();
+
+  for (const name of candidates.slice(0, 4)) {
+    const articles = await fetchGoogleNews(`${name} match résultat score`, { limit: 6 });
+    for (const a of articles) {
+      const titleKey = a.title.toLowerCase().slice(0, 60);
+      if (seenLinks.has(a.link) || seenTitles.has(titleKey)) continue;
+      seenLinks.add(a.link);
+      seenTitles.add(titleKey);
+      allArticles.push(a);
+    }
+  }
+
+  allArticles.sort((a, b) => (b.pubDateMs || 0) - (a.pubDateMs || 0));
+
+  const events = [];
+  for (const a of allArticles) {
+    const scoreFromTitle = extractScoreFromText(a.title);
+    const scoreFromDesc = !scoreFromTitle ? extractScoreFromText(a.description) : null;
+    const score = scoreFromTitle || scoreFromDesc;
+
+    if (score && Number.isFinite(score.homeScore) && Number.isFinite(score.awayScore)) {
+      events.push({
+        match: score.home
+          ? `${score.home} ${score.homeScore} - ${score.awayScore} ${score.away || "?"}`
+          : `${score.homeScore} - ${score.awayScore} (${score.away || "?"})`,
+        homeTeam: score.home || null,
+        awayTeam: score.away || null,
+        homeScore: score.homeScore,
+        awayScore: score.awayScore,
+        date: a.pubDateMs ? new Date(a.pubDateMs).toISOString().split("T")[0] : null,
+        publishedAt: a.pubDate || null,
+        source: a.source || "Google News",
+        title: a.title,
+        url: a.link,
+        description: a.description.slice(0, 300)
+      });
+    }
+  }
+
+  const seenMatches = new Set();
+  const uniqueEvents = events.filter((e) => {
+    const key = `${e.date}|${e.homeTeam}|${e.awayTeam}|${e.homeScore}|${e.awayScore}`;
+    if (seenMatches.has(key)) return false;
+    seenMatches.add(key);
+    return true;
+  });
+
+  const result = {
+    team: candidates[0],
+    searchedAs: candidates,
+    events: uniqueEvents.slice(0, CONFIG.SPORT_NEWS_MAX_ARTICLES),
+    allArticles: allArticles.slice(0, CONFIG.SPORT_NEWS_MAX_ARTICLES * 2),
+    fetchedAt: Date.now()
+  };
+
+  if (uniqueEvents.length > 0) sportCache.set(cacheKey, result);
+  return result;
+}
+
+async function searchSportsScores(team) {
+  if (!team) return { events: [], error: "Aucune équipe précisée" };
+  return await searchSportsViaGoogleNews(team);
+}
+
+// ================================================================================
+// §3.3 — IMAGES RÉELLES (Wikimedia + Wikipedia + DDG searchImages)
+// ================================================================================
 
 const IMAGE_CACHE_KEY = (q) => `img:${String(q).toLowerCase().trim()}`;
 
+/**
+ * Recherche images Wikimedia Commons.
+ * - gsrnamespace=6 (fichiers uniquement)
+ * - Utilise TOUJOURS le thumburl fourni par l'API (paliers standard Wikimedia)
+ * - User-Agent conforme à la politique Wikimedia
+ */
 async function searchWikimediaImagesV15(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
   try {
@@ -3697,7 +3369,7 @@ async function searchWikimediaImagesV15(query, limit = CONFIG.IMAGE_SEARCH_LIMIT
       "https://commons.wikimedia.org/w/api.php" +
       "?action=query&generator=search" +
       `&gsrsearch=${encodeURIComponent(query)}` +
-      "&gsrnamespace=6" +                 // ⚠️ namespace Fichier uniquement
+      "&gsrnamespace=6" +
       `&gsrlimit=${Math.min(limit, 10)}` +
       "&prop=imageinfo&iiprop=url|extmetadata" +
       "&iiurlwidth=1280" +
@@ -3715,7 +3387,6 @@ async function searchWikimediaImagesV15(query, limit = CONFIG.IMAGE_SEARCH_LIMIT
       .map((page) => {
         const info = page.imageinfo?.[0];
         if (!info) return null;
-        // ⚠️ On utilise TOUJOURS le thumburl fourni par l'API (paliers standard Wikimedia)
         const url = info.thumburl || info.url || null;
         if (!url) return null;
         return {
@@ -3754,52 +3425,8 @@ async function fetchWikipediaThumb(query) {
   } catch { return null; }
 }
 
-async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
-  const cleanQuery = extractEntity(query) || String(query || "").trim();
-  if (!cleanQuery) return { images: [] };
-
-  const cacheKey = IMAGE_CACHE_KEY(cleanQuery);
-  const cached = getCachedImages(cacheKey);
-  if (cached) return cached;
-
-  // ⚠️ Une deadline PAR source via allSettledWithDeadline : une source lente
-  // n'annule pas les autres.
-  const [commonsR, wikiR, ddgR] = await allSettledWithDeadline([
-    searchWikimediaImagesV15(cleanQuery, limit),
-    fetchWikipediaThumb(cleanQuery),
-    searchDuckDuckGoImages(cleanQuery, Math.min(4, limit))
-  ], CONFIG.IMAGE_SOURCE_DEADLINE_MS);
-
-  const commonsImages = commonsR.status === "fulfilled" ? (commonsR.value?.images || []) : [];
-  const wikiImage = (wikiR.status === "fulfilled" && wikiR.value) ? wikiR.value : null;
-  const ddgImages = ddgR.status === "fulfilled" ? (ddgR.value || []) : [];
-
-  const all = [
-    ...commonsImages,
-    ...(wikiImage ? [wikiImage] : []),
-    ...ddgImages
-  ];
-
-  // Dédoublonnage par URL canonique
-  const seen = new Set();
-  const unique = all.filter((img) => {
-    if (!img?.url || seen.has(img.url)) return false;
-    seen.add(img.url);
-    return true;
-  }).slice(0, limit);
-
-  const result = { images: unique };
-  // ⚠️ setCachedImages refuse le vide (déjà dans Partie 1).
-  setCachedImages(cacheKey, result);
-  if (unique.length > 0) logger.info({ query: cleanQuery, count: unique.length }, "Images trouvées");
-  return result;
-}
-
-// ================================================================================
-// §3.3 — searchDuckDuckGoImages (⚠️ ddgScrape.searchImages, pas search)
-// ================================================================================
-
-async function searchDuckDuckGoImages(query, limit = 4) {
+/** DuckDuckGo Images via searchImages() — PAS search() web. */
+async function searchDuckDuckGoImages(query, limit = CONFIG.IMAGE_DDG_LIMIT) {
   if (!ddgScrape) return [];
   try {
     const fn = ddgScrape.searchImages || ddgScrape.images;
@@ -3820,6 +3447,55 @@ async function searchDuckDuckGoImages(query, limit = 4) {
     logger.warn({ err: e.message, query }, "DDG images échec");
     return [];
   }
+}
+
+/**
+ * Fusion des 3 sources avec deadline PAR SOURCE (une source lente ne jette plus tout).
+ * Cache UNIQUEMENT si images > 0.
+ */
+async function searchImagesWithFallback(query, limit = CONFIG.IMAGE_SEARCH_LIMIT) {
+  const cleanQuery = extractEntity(query) || String(query || "").trim();
+  if (!cleanQuery) return { images: [] };
+
+  const cacheKey = IMAGE_CACHE_KEY(cleanQuery);
+  const cached = getCachedImages(cacheKey);
+  if (cached) return cached;
+
+  const [commonsR, wikiR, ddgR] = await allSettledWithDeadline([
+    searchWikimediaImagesV15(cleanQuery, limit),
+    fetchWikipediaThumb(cleanQuery),
+    searchDuckDuckGoImages(cleanQuery, Math.min(4, limit))
+  ], CONFIG.IMAGE_SOURCE_DEADLINE_MS);
+
+  const commonsImages = commonsR.status === "fulfilled" ? (commonsR.value?.images || []) : [];
+  const wikiImage = (wikiR.status === "fulfilled" && wikiR.value) ? wikiR.value : null;
+  const ddgImages = ddgR.status === "fulfilled" ? (ddgR.value || []) : [];
+
+  const all = [
+    ...commonsImages,
+    ...(wikiImage ? [wikiImage] : []),
+    ...ddgImages
+  ];
+
+  const seen = new Set();
+  const unique = all.filter((img) => {
+    if (!img?.url || seen.has(img.url)) return false;
+    seen.add(img.url);
+    return true;
+  }).slice(0, limit);
+
+  const result = { images: unique };
+  setCachedImages(cacheKey, result);
+  if (unique.length > 0) {
+    logger.info({
+      query: cleanQuery,
+      count: unique.length,
+      commons: commonsImages.length,
+      wiki: wikiImage ? 1 : 0,
+      ddg: ddgImages.length
+    }, "Images trouvées");
+  }
+  return result;
 }
 
 // ================================================================================
@@ -3879,46 +3555,17 @@ async function searchWeb(query) {
 async function searchNews(query) {
   if (!query) return { articles: [] };
   try {
-    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=fr&gl=FR&ceid=FR:fr`;
-    const response = await axios.get(url, { timeout: 8000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } });
-    const xml = response.data || "";
-    const items = [];
-    const re = /<item>([\s\S]*?)<\/item>/g;
-    let match;
-    while ((match = re.exec(xml)) !== null && items.length < 6) {
-      const block = match[1];
-      const title = (block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "";
-      const link = (block.match(/<link>([\s\S]*?)<\/link>/) || [])[1] || "";
-      const pubDate = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || "";
-      const description = (block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "";
-      if (title) items.push({ title: decodeXmlEntities(title), link: link.trim(), pubDate, description: decodeXmlEntities(description) });
-    }
-    return { articles: items };
+    const items = await fetchGoogleNews(query, { limit: 8 });
+    return {
+      articles: items.map((a) => ({
+        title: a.title, link: a.link, pubDate: a.pubDate,
+        description: a.description, source: a.source
+      }))
+    };
   } catch (e) {
     logger.warn({ err: e.message }, "Actualités échec");
     return { articles: [] };
   }
-}
-
-async function searchSportsScores(team) {
-  if (!team) return { events: [], error: "Aucune équipe précisée" };
-  try {
-    const searchResp = await axios.get(
-      `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(team)}`,
-      { timeout: 7000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } }
-    );
-    const t = searchResp.data?.teams?.[0];
-    if (!t) return { events: [], error: `Équipe "${team}" introuvable` };
-    const eventsResp = await axios.get(
-      `https://www.thesportsdb.com/api/v1/json/3/eventslast.php?id=${t.idTeam}`,
-      { timeout: 7000, headers: { "User-Agent": CONFIG.HTTP_USER_AGENT } }
-    );
-    const events = (eventsResp.data?.results || []).slice(0, 5).map((e) => ({
-      match: `${e.strHomeTeam} ${e.intHomeScore ?? "?"} - ${e.intAwayScore ?? "?"} ${e.strAwayTeam}`,
-      date: e.dateEvent, league: e.strLeague
-    }));
-    return { team: t.strTeam, events };
-  } catch (e) { return { events: [], error: e.message }; }
 }
 
 async function searchScience(query) {
@@ -4035,7 +3682,7 @@ async function scrapeArticleContent(url) {
 }
 
 // ================================================================================
-// §3.6 — TASKS CRUD v15 (UUID · Supabase-first · outbox)
+// §3.5 — TASKS CRUD v15.1 (UUID + Supabase-first)
 // ================================================================================
 
 async function createTask(userId, { title, notes = null, dueAt = null }) {
@@ -4062,8 +3709,7 @@ async function createTask(userId, { title, notes = null, dueAt = null }) {
 
   if (supabase) {
     await supabaseWriteSafe({
-      table: "user_tasks",
-      op: "upsert",
+      table: "user_tasks", op: "upsert",
       payload: {
         id, user_id: userId, title: cleanTitle, notes: cleanNotes,
         due_at: dueAtMs ? new Date(dueAtMs).toISOString() : null,
@@ -4071,8 +3717,7 @@ async function createTask(userId, { title, notes = null, dueAt = null }) {
         created_at: new Date(now).toISOString(),
         updated_at: new Date(now).toISOString()
       },
-      matchColumn: "id",
-      idempotencyKey: `task:${id}`
+      matchColumn: "id", idempotencyKey: `task:${id}`
     });
   }
 
@@ -4080,14 +3725,13 @@ async function createTask(userId, { title, notes = null, dueAt = null }) {
 }
 
 async function listTasks(userId, { status = null } = {}) {
-  // ⚠️ Lecture : Supabase d'abord (source de vérité), repli local.
   if (supabase) {
     try {
-      let q = supabase.from("user_tasks").select("*").eq("user_id", userId).order("due_at", { ascending: true, nullsFirst: false }).limit(50);
+      let q = supabase.from("user_tasks").select("*").eq("user_id", userId)
+        .order("due_at", { ascending: true, nullsFirst: false }).limit(50);
       if (status) q = q.eq("status", status);
       const { data, error } = await q;
       if (!error && Array.isArray(data)) {
-        // Miroir local best-effort
         for (const t of data) {
           try {
             await dbRun(
@@ -4129,11 +3773,9 @@ async function updateTaskStatus(userId, taskId, status) {
 
   if (supabase) {
     await supabaseWriteSafe({
-      table: "user_tasks",
-      op: "update",
+      table: "user_tasks", op: "update",
       payload: { status, updated_at: new Date().toISOString() },
-      matchColumn: "id",
-      matchValue: taskId,
+      matchColumn: "id", matchValue: taskId,
       idempotencyKey: `task_status:${taskId}:${status}:${Date.now()}`
     });
   }
@@ -4146,11 +3788,8 @@ async function deleteTask(userId, taskId) {
   await dbRun(`DELETE FROM user_tasks WHERE id = ? AND user_id = ?`, [taskId, userId]);
   if (supabase) {
     await supabaseWriteSafe({
-      table: "user_tasks",
-      op: "delete",
-      payload: {},
-      matchColumn: "id",
-      matchValue: taskId,
+      table: "user_tasks", op: "delete", payload: {},
+      matchColumn: "id", matchValue: taskId,
       idempotencyKey: `task_delete:${taskId}`
     });
   }
@@ -4158,14 +3797,12 @@ async function deleteTask(userId, taskId) {
 }
 
 // ================================================================================
-// §3.7 — MÉMOIRE LONG TERME (file bornée)
+// §3.6 — MÉMOIRE LONG TERME
 // ================================================================================
-// ⚠️ PHASE 1 : jamais en concurrence avec le chat, concurrency=1, interval mini 2 s.
 
 const USER_MEMORY_UPDATE_EVERY_N_MESSAGES = parseInt(process.env.USER_MEMORY_UPDATE_EVERY_N_MESSAGES || "6", 10);
 
 async function getUserMemory(userId) {
-  // Supabase d'abord
   if (supabase) {
     try {
       const { data, error } = await supabase.from("user_memory").select("summary").eq("user_id", userId).maybeSingle();
@@ -4189,14 +3826,12 @@ async function saveUserMemory(userId, summary, messagesSinceUpdate = 0) {
 
   if (supabase) {
     await supabaseWriteSafe({
-      table: "user_memory",
-      op: "upsert",
+      table: "user_memory", op: "upsert",
       payload: {
         user_id: userId, summary, messages_since_update: messagesSinceUpdate,
         updated_at: new Date().toISOString()
       },
-      matchColumn: "user_id",
-      idempotencyKey: `memory:${userId}`
+      matchColumn: "user_id", idempotencyKey: `memory:${userId}`
     });
   }
 }
@@ -4215,7 +3850,6 @@ async function incrementUserMemoryCounter(userId) {
   return count;
 }
 
-/** Vraie implémentation, branchée sur queueManager ("memory-summary", concurrency=1). */
 async function runMemorySummaryImpl({ userId, lastUserMessage, lastAssistantReply }) {
   try {
     const previousSummary = await getUserMemory(userId);
@@ -4258,21 +3892,17 @@ async function runMemorySummaryImpl({ userId, lastUserMessage, lastAssistantRepl
         return;
       }
     }
-    // Repli : reset du compteur pour ne pas rester coincé
     await saveUserMemory(userId, previousSummary, 0);
   } catch (e) {
     logger.error({ err: e.message, userId }, "Erreur runMemorySummary");
   }
 }
 
-// Branche la vraie implémentation dans le queueManager (Partie 1 a un stub)
 if (typeof module.exports.setRunMemorySummary === "function") {
   module.exports.setRunMemorySummary(runMemorySummaryImpl);
 }
-// Fallback : si le stub de la Partie 1 est dans la même portée, on remplace.
 try { runMemorySummary = runMemorySummaryImpl; } catch {}
 
-/** Déclenche (sans attendre) le résumé mémoire toutes N interactions. */
 async function maybeUpdateUserMemoryAsync(userId, lastUserMessage, lastAssistantReply) {
   try {
     const count = await incrementUserMemoryCounter(userId);
@@ -4286,14 +3916,18 @@ async function maybeUpdateUserMemoryAsync(userId, lastUserMessage, lastAssistant
 }
 
 // ================================================================================
-// §3.8 — SESSIONS + ACTIVE INTENT (expiration, annulation)
+// §3.7 — SESSIONS + ACTIVE INTENT
 // ================================================================================
 
 const ACTIVE_INTENT_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * ⚠️ v15.1 : synchronisation Supabase SYNCHRONE à chaque appel (idempotent).
+ * Corrige la perte d'historique au redéploiement Render.
+ */
 async function getSession(conversationId, userId, firebaseUid = null) {
-  // Un seul aller-retour Supabase (pas 3 comme en v14).
   const local = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
+
   if (local) {
     if (local.user_id !== userId && local.firebase_uid !== userId) {
       const err = new Error("Conversation non autorisée");
@@ -4301,31 +3935,42 @@ async function getSession(conversationId, userId, firebaseUid = null) {
       throw err;
     }
     await dbRun("UPDATE sessions SET updated_at = ? WHERE session_id = ?", [Date.now(), conversationId]);
+
+    if (supabase) {
+      supabaseWriteSafe({
+        table: "sessions", op: "upsert",
+        payload: {
+          session_id: conversationId, user_id: userId,
+          firebase_uid: firebaseUid || userId,
+          updated_at: new Date().toISOString()
+        },
+        matchColumn: "session_id", idempotencyKey: `session:${conversationId}`
+      }).catch(() => {});
+    }
     return local;
   }
 
-  // Insertion locale
   await dbRun(
     `INSERT INTO sessions (session_id, user_id, firebase_uid, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?)`,
     [conversationId, userId, firebaseUid || userId, Date.now(), Date.now()]
   );
 
-  // Sync Supabase en arrière-plan
   if (supabase) {
-    setImmediate(() => {
-      supabaseWriteSafe({
-        table: "sessions",
-        op: "upsert",
+    try {
+      await supabaseWriteSafe({
+        table: "sessions", op: "upsert",
         payload: {
           session_id: conversationId, user_id: userId,
           firebase_uid: firebaseUid || userId,
+          created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         },
-        matchColumn: "session_id",
-        idempotencyKey: `session:${conversationId}`
-      }).catch(() => {});
-    });
+        matchColumn: "session_id", idempotencyKey: `session:${conversationId}`
+      });
+    } catch (e) {
+      logger.warn({ err: e.message }, "getSession — sync Supabase échouée");
+    }
   }
 
   return { session_id: conversationId, user_id: userId, firebase_uid: firebaseUid || userId };
@@ -4360,14 +4005,13 @@ async function clearActiveIntent(conversationId) {
 }
 
 // ================================================================================
-// §3.9 — HISTORIQUE (⚠️ user_id filtré dans TOUTES les branches)
+// §3.8 — HISTORIQUE + PROPRIÉTÉ
 // ================================================================================
 
 async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_CONTEXT_MESSAGES) {
-  // 1) Supabase (source de vérité) — filtré par user_id
   if (supabase) {
     try {
-      let q = supabase
+      const q = supabase
         .from("messages")
         .select("role, content, created_at, user_id")
         .eq("session_id", conversationId)
@@ -4375,7 +4019,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_
         .limit(limit);
       const { data, error } = await q;
       if (!error && Array.isArray(data) && data.length > 0) {
-        // ⚠️ Filtre user_id EN MÉMOIRE si présent (colonne optionnelle côté Supabase)
         const filtered = userId
           ? data.filter((m) => !m.user_id || m.user_id === userId)
           : data;
@@ -4384,7 +4027,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_
     } catch (e) { logger.warn({ err: e.message }, "getFullHistory Supabase échec → local"); }
   }
 
-  // 2) Local — filtré par user_id
   try {
     let q = "SELECT role, content FROM messages WHERE session_id = ?";
     const params = [conversationId];
@@ -4403,12 +4045,7 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.MAX_
   }
 }
 
-// ================================================================================
-// §3.10 — assertConversationOwnership étendu Supabase
-// ================================================================================
-
 async function assertConversationOwnership(conversationId, userId) {
-  // 1) Local
   const local = await dbGet(
     `SELECT user_id, firebase_uid FROM sessions WHERE session_id = ?`,
     [conversationId]
@@ -4422,14 +4059,11 @@ async function assertConversationOwnership(conversationId, userId) {
     return true;
   }
 
-  // 2) Supabase (si session inconnue localement, ex. après reset SQLite)
   if (supabase) {
     try {
       const { data, error } = await supabase
-        .from("sessions")
-        .select("user_id, firebase_uid")
-        .eq("session_id", conversationId)
-        .maybeSingle();
+        .from("sessions").select("user_id, firebase_uid")
+        .eq("session_id", conversationId).maybeSingle();
       if (!error && data) {
         if (data.user_id && data.user_id !== userId && data.firebase_uid !== userId) {
           const e = new Error("Cette conversation n'appartient pas à cet utilisateur.");
@@ -4444,42 +4078,40 @@ async function assertConversationOwnership(conversationId, userId) {
     }
   }
 
-  // Session inconnue partout : autorisé (création à venir via getSession).
   return true;
 }
 
 // ================================================================================
-// §3.11 — saveMessageWithUser v15
+// §3.9 — saveMessageWithUser (Supabase SYNCHRONE)
 // ================================================================================
-// ⚠️ PHASE 3 : Supabase-first (écriture via outbox si échec), puis SQLite.
-// ⚠️ PHASE 1 : les blocs "Illustrations"/"Sources" ne sont PAS sauvegardés — le
-// texte pur est sauvegardé, ces blocs sont ajoutés à la RÉPONSE envoyée seulement.
 
+/**
+ * ⚠️ v15.1 : écriture Supabase SYNCHRONE (bloquante) — corrige la perte au redéploiement.
+ * Le texte PUR est sauvegardé (pas les blocs Illustrations/Sources).
+ */
 async function saveMessageWithUser(conversationId, role, content, userId = null, firebaseUid = null, metadata = {}) {
   const now = Date.now();
 
-  // Supabase en arrière-plan (via outbox)
-  if (supabase) {
+  if (supabase && userId) {
     const idemKey = `msg:${conversationId}:${role}:${now}:${sha256(String(content).slice(0, 64)).slice(0, 12)}`;
-    setImmediate(() => {
-      supabaseWriteSafe({
-        table: "messages",
-        op: "insert",
+    try {
+      await supabaseWriteSafe({
+        table: "messages", op: "insert",
         payload: {
           session_id: conversationId,
           firebase_uid: firebaseUid || userId,
           user_id: userId,
-          role,
-          content,
+          role, content,
           metadata: metadata || {},
           created_at: new Date(now).toISOString()
         },
         idempotencyKey: idemKey
-      }).catch(() => {});
-    });
+      });
+    } catch (e) {
+      logger.warn({ err: e.message }, "saveMessageWithUser — outbox prend le relais");
+    }
   }
 
-  // Local (synchrone, source de contexte la plus rapide)
   try {
     await dbRun(
       `INSERT INTO messages (session_id, user_id, role, content, metadata, created_at)
@@ -4493,7 +4125,7 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
 }
 
 // ================================================================================
-// §3.12 — EMAIL
+// §3.10 — EMAIL DISPATCH
 // ================================================================================
 
 async function verifyGmailScope(accessToken) {
@@ -4595,7 +4227,7 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, 
 }
 
 // ================================================================================
-// §3.13 — WHISPER (transcription)
+// §3.11 — WHISPER TRANSCRIPTION
 // ================================================================================
 
 async function transcribeAudioGroq(buffer, filename, mimetype) {
@@ -4629,11 +4261,8 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
 }
 
 // ================================================================================
-// §3.14 — PROMPTS SYSTÈME (texte brut, sans JSON)
+// §3.12 — LUBA_SYSTEM_PROMPT (anti-hallucination)
 // ================================================================================
-// ⚠️ PHASE 1 : plus de JSON pour le chat. Le modèle répond en Markdown brut.
-// Les suggestions sont extraites soit d'un bloc final balisé, soit générées
-// par un mini-appel séparé (fallback).
 
 const LUBA_SYSTEM_PROMPT = [
   "Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
@@ -4648,12 +4277,17 @@ const LUBA_SYSTEM_PROMPT = [
   "- Ne redemande JAMAIS une info déjà donnée.",
   "- Si une [MÉMOIRE LONG TERME] est fournie, utilise-la naturellement.",
   "",
-  "DONNÉES :",
-  "- N'invente JAMAIS un score, une actualité, une météo, une vidéo.",
-  "- Utilise TOUJOURS l'outil approprié.",
+  "DONNÉES — RÈGLE ABSOLUE (violation = faute grave) :",
+  "- N'invente JAMAIS un score, une actualité, une météo, une vidéo, un nom de joueur, une date.",
+  "- Si un outil retourne un résultat, UTILISE-LE TEL QUEL. Ne modifie aucun chiffre.",
+  "- Si un outil ÉCHOUE ou retourne 'aucun résultat', DIS-LE CLAIREMENT à l'utilisateur.",
+  "  Exemple : « Je n'ai pas trouvé le score exact pour ce match. Veux-tu que je cherche autrement ? »",
+  "- Un score, une date ou un nom de joueur DOIT venir d'un résultat d'outil. Sinon, tais-toi.",
+  "- Mieux vaut dire « je ne sais pas » que d'inventer une information.",
   "",
   "IMAGES :",
-  "- Dès que tu décris une personnalité, un lieu ou un objet précis, appelle search_images.",
+  "- Dès que tu décris une personnalité, un lieu, un objet ou une équipe précise, appelle search_images.",
+  "- Les images sont affichées automatiquement — ne mentionne JAMAIS les URLs dans ta réponse.",
   "",
   "MODULE JARVIS :",
   "- Chercher un clip → search_youtube",
@@ -4676,11 +4310,14 @@ const LUBA_SYSTEM_PROMPT = [
   "",
   "SUGGESTIONS :",
   "- À la fin de ta réponse, si pertinent, ajoute un bloc :",
-  "  <!--SUGGESTIONS:[\"Question 1 ?\",\"Question 2 ?\",\"Question 3 ?\"]-->",
+  '  <!--SUGGESTIONS:["Question 1 ?","Question 2 ?","Question 3 ?"]-->',
   "- Sinon, n'ajoute rien."
 ].join("\n");
 
-/** Extrait le bloc <!--SUGGESTIONS:[...]--> de la réponse et le retire. */
+// ================================================================================
+// §3.13 — SUGGESTIONS
+// ================================================================================
+
 function extractSuggestions(text) {
   if (!text) return { text: "", suggestions: [] };
   const m = String(text).match(/<!--\s*SUGGESTIONS\s*:\s*(\[[\s\S]*?\])\s*-->/i);
@@ -4693,7 +4330,6 @@ function extractSuggestions(text) {
   return { text: text.replace(m[0], "").trim(), suggestions };
 }
 
-/** Génère 3 suggestions via mini-appel (fallback si pas de bloc). */
 async function generateSuggestions(userMessage, replyText) {
   try {
     const provider = MODEL_TIERS.v100.providers[0];
@@ -4719,10 +4355,8 @@ async function generateSuggestions(userMessage, replyText) {
 }
 
 // ================================================================================
-// §3.14b — ENRICHISSEMENT DE CONTEXTE (⚠️ UNE SEULE FOIS, résultat réutilisé)
+// §3.14 — ENRICHISSEMENT CONTEXTE (images en parallèle)
 // ================================================================================
-// ⚠️ PHASE 1 : les outils pré-exécutés ne doivent PLUS être rejoués dans la boucle.
-// On expose le résultat dans un cache local { name::argsHash → result }.
 
 function toolCacheKey(name, args) {
   return `${name}::${sha256(JSON.stringify(args || {})).slice(0, 16)}`;
@@ -4752,22 +4386,67 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
       }
       case "ACTUALITE": {
         const q = entity || userMessage;
-        const { result, sourceKeys } = await run("search_news", { query: q });
+        const [newsRes, imagesRes] = await Promise.all([
+          run("search_news", { query: q }),
+          run("search_images", { query: q })
+        ]);
+        const { result, sourceKeys } = newsRes;
+
         if (result.articles?.length) {
-          enrichment.contextData += "\n[ACTUALITÉS RÉCENTES — ne cite pas les URLs dans la réponse]\n";
+          enrichment.contextData += "\n[ACTUALITÉS RÉCENTES — utilise ces faits, ne cite pas les URLs]\n";
           result.articles.slice(0, 5).forEach((a, i) => {
             enrichment.contextData += `${i + 1}. ${a.title} (${a.pubDate})\n   ${a.description ? a.description.slice(0, 200) : ""}\n\n`;
           });
           sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
+        } else {
+          enrichment.contextData += `\n[ACTUALITÉ — AUCUN ARTICLE TROUVÉ pour "${q}"]\n⚠️ Dis-le à l'utilisateur. N'invente pas.\n`;
+        }
+
+        if (imagesRes.result.images?.length) {
+          enrichment.media.images = imagesRes.result.images.slice(0, 3);
+          enrichment.contextData += `\n[IMAGES TROUVÉES — affichées automatiquement, ne mentionne pas les URLs]\n`;
+          imagesRes.sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
         }
         break;
       }
       case "SPORT": {
-        const { result, sourceKeys } = await run("search_sports_scores", { team: entity || userMessage });
-        if (result.events?.length) {
-          enrichment.contextData += `\n[RÉSULTATS SPORTIFS — ${result.team || entity}]\n`;
-          result.events.forEach((e) => { enrichment.contextData += `${e.match} (${e.date}) - ${e.league}\n`; });
-          sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
+        const [scoresRes, imagesRes] = await Promise.all([
+          run("search_sports_scores", { team: entity || userMessage }),
+          run("search_images", { query: `${entity || userMessage} football player team` })
+        ]);
+
+        if (scoresRes.result.events?.length) {
+          enrichment.contextData += `\n[RÉSULTATS SPORTIFS RÉCENTS (source : Google News, vérifié)]\n`;
+          scoresRes.result.events.forEach((e) => {
+            enrichment.contextData +=
+              `- ${e.match}\n` +
+              `  Date : ${e.date || "?"}\n` +
+              `  Source : ${e.source}\n` +
+              `  Article : "${e.title}"\n` +
+              `  Lien : ${e.url}\n\n`;
+          });
+          enrichment.contextData += `\n⚠️ RÈGLE : utilise UNIQUEMENT ces scores. Ne les modifie pas. Ne cite que les joueurs si tu en as la certitude dans les articles.\n`;
+          scoresRes.sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
+        } else {
+          const articles = scoresRes.result.allArticles || [];
+          if (articles.length > 0) {
+            enrichment.contextData += `\n[SPORT — ARTICLES TROUVÉS mais AUCUN SCORE extrait automatiquement]\n`;
+            enrichment.contextData += `Voici les titres récents (à utiliser pour informer, PAS pour inventer un score) :\n`;
+            articles.slice(0, 5).forEach((a) => {
+              enrichment.contextData += `- "${a.title}" (${a.source}, ${a.pubDate})\n  ${a.link}\n`;
+            });
+            enrichment.contextData += `\n⚠️ RÈGLE STRICTE : tu n'as PAS de score exact. Dis-le clairement à l'utilisateur et propose de chercher un article précis. N'INVENTE PAS de score, de date, ni de nom de joueur.\n`;
+          } else {
+            enrichment.contextData += `\n[SPORT — AUCUNE INFORMATION TROUVÉE pour "${entity || userMessage}"]\n`;
+            enrichment.contextData += `⚠️ RÈGLE STRICTE : dis à l'utilisateur que tu n'as pas trouvé d'information fiable. Ne devine RIEN. Propose de reformuler la question.\n`;
+          }
+          scoresRes.sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
+        }
+
+        if (imagesRes.result.images?.length) {
+          enrichment.media.images = imagesRes.result.images.slice(0, 3);
+          enrichment.contextData += `\n[IMAGES TROUVÉES — affichées automatiquement, ne mentionne pas les URLs]\n`;
+          imagesRes.sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
         }
         break;
       }
@@ -4775,7 +4454,7 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
         const { result, sourceKeys } = await run("search_images", { query: entity || userMessage });
         if (result.images?.length) {
           enrichment.media.images = result.images.slice(0, 3);
-          enrichment.contextData += `\n[IMAGES TROUVÉES — elles seront affichées automatiquement, ne mentionne pas les URLs]\n`;
+          enrichment.contextData += `\n[IMAGES TROUVÉES — affichées automatiquement, ne mentionne pas les URLs]\n`;
           sourceKeys.forEach((k) => enrichment.sourceKeys.push(k));
         }
         break;
@@ -4803,7 +4482,7 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
 }
 
 // ================================================================================
-// §3.14c — handleChat v15 (NON BLOQUANT, PARALLÉLISÉ, SANS DOUBLONS)
+// §3.15 — handleChat v15.1
 // ================================================================================
 
 async function handleChat({
@@ -4816,7 +4495,7 @@ async function handleChat({
 
   if (sse) sse.status("starting");
 
-  // -------- 1) Parallélisation des lectures indépendantes --------
+  // 1) Parallélisation des lectures indépendantes
   const [_, history, longTermMemory, activeIntent] = await Promise.all([
     getSession(conversationId, userId, firebaseUid).catch((e) => {
       if (e.code === "CONVERSATION_OWNERSHIP") throw e;
@@ -4828,7 +4507,7 @@ async function handleChat({
     getActiveIntent(conversationId).catch(() => null)
   ]);
 
-  // -------- 2) Intention active (WhatsApp/Email en cours) --------
+  // 2) Intention active
   if (activeIntent) {
     if (sse) sse.status("active_intent");
     const out = await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken });
@@ -4847,23 +4526,22 @@ async function handleChat({
     };
   }
 
-  // -------- 3) Pré-routeur d'intention + entité --------
+  // 3) Pré-routeur intention + entité
   const { intent, entity } = preRouteIntent(message);
   if (sse) sse.status("thinking", { intent });
 
-  // -------- 4) Écriture du message user (fire-and-forget côté Supabase) --------
+  // 4) Save user message (fire-and-forget côté Supabase = déjà sync via saveMessageWithUser)
   saveMessageWithUser(conversationId, "user", message, userId, firebaseUid).catch(() => {});
 
-  // -------- 5) Enrichissement (une seule fois) + cache anti-doublon --------
+  // 5) Enrichissement
   const toolCache = new Map();
   const enrichment = await enrichContextWithIntent(intent, message, entity, toolCache);
 
-  // ⚠️ Émission SSE des médias dès qu'ils sont prêts (avant le LLM)
+  // Émission SSE des médias dès qu'ils sont prêts
   if (sse && enrichment.media.images.length > 0) sse.images(enrichment.media.images);
   if (sse && enrichment.media.videos.length > 0) sse.videos(enrichment.media.videos);
 
-  // -------- 6) Construction des messages LLM (⚠️ PAS de doublon d'historique) --------
-  // On envoie l'historique UNE SEULE FOIS dans `messages` — pas dans un system prompt.
+  // 6) Construction des messages LLM (historique UNE seule fois)
   const historyWithoutCurrent = history.length > 0 && history[history.length - 1].role === "user"
     ? history.slice(0, -1)
     : history;
@@ -4877,13 +4555,13 @@ async function handleChat({
     ? `${message}\n\n[CONTEXTE ENRICHI — NE PAS CITER CES SOURCES]\n${enrichment.contextData}`
     : message;
 
-  let messages = [
+  const messages = [
     { role: "system", content: systemContent },
     ...contextHistory,
     { role: "user", content: userContentWithEnrichment }
   ];
 
-  // -------- 7) Exécution LLM (vision ou texte) --------
+  // 7) Exécution LLM
   const usedSources = new Set(enrichment.sourceKeys);
   let collectedImages = enrichment.media.images.map((i) => i.url);
   let collectedVideos = [...enrichment.media.videos];
@@ -4898,8 +4576,6 @@ async function handleChat({
     : (useV250 ? MODEL_TIERS.v250.reasoning.providers : MODEL_TIERS.v100.providers);
 
   const executeFn = async ({ toolName, args }) => {
-    // ⚠️ Anti-doublon : si l'enrichissement a déjà exécuté ce couple (nom,args),
-    // on réutilise le résultat au lieu de refaire l'appel réseau.
     const key = toolCacheKey(toolName, args);
     if (toolCache.has(key)) {
       const cached = toolCache.get(key);
@@ -4911,22 +4587,20 @@ async function handleChat({
   };
 
   try {
-    // -------- Boucle agent bornée sur le provider principal --------
-    // Rotation : on essaie chaque provider jusqu'à ce qu'un réussisse.
     let loopResult = { success: false };
     for (const provider of providerChain) {
       const r = await runToolLoop({
         messages,
         providerConfig: provider,
         images,
-        executeFn
+        executeFn,
+        sse
       });
       if (r.success) {
         loopResult = r;
         providerUsed = provider.provider;
         break;
       }
-      // Sinon on essaie le suivant
       logger.warn({ provider: provider.provider, err: r.error?.message }, "Boucle tool LLM échouée, provider suivant");
     }
 
@@ -4939,13 +4613,12 @@ async function handleChat({
       (loopResult.usedSources || []).forEach((k) => usedSources.add(k));
       collectedImages.push(...(loopResult.images || []));
       collectedVideos.push(...(loopResult.videos || []));
-      // Le modèle peut ne pas avoir utilisé les outils pré-enrichis (peu probable)
       if (collectedImages.length === 0 && enrichment.media.images.length > 0) {
         collectedImages.push(...enrichment.media.images.map((i) => i.url));
       }
     }
 
-    // -------- Si v250 demandé, on relance la phase "code" avec historique --------
+    // Si v250 demandé, relance phase code
     if (useV250 && !images && finalText && intent === "CODE") {
       const codeProvider = MODEL_TIERS.v250.code.providers[0];
       const codeMessages = [
@@ -4971,7 +4644,7 @@ async function handleChat({
     degraded = true;
   }
 
-  // -------- 8) Post-traitement : normalizeMath + stripThink + suggestions --------
+  // 8) Post-traitement
   finalText = normalizeMath(finalText || "");
   if (!finalText) finalText = "Je n'ai pas pu générer une réponse pour le moment.";
 
@@ -4979,31 +4652,28 @@ async function handleChat({
   finalText = sug.text;
   let suggestions = sug.suggestions;
   if (suggestions.length === 0 && !degraded) {
-    // Mini-appel en tâche de fond, non bloquant pour la réponse
     generateSuggestions(message, finalText.slice(0, 500))
       .then((s) => { if (s.length) suggestions = s; })
       .catch(() => {});
   }
 
-  // -------- 9) Dédoublonnage médias --------
+  // 9) Dédoublonnage médias
   collectedImages = [...new Set(collectedImages.filter(Boolean))];
   collectedVideos = dedupeVideos(collectedVideos);
 
-  // -------- 10) Save du texte PUR (sans Illustrations/Sources) --------
+  // 10) Save texte PUR (sans Illustrations/Sources)
   saveMessageWithUser(conversationId, "assistant", finalText, userId, firebaseUid, {
     providerUsed, intent, degraded
   }).catch(() => {});
 
-  // -------- 11) Mémoire long terme (fire-and-forget, file bornée) --------
+  // 11) Mémoire long terme (fire-and-forget)
   maybeUpdateUserMemoryAsync(userId, message, finalText).catch(() => {});
 
-  // -------- 12) Construction de la réponse HTTP --------
-  // ⚠️ Les blocs "Illustrations" et "Sources" sont ajoutés UNIQUEMENT dans la
-  // réponse envoyée (pas dans l'historique réinjecté au LLM).
+  // 12) Réponse HTTP — Illustrations/Sources SEULEMENT côté client
   let replyForClient = finalText;
 
-  const inlineImages = enrichment.media.images.length === 0 && collectedImages.length > 0;
-  if (inlineImages) {
+  const shouldInlineImages = !sse && enrichment.media.images.length === 0 && collectedImages.length > 0;
+  if (shouldInlineImages) {
     const md = collectedImages.map((u, i) => `![Image ${i + 1}](${u})`).join("\n\n");
     replyForClient += `\n\n---\n\n**Illustrations :**\n\n${md}`;
   }
@@ -5043,7 +4713,7 @@ async function handleChat({
     elapsedMs: Date.now() - startedAt
   };
 
-  // -------- 13) SSE : on stream le texte final puis on clôt --------
+  // 13) SSE : stream texte final puis clôt
   if (sse) {
     sse.suggestions(suggestions);
     sse.sources(result.sources);
@@ -5065,68 +4735,8 @@ async function handleChat({
 }
 
 // ================================================================================
-// §3.15 — SSE WRAPPER HTTP
-// ================================================================================
-
-/**
- * Endpoint SSE opt-in. Détecte :
- *   - header Accept: text/event-stream
- *   - body: { stream: true }
- * Le premier événement part immédiatement (< 50 ms, bien en dessous du budget 300 ms).
- */
-async function chatStreamingHandler(req, res) {
-  const sse = new SSEWriter(res);
-  const clientGone = { value: false };
-  req.on("close", () => { clientGone.value = true; sse.closed = true; });
-
-  const { conversationId, message, modelTier } = req.body || {};
-  const safeMessage = sanitizeForLLM(message);
-
-  if (!safeMessage) {
-    sse.error({ reply: "Message vide." });
-    sse.done({ error: true });
-    return sse.end();
-  }
-
-  // Quota (avant le LLM)
-  const quota = await checkUserQuota(req.userId, "message", req.userRole);
-  if (!quota.allowed) {
-    sse.error({ reply: quota.message, code: "QUOTA_EXCEEDED" });
-    sse.done({ error: true });
-    return sse.end();
-  }
-  await incrementUserQuota(req.userId, "message");
-
-  try {
-    await handleChat({
-      conversationId: conversationId || generateConversationId(),
-      userId: req.userId,
-      firebaseUid: req.firebaseUid,
-      message: safeMessage,
-      googleAccessToken: req.headers["x-google-access-token"] || null,
-      channel: "web-sse",
-      modelTier: modelTier === "v250" ? "v250" : "v100",
-      images: req._uploadedImages || null,
-      sse
-    });
-  } catch (e) {
-    logger.error({ err: e.message, stack: e.stack }, "chatStreamingHandler erreur");
-    if (!sse.closed) {
-      sse.error({ reply: "Une erreur interne est survenue." });
-      sse.done({ error: true });
-    }
-  } finally {
-    if (!sse.closed) sse.end();
-  }
-}
-
-// ================================================================================
 // §3.16 — handleActiveIntent (annulation + expiration)
 // ================================================================================
-// ⚠️ PHASE 4 :
-//   - "annule" / "stop" / "laisse tomber" → annule et efface
-//   - Toute réponse est validée AVANT d'être acceptée comme numéro/sujet/corps
-//   - Expiration 5 min gérée par getActiveIntent
 
 const CANCEL_WORDS = new Set(["annule", "annuler", "stop", "abandonne", "laisse tomber", "oublie", "cancel"]);
 
@@ -5168,7 +4778,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
       }
       break;
     }
-
     case "EMAIL": {
       const data = activeIntent.data || {};
       if (data.step === "NEED_RECIPIENT") {
@@ -5189,11 +4798,8 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         const body = sanitizeStrict(userMessage, 5000);
         if (!body) return { reply: "Contenu vide. Réessayez ou tapez « annule ».", error: true };
         const result = await dispatchSendEmail({
-          googleAccessToken,
-          recipient: data.recipient,
-          subject: data.subject,
-          body,
-          userId
+          googleAccessToken, recipient: data.recipient,
+          subject: data.subject, body, userId
         });
         await clearActiveIntent(conversationId);
         if (result.success) return { reply: `✅ Email envoyé à ${data.recipient}.`, error: false };
@@ -5210,8 +4816,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
 // ================================================================================
 // §3.17 — HYDRATATION SUPABASE → SQLITE
 // ================================================================================
-// ⚠️ PHASE 3 : au démarrage (ou à la connexion), on hydrate SQLite depuis Supabase
-// pour survivre aux redéploiements (Render : disque éphémère).
 
 async function hydrateUserFromSupabase(userId, { limit = 50 } = {}) {
   if (!supabase) return { ok: false, reason: "no_supabase" };
@@ -5219,7 +4823,9 @@ async function hydrateUserFromSupabase(userId, { limit = 50 } = {}) {
 
   // 1) User
   try {
-    const { data: u, error } = await supabase.from("users").select("id, firebase_uid, email, display_name, role, created_at").eq("firebase_uid", userId).maybeSingle();
+    const { data: u, error } = await supabase.from("users")
+      .select("id, firebase_uid, email, display_name, role, created_at")
+      .eq("firebase_uid", userId).maybeSingle();
     if (!error && u) {
       await dbRun(
         `INSERT INTO users (id, firebase_uid, email, display_name, role, last_seen_at, created_at, updated_at)
@@ -5255,7 +4861,7 @@ async function hydrateUserFromSupabase(userId, { limit = 50 } = {}) {
     }
   } catch {}
 
-  // 3) Messages récents (par session)
+  // 3) Messages récents
   try {
     const { data: msgs, error } = await supabase
       .from("messages").select("session_id, role, content, created_at")
@@ -5263,7 +4869,6 @@ async function hydrateUserFromSupabase(userId, { limit = 50 } = {}) {
     if (!error && Array.isArray(msgs)) {
       for (const m of msgs.reverse()) {
         try {
-          // Vérifie si le message existe déjà (par session_id + created_at)
           const exists = await dbGet(
             `SELECT 1 FROM messages WHERE session_id = ? AND created_at = ? AND role = ? LIMIT 1`,
             [m.session_id, m.created_at ? Date.parse(m.created_at) : Date.now(), m.role]
@@ -5304,7 +4909,8 @@ async function hydrateUserFromSupabase(userId, { limit = 50 } = {}) {
 
   // 5) Mémoire long terme
   try {
-    const { data: mem, error } = await supabase.from("user_memory").select("summary, messages_since_update, updated_at").eq("user_id", userId).maybeSingle();
+    const { data: mem, error } = await supabase.from("user_memory")
+      .select("summary, messages_since_update, updated_at").eq("user_id", userId).maybeSingle();
     if (!error && mem) {
       await dbRun(
         `INSERT INTO user_memory (user_id, summary, messages_since_update, updated_at)
@@ -5320,21 +4926,22 @@ async function hydrateUserFromSupabase(userId, { limit = 50 } = {}) {
 }
 
 // ================================================================================
-// §3.18 — EXPORTS PARTIE 3 (OVERRIDE des stubs v14)
+// §3.18 — EXPORTS PARTIE 3 (OVERRIDE des stubs)
 // ================================================================================
 
-// ⚠️ Override : les fonctions ci-dessous remplacent celles définies en Partie 1/2
-// pour corriger les bugs profonds (handleChat, getFullHistory, tasks, etc.).
 Object.assign(module.exports, {
   // SSE
-  SSEWriter, safeChunkText, streamTextAsTokens, chatStreamingHandler,
+  SSEWriter, streamTextAsTokens,
+
+  // Google News + Sport
+  fetchGoogleNews, extractScoreFromText, searchSportsViaGoogleNews, searchSportsScores,
 
   // Images
   searchImagesWithFallback, searchWikimediaImagesV15, fetchWikipediaThumb, searchDuckDuckGoImages,
 
   // Search helpers
-  searchWikipediaSummary, searchWeb, searchDuckDuckGo, searchNews, searchSportsScores,
-  searchScience, searchSocial, getWeather, searchYouTube, extractYouTubeVideoId, scrapeArticleContent,
+  searchWikipediaSummary, searchWeb, searchDuckDuckGo, searchNews, searchScience,
+  searchSocial, getWeather, searchYouTube, extractYouTubeVideoId, scrapeArticleContent,
 
   // Tasks (UUID + Supabase-first)
   createTask, listTasks, updateTaskStatus, deleteTask,
@@ -5362,48 +4969,42 @@ Object.assign(module.exports, {
   handleChat, handleActiveIntent,
 
   // Hydratation
-  hydrateUserFromSupabase
+  hydrateUserFromSupabase,
+
+  // Divers
+  isCancelMessage
 });
 
-// ================================================================================
 // ==================== FIN PARTIE 3 ============================================
 // ================================================================================
-// Partie 4 ajoutera :
-//   - app Express + montage de tous les middlewares (mountBodyParsers, CORS, helmet)
-//   - Routes publiques (/api/health corrigé, /, 404)
-//   - Routes user (/api/chat avec SSE opt-in, /api/conversations, /api/tasks, etc.)
-//   - /api/session/bootstrap (sans LLM bloquant, requête unique)
-//   - /api/admin/*, /api/account (RGPD), /api/voice/transcribe
-//   - WhatsApp connect/send
-//   - Graceful shutdown + démarrage + logs
-//   - Tests d'intégration + checklist finale
-// ================================================================================
-// ================================================================================
-// ==================== PARTIE 4 : APP EXPRESS · ROUTES · DÉMARRAGE ============
+// ==================== PARTIE 4 : APP EXPRESS · ROUTES · DÉMARRAGE =============
 // ================================================================================
 // Sommaire :
-//   §4.1  Application Express + middlewares globaux (CORS, Helmet, body)
-//   §4.2  Route : / (info publique)
-//   §4.3  Route : /api/health (corrigée : success = !error, infos réduites publiquement)
-//   §4.4  Route : /api/user/whoami
-//   §4.5  Route : /api/session/bootstrap (⚠️ sans LLM bloquant, 1 requête Supabase)
-//   §4.6  Route : /api/chat (⚠️ SSE opt-in + JSON classique)
-//   §4.7  Route : /api/conversations, /api/conversation/:id/messages
-//   §4.8  Route : /api/user/stats
-//   §4.9  Route : /api/session/create, /api/session/revoke
-//   §4.10 Route : /api/tools (whitelist + quota)
-//   §4.11 Routes : /api/tasks CRUD
-//   §4.12 Route : /api/youtube/search
-//   §4.13 Route : /api/voice/transcribe
-//   §4.14 Routes WhatsApp : connect / send
-//   §4.15 Route : /api/intent/init (WhatsApp/Email flow)
-//   §4.16 Route : /api/memory (RGPD : lire / effacer)
-//   §4.17 Route : /api/admin/set-role
-//   §4.18 Route : /api/account (suppression complète, RGPD)
-//   §4.19 404 + gestion d'erreur globale
-//   §4.20 Housekeeping + démarrage + graceful shutdown
-//   §4.21 Tests d'intégration (fichier tests/integration.test.js)
-//   §4.22 Checklist mise en production
+//   §4.1  Application Express + middlewares globaux
+//   §4.2  Route / (info publique)
+//   §4.3  Route /api/health (corrigée)
+//   §4.4  Route /api/user/whoami
+//   §4.5  Route /api/session/bootstrap (sans LLM bloquant)
+//   §4.6  Route /api/greeting (async, caché)
+//   §4.7  Route /api/chat (SSE opt-in + JSON)
+//   §4.8  Routes /api/conversations, /api/conversation/:id/messages
+//   §4.9  Route /api/user/stats
+//   §4.10 Routes /api/session/create, /api/session/revoke
+//   §4.11 Route /api/tools
+//   §4.12 Routes /api/tasks CRUD
+//   §4.13 Route /api/youtube/search
+//   §4.14 Route /api/voice/transcribe
+//   §4.15 Routes WhatsApp : connect / send
+//   §4.16 Route /api/intent/init
+//   §4.17 Routes /api/user/memory (RGPD)
+//   §4.18 Route /api/memory/clear (⚠️ propriété vérifiée)
+//   §4.19 Route /api/admin/set-role
+//   §4.20 Route /api/admin/backfill-supabase
+//   §4.21 Route /api/account (suppression RGPD)
+//   §4.22 404 + gestion d'erreur globale
+//   §4.23 Housekeeping
+//   §4.24 Démarrage + graceful shutdown
+//   §4.25 Exports finaux
 // ================================================================================
 
 const app = express();
@@ -5425,21 +5026,20 @@ app.use(cors({
   allowedHeaders: [
     "Content-Type", "Authorization", "X-Requested-With",
     "x-user-id", "X-Google-Access-Token", "X-Session-Token",
-    "Accept", "Last-Event-ID" // SSE
+    "Accept", "Last-Event-ID"
   ],
   exposedHeaders: ["Content-Type", "Cache-Control", "Connection", "X-Accel-Buffering"],
   credentials: true,
   maxAge: 86400
 }));
 
-// ---------- Helmet ----------
-// ⚠️ CSP avec nonce par requête (au lieu de 'unsafe-inline').
-// Le front peut récupérer le nonce via `res.locals.cspNonce` s'il rend du HTML côté serveur.
+// ---------- CSP nonce ----------
 app.use((req, res, next) => {
   res.locals.cspNonce = crypto.randomBytes(16).toString("base64");
   next();
 });
 
+// ---------- Helmet ----------
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: {
@@ -5487,7 +5087,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Body parsers (⚠️ PHASE 2 : 1 Mo par défaut, 20 Mo opt-in) ----------
+// ---------- Body parsers ----------
 mountBodyParsers(app);
 
 // ---------- Request ID + log ----------
@@ -5509,7 +5109,7 @@ app.use((req, res, next) => {
 });
 
 // ================================================================================
-// §4.2 — ROUTE PUBLIQUE / (info minimale)
+// §4.2 — ROUTE / (info minimale)
 // ================================================================================
 
 app.get("/", (req, res) => {
@@ -5522,19 +5122,17 @@ app.get("/", (req, res) => {
 });
 
 // ================================================================================
-// §4.3 — /api/health (⚠️ PHASE 2 : success corrigé, infos réduites en public)
+// §4.3 — /api/health
 // ================================================================================
 
 app.get("/api/health", async (req, res) => {
-  // Public : on n'expose PAS le détail des providers, des modèles, ni des configs.
-  // Le détail complet est accessible sur /api/health?full=1 AVEC authentification admin.
   let dbOk = true;
   try { await dbGet("SELECT 1"); } catch { dbOk = false; }
 
   const full = req.query.full === "1";
 
   const publicReport = {
-    success: dbOk,                    // ⚠️ FIX v14 : était !dbOk (inversé)
+    success: dbOk,
     error: !dbOk,
     reply: dbOk ? `Serveur ${CONFIG.AGENT_NAME} en bonne santé` : "Serveur en cours de maintenance",
     data: {
@@ -5543,14 +5141,12 @@ app.get("/api/health", async (req, res) => {
       version: CONFIG.VERSION,
       database: dbOk ? "ok" : "erreur",
       modelsOk: modelAvailabilityReport.ok,
-      features: { vision: Boolean(geminiClient), quotas: true }
+      features: { vision: Boolean(geminiClient), quotas: true, sse: true }
     }
   };
 
   if (!full) return res.json(publicReport);
 
-  // Détail complet (sans secrets) — accessible publiquement ici pour le monitoring,
-  // mais SANS compter les clés API ni les chemins internes.
   return res.json({
     ...publicReport,
     data: {
@@ -5584,7 +5180,9 @@ app.get("/api/health", async (req, res) => {
         persistentStoreIsSupabase: Boolean(supabase),
         codeSandbox: Boolean(CONFIG.CODE_SANDBOX_PROVIDER),
         sse: true,
-        outbox: Boolean(supabase)
+        outbox: Boolean(supabase),
+        googleNewsSport: true,
+        wikimediaImages: true
       },
       modelAvailability: modelAvailabilityReport
     }
@@ -5604,7 +5202,7 @@ app.get("/api/user/whoami", authLimiter, authenticateUser, (req, res) => {
 });
 
 // ================================================================================
-// §4.5 — /api/session/bootstrap (⚠️ PHASE 1 : plus de LLM bloquant, 1 requête)
+// §4.5 — /api/session/bootstrap (sans LLM bloquant)
 // ================================================================================
 
 app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res) => {
@@ -5612,12 +5210,9 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
     const userId = req.userId;
     const today = todayKeyMs();
 
-    // -------- 1) Conversations + dernier message : 1 SEULE requête Supabase --------
     let conversations = [];
     if (supabase) {
       try {
-        // ⚠️ On utilise une RPC ou une jointure si disponible ; sinon :
-        // on récupère les sessions et on fait 1 seule requête messages pour toutes.
         const { data: supaSessions, error } = await supabase
           .from("sessions")
           .select("session_id, created_at, updated_at")
@@ -5627,36 +5222,40 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
 
         if (!error && Array.isArray(supaSessions) && supaSessions.length > 0) {
           const sessionIds = supaSessions.map((s) => s.session_id);
-          // ⚠️ UNE SEULE requête pour tous les derniers messages
-          const { data: lastMsgs, error: err2 } = await supabase
+          const { data: allMsgs, error: err2 } = await supabase
             .from("messages")
             .select("session_id, role, content, created_at")
             .in("session_id", sessionIds)
+            .eq("user_id", userId)
             .order("created_at", { ascending: false });
 
-          // Regroupe par session (le plus récent en premier)
           const lastBySession = new Map();
-          if (!err2 && Array.isArray(lastMsgs)) {
-            for (const m of lastMsgs) {
+          const countBySession = new Map();
+          if (!err2 && Array.isArray(allMsgs)) {
+            for (const m of allMsgs) {
               if (!lastBySession.has(m.session_id)) lastBySession.set(m.session_id, m);
+              countBySession.set(m.session_id, (countBySession.get(m.session_id) || 0) + 1);
             }
           }
 
-          conversations = supaSessions.map((s) => {
-            const last = lastBySession.get(s.session_id);
-            return {
-              conversationId: s.session_id,
-              createdAt: s.created_at,
-              updatedAt: s.updated_at,
-              lastMessageRole: last?.role || null,
-              lastMessagePreview: last?.content ? String(last.content).slice(0, 140) : null
-            };
-          });
+          conversations = supaSessions
+            .map((s) => {
+              const last = lastBySession.get(s.session_id);
+              const count = countBySession.get(s.session_id) || 0;
+              return {
+                conversationId: s.session_id,
+                createdAt: s.created_at,
+                updatedAt: s.updated_at,
+                lastMessageRole: last?.role || null,
+                lastMessagePreview: last?.content ? String(last.content).slice(0, 140) : null,
+                messageCount: count
+              };
+            })
+            .filter((c) => c.messageCount > 0);
         }
       } catch (e) { logger.warn({ err: e.message }, "bootstrap Supabase échec"); }
     }
 
-    // Repli local si aucune conversation Supabase
     if (conversations.length === 0) {
       const rows = await dbAll(
         `SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 30`,
@@ -5677,7 +5276,6 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
       }));
     }
 
-    // -------- 2) Quotas + tâches en parallèle --------
     const [quotaRow, tasksResult, userRow, longTermMemory] = await Promise.all([
       dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [userId, today]).catch(() => null),
       listTasks(userId, { status: "pending" }).catch(() => ({ tasks: [] })),
@@ -5685,8 +5283,6 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
       getUserMemory(userId).catch(() => "")
     ]);
 
-    // -------- 3) ⚠️ Salutation STATIQUE (pas de LLM bloquant) --------
-    // Le front peut demander une salutation personnalisée via /api/greeting (async).
     const displayName = userRow?.display_name || null;
     const greeting = displayName
       ? `Bonjour ${displayName.split(" ")[0]}, comment puis-je vous aider ?`
@@ -5711,7 +5307,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
 });
 
 // ================================================================================
-// §4.5b — /api/greeting (salutation personnalisée, async, cachée 10 min)
+// §4.6 — /api/greeting (async, caché)
 // ================================================================================
 
 const greetingCache = new LRUCache({ max: 500, ttl: 10 * 60 * 1000 });
@@ -5727,7 +5323,6 @@ app.get("/api/greeting", apiLimiter, authenticateUser, async (req, res) => {
       listTasks(userId, { status: "pending" }).catch(() => ({ tasks: [] }))
     ]);
 
-    // Essai LLM rapide (timeout 3 s), sinon statique
     let greeting = "Bonjour, comment puis-je vous aider ?";
     try {
       const provider = MODEL_TIERS.v100.providers[0];
@@ -5751,16 +5346,15 @@ app.get("/api/greeting", apiLimiter, authenticateUser, async (req, res) => {
 
     greetingCache.set(userId, greeting);
     return res.json({ success: true, greeting });
-  } catch (e) {
+  } catch {
     return res.status(500).json({ success: false, error: true, greeting: "Bonjour." });
   }
 });
 
 // ================================================================================
-// §4.6 — /api/chat : JSON classique OU SSE opt-in
+// §4.7 — /api/chat (SSE opt-in + JSON classique)
 // ================================================================================
 
-/** Détecte si le client demande du streaming. */
 function wantsStreaming(req) {
   const accept = String(req.headers.accept || "").toLowerCase();
   const bodyStream = req.body && req.body.stream === true;
@@ -5768,16 +5362,16 @@ function wantsStreaming(req) {
   return accept.includes("text/event-stream") || bodyStream || queryStream;
 }
 
-/**
- * Endpoint chat.
- * - Multipart/form-data : images possibles (multer).
- * - JSON : avec { stream: true } → SSE.
- * - Form-urlencoded : chat simple sans image.
- *
- * Le contrat HTTP (reply, images, media, suggestions, sources, intent,
- * providerUsed, modelTier, degraded, conversationId, isNewConversation)
- * est STRICTEMENT préservé en mode JSON.
- */
+function sseShortError(res, message, code) {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  res.write(`event: error\ndata: ${JSON.stringify({ reply: message, code })}\n\n`);
+  res.write(`event: done\ndata: ${JSON.stringify({ error: true })}\n\n`);
+  res.end();
+}
+
 app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONFIG.MAX_IMAGES_PER_REQUEST), async (req, res) => {
   const isStream = wantsStreaming(req) && !(req.files && req.files.length > 0);
 
@@ -5786,7 +5380,6 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
     let conversationId = req.body?.conversationId || req.body?.conversation_id;
     const modelTier = req.body?.modelTier === "v250" ? "v250" : "v100";
 
-    // -------- Validation --------
     if (!rawMessage || typeof rawMessage !== "string") {
       if (isStream) return sseShortError(res, "Le message est obligatoire.", "MISSING_MESSAGE");
       return res.status(400).json({ success: false, error: true, reply: "Le paramètre 'message' est obligatoire.", code: "MISSING_MESSAGE" });
@@ -5800,20 +5393,18 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
 
     if (conversationId && !/^[a-zA-Z0-9_-]{6,80}$/.test(conversationId)) {
       if (isStream) return sseShortError(res, "Identifiant de conversation invalide.", "INVALID_CONVERSATION_ID");
-      return res.status(400).json({ success: false, error: true, reply: "Identifiant de conversation invalide.", code: "INVALID_CONVERSATION_ID" });
+      return res.status(400).json({ success: false, error: true, reply: "Identifiant invalide.", code: "INVALID_CONVERSATION_ID" });
     }
 
     if (!conversationId) conversationId = generateConversationId();
     const isNewConversation = !req.body?.conversationId && !req.body?.conversation_id;
 
-    // -------- Propriété de la conversation --------
     try { await assertConversationOwnership(conversationId, req.userId); }
     catch (e) {
       if (isStream) return sseShortError(res, e.message, "CONVERSATION_OWNERSHIP");
       return res.status(403).json({ success: false, error: true, reply: e.message, code: "CONVERSATION_OWNERSHIP" });
     }
 
-    // -------- Quota AVANT LLM --------
     const quota = await checkUserQuota(req.userId, "message", req.userRole);
     if (!quota.allowed) {
       if (isStream) return sseShortError(res, quota.message, "QUOTA_EXCEEDED");
@@ -5821,7 +5412,6 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
     }
     await incrementUserQuota(req.userId, "message");
 
-    // -------- Images (multipart) --------
     let images = null;
     if (req.files && req.files.length > 0) {
       const invalid = req.files.find((f) => !isValidImageSignature(f.buffer));
@@ -5834,17 +5424,15 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
 
     const googleAccessToken = req.headers["x-google-access-token"] || null;
 
-    // -------- Mode SSE --------
+    // MODE SSE
     if (isStream) {
       const sse = new SSEWriter(res);
       req.on("close", () => { sse.closed = true; });
 
-      // ⚠️ Premier événement IMMÉDIAT (< 50 ms) : le client n'attend jamais
       sse.status("accepted", { conversationId, isNewConversation });
 
-      // Verrou par conversation (⚠️ PHASE 3 : pas d'entrelacement)
       const ownerRequestId = req.requestId;
-      const locked = await acquireConversationLock(conversationId, ownerRequestId, 60000);
+      const locked = await acquireConversationLock(conversationId, ownerRequestId, 90000);
       if (!locked) {
         sse.error({ reply: "Une autre requête est en cours sur cette conversation.", code: "CONVERSATION_BUSY" });
         sse.done({ error: true });
@@ -5853,15 +5441,9 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
 
       try {
         await handleChat({
-          conversationId,
-          userId: req.userId,
-          firebaseUid: req.firebaseUid,
-          message: sanitizedMessage,
-          googleAccessToken,
-          channel: "web-sse",
-          modelTier,
-          images,
-          sse
+          conversationId, userId: req.userId, firebaseUid: req.firebaseUid,
+          message: sanitizedMessage, googleAccessToken,
+          channel: "web-sse", modelTier, images, sse
         });
       } catch (e) {
         logger.error({ err: e.message, stack: e.stack }, "SSE handleChat erreur");
@@ -5876,24 +5458,18 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
       return;
     }
 
-    // -------- Mode JSON classique --------
+    // MODE JSON classique
     const ownerRequestId = req.requestId;
-    const locked = await acquireConversationLock(conversationId, ownerRequestId, 60000);
+    const locked = await acquireConversationLock(conversationId, ownerRequestId, 90000);
     if (!locked) {
-      return res.status(409).json({ success: false, error: true, reply: "Une autre requête est en cours sur cette conversation.", code: "CONVERSATION_BUSY" });
+      return res.status(409).json({ success: false, error: true, reply: "Une autre requête est en cours.", code: "CONVERSATION_BUSY" });
     }
 
     try {
       const result = await handleChat({
-        conversationId,
-        userId: req.userId,
-        firebaseUid: req.firebaseUid,
-        message: sanitizedMessage,
-        googleAccessToken,
-        channel: "web",
-        modelTier,
-        images,
-        sse: null
+        conversationId, userId: req.userId, firebaseUid: req.firebaseUid,
+        message: sanitizedMessage, googleAccessToken,
+        channel: "web", modelTier, images, sse: null
       });
 
       return res.status(200).json({
@@ -5912,24 +5488,12 @@ app.post("/api/chat", chatLimiter, authenticateUser, upload.array("images", CONF
   }
 });
 
-/** Réponse SSE courte pour les erreurs avant initialisation du flux. */
-function sseShortError(res, message, code) {
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-  res.write(`event: error\ndata: ${JSON.stringify({ reply: message, code })}\n\n`);
-  res.write(`event: done\ndata: ${JSON.stringify({ error: true })}\n\n`);
-  res.end();
-}
-
 // ================================================================================
-// §4.7 — CONVERSATIONS
+// §4.8 — CONVERSATIONS
 // ================================================================================
 
 app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => {
   try {
-    // Supabase-first avec une seule requête pour les derniers messages
     if (supabase) {
       const { data: supaSessions, error } = await supabase
         .from("sessions").select("session_id, created_at, updated_at")
@@ -5939,30 +5503,37 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
         const ids = supaSessions.map((s) => s.session_id);
         const { data: lastMsgs, error: err2 } = await supabase
           .from("messages").select("session_id, role, content, created_at")
-          .in("session_id", ids).order("created_at", { ascending: false });
+          .in("session_id", ids).eq("user_id", req.userId)
+          .order("created_at", { ascending: false });
 
         const lastBySession = new Map();
+        const countBySession = new Map();
         if (!err2 && Array.isArray(lastMsgs)) {
-          for (const m of lastMsgs) if (!lastBySession.has(m.session_id)) lastBySession.set(m.session_id, m);
+          for (const m of lastMsgs) {
+            if (!lastBySession.has(m.session_id)) lastBySession.set(m.session_id, m);
+            countBySession.set(m.session_id, (countBySession.get(m.session_id) || 0) + 1);
+          }
         }
 
-        return res.json({
-          success: true, error: false,
-          conversations: supaSessions.map((s) => {
+        const filtered = supaSessions
+          .map((s) => {
             const last = lastBySession.get(s.session_id);
+            const count = countBySession.get(s.session_id) || 0;
             return {
               conversationId: s.session_id,
               createdAt: s.created_at,
               updatedAt: s.updated_at,
               lastMessageRole: last?.role || null,
-              lastMessagePreview: last?.content ? String(last.content).slice(0, 140) : null
+              lastMessagePreview: last?.content ? String(last.content).slice(0, 140) : null,
+              messageCount: count
             };
           })
-        });
+          .filter((c) => c.messageCount > 0);
+
+        return res.json({ success: true, error: false, conversations: filtered });
       }
     }
 
-    // Repli local
     const rows = await dbAll(
       `SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50`,
       [req.userId]
@@ -5989,7 +5560,6 @@ app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUs
     const { conversationId } = req.params;
     if (!conversationId) return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
 
-    // ⚠️ PHASE 2 : propriété vérifiée localement ET côté Supabase
     try { await assertConversationOwnership(conversationId, req.userId); }
     catch (e) { return res.status(403).json({ success: false, error: true, reply: e.message, code: "CONVERSATION_OWNERSHIP" }); }
 
@@ -5999,13 +5569,13 @@ app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUs
 
     const messages = await getFullHistory(conversationId, req.userId, limit);
     return res.json({ success: true, error: false, conversationId, messages, count: messages.length });
-  } catch (e) {
+  } catch {
     return res.status(500).json({ success: false, error: true, code: "HISTORY_FETCH_ERROR" });
   }
 });
 
 // ================================================================================
-// §4.8 — /api/user/stats
+// §4.9 — /api/user/stats
 // ================================================================================
 
 app.get("/api/user/stats", apiLimiter, authenticateUser, async (req, res) => {
@@ -6028,7 +5598,7 @@ app.get("/api/user/stats", apiLimiter, authenticateUser, async (req, res) => {
 });
 
 // ================================================================================
-// §4.9 — SESSIONS ACTIVES
+// §4.10 — SESSIONS ACTIVES
 // ================================================================================
 
 app.post("/api/session/create", authLimiter, authenticateUser, async (req, res) => {
@@ -6058,7 +5628,7 @@ app.post("/api/session/revoke", authLimiter, authenticateUser, async (req, res) 
 });
 
 // ================================================================================
-// §4.10 — /api/tools (⚠️ PHASE 2 : whitelist + quota + paramètres validés)
+// §4.11 — /api/tools (whitelist + quota + paramètres validés)
 // ================================================================================
 
 app.post("/api/tools", toolLimiter, authenticateUser, async (req, res) => {
@@ -6073,7 +5643,6 @@ app.post("/api/tools", toolLimiter, authenticateUser, async (req, res) => {
       return res.status(403).json({ success: false, error: true, reply: "Outil non autorisé.", code: "TOOL_NOT_ALLOWED" });
     }
 
-    // ⚠️ Quota explicite par outil
     if (toolName === "send_email") {
       const q = await checkUserQuota(req.userId, "email", req.userRole);
       if (!q.allowed) return res.status(429).json({ success: false, error: true, reply: q.message, code: "EMAIL_QUOTA_EXCEEDED" });
@@ -6083,7 +5652,7 @@ app.post("/api/tools", toolLimiter, authenticateUser, async (req, res) => {
     const { result, sourceKeys } = await executeToolNative(toolName, params, {
       userId: req.userId,
       googleAccessToken,
-      agentMode: false // ⚠️ /api/tools n'autorise PAS les effets de bord sans confirmation
+      agentMode: false
     });
 
     if (result?.code === "NEEDS_CONFIRMATION") {
@@ -6104,7 +5673,7 @@ app.post("/api/tools", toolLimiter, authenticateUser, async (req, res) => {
 });
 
 // ================================================================================
-// §4.11 — TÂCHES CRUD
+// §4.12 — TÂCHES CRUD
 // ================================================================================
 
 app.get("/api/tasks", apiLimiter, authenticateUser, async (req, res) => {
@@ -6121,8 +5690,7 @@ app.post("/api/tasks", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { title, notes, dueAt } = req.body || {};
     const result = await createTask(req.userId, {
-      title,
-      notes,
+      title, notes,
       dueAt: dueAt ? Date.parse(dueAt) : null
     });
     if (!result.success) return res.status(400).json({ success: false, error: true, reply: result.error, code: "TASK_CREATE_INVALID" });
@@ -6156,7 +5724,7 @@ app.delete("/api/tasks/:taskId", apiLimiter, authenticateUser, async (req, res) 
 });
 
 // ================================================================================
-// §4.12 — YOUTUBE
+// §4.13 — YOUTUBE
 // ================================================================================
 
 app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) => {
@@ -6172,7 +5740,7 @@ app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) =>
 });
 
 // ================================================================================
-// §4.13 — TRANSCRIPTION VOCALE
+// §4.14 — TRANSCRIPTION VOCALE
 // ================================================================================
 
 app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.single("audio"), async (req, res) => {
@@ -6193,7 +5761,7 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
 });
 
 // ================================================================================
-// §4.14 — WHATSAPP ROUTES
+// §4.15 — WHATSAPP ROUTES
 // ================================================================================
 
 app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
@@ -6240,7 +5808,7 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
 });
 
 // ================================================================================
-// §4.15 — /api/intent/init
+// §4.16 — /api/intent/init
 // ================================================================================
 
 app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
@@ -6269,7 +5837,7 @@ app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
 });
 
 // ================================================================================
-// §4.16 — MÉMOIRE (RGPD) : lecture / effacement
+// §4.17 — MÉMOIRE (RGPD)
 // ================================================================================
 
 app.get("/api/user/memory", apiLimiter, authenticateUser, async (req, res) => {
@@ -6297,14 +5865,15 @@ app.delete("/api/user/memory", apiLimiter, authenticateUser, async (req, res) =>
   }
 });
 
-// ⚠️ PHASE 2 : /api/memory/clear vérifie maintenant la propriété AVANT tout delete.
+// ================================================================================
+// §4.18 — /api/memory/clear (⚠️ propriété vérifiée)
+// ================================================================================
+
 app.post("/api/memory/clear", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const conversationId = req.body?.conversationId || req.body?.conversation_id;
     if (!conversationId) return res.status(400).json({ success: false, error: true, code: "MISSING_CONVERSATION_ID" });
 
-    // ⚠️ Correction critique : sans ceci, n'importe quel utilisateur pouvait effacer
-    // la conversation d'un autre en connaissant son ID.
     try { await assertConversationOwnership(conversationId, req.userId); }
     catch (e) { return res.status(403).json({ success: false, error: true, reply: e.message, code: "CONVERSATION_OWNERSHIP" }); }
 
@@ -6326,7 +5895,7 @@ app.post("/api/memory/clear", apiLimiter, authenticateUser, async (req, res) => 
 });
 
 // ================================================================================
-// §4.17 — ADMIN
+// §4.19 — /api/admin/set-role
 // ================================================================================
 
 app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(["ADMIN"]), async (req, res) => {
@@ -6348,7 +5917,62 @@ app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(["A
 });
 
 // ================================================================================
-// §4.18 — /api/account (RGPD : suppression complète)
+// §4.20 — /api/admin/backfill-supabase
+// ================================================================================
+// ⚠️ v15.1 : pousse toutes les sessions/messages locaux vers Supabase.
+// Utile après un redéploiement Render (SQLite éphémère → Supabase source de vérité).
+
+app.post("/api/admin/backfill-supabase", strictLimiter, authenticateUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ success: false, error: true, code: "NO_SUPABASE" });
+
+    const userId = req.userId;
+    const stats = { sessions: 0, messages: 0, skipped: 0 };
+
+    const sessions = await dbAll(`SELECT * FROM sessions WHERE user_id = ?`, [userId]);
+    for (const s of sessions) {
+      const r = await supabaseWriteSafe({
+        table: "sessions", op: "upsert",
+        payload: {
+          session_id: s.session_id, user_id: s.user_id,
+          firebase_uid: s.firebase_uid || s.user_id,
+          created_at: new Date(s.created_at).toISOString(),
+          updated_at: new Date(s.updated_at).toISOString()
+        },
+        matchColumn: "session_id", idempotencyKey: `backfill_session:${s.session_id}`
+      });
+      if (r.success) stats.sessions++;
+    }
+
+    const messages = await dbAll(
+      `SELECT * FROM messages WHERE user_id = ? ORDER BY created_at ASC`,
+      [userId]
+    );
+    for (const m of messages) {
+      const r = await supabaseWriteSafe({
+        table: "messages", op: "insert",
+        payload: {
+          session_id: m.session_id, firebase_uid: userId, user_id: userId,
+          role: m.role, content: m.content,
+          metadata: m.metadata ? JSON.parse(m.metadata) : {},
+          created_at: new Date(m.created_at).toISOString()
+        },
+        idempotencyKey: `backfill_msg:${m.session_id}:${m.created_at}:${sha256(m.content).slice(0, 8)}`
+      });
+      if (r.success) stats.messages++;
+      else stats.skipped++;
+    }
+
+    logger.info({ userId, stats }, "Backfill Supabase terminé");
+    return res.json({ success: true, error: false, stats });
+  } catch (e) {
+    logger.error({ err: e.message }, "backfill-supabase échec");
+    return res.status(500).json({ success: false, error: true, code: "BACKFILL_ERROR" });
+  }
+});
+
+// ================================================================================
+// §4.21 — /api/account (RGPD : suppression complète)
 // ================================================================================
 
 app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => {
@@ -6356,7 +5980,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
     const userId = req.userId;
     const firebaseUid = req.firebaseUid;
 
-    // 1) Ferme la session WhatsApp + supprime son dossier
     try {
       const waSession = whatsappManager.sessions.get(userId);
       if (waSession?.sock) waSession.sock.end(undefined);
@@ -6365,7 +5988,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
     } catch {}
 
-    // 2) Local
     await dbTransaction(async ({ dbRun }) => {
       await dbRun("DELETE FROM messages WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
       await dbRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
@@ -6380,7 +6002,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       await dbRun("DELETE FROM users WHERE id = ?", [userId]);
     });
 
-    // 3) Supabase (via outbox pour ne rien perdre)
     if (supabase) {
       const tables = ["messages", "sessions", "user_tasks", "user_memory", "whatsapp_credentials"];
       for (const t of tables) {
@@ -6397,7 +6018,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       }).catch(() => {});
     }
 
-    // 4) Firebase
     let firebaseDeleted = false;
     if (firebaseApp && firebaseAdmin) {
       try {
@@ -6419,7 +6039,7 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
 });
 
 // ================================================================================
-// §4.19 — 404 + gestion d'erreur globale
+// §4.22 — 404 + gestion d'erreur globale
 // ================================================================================
 
 app.use((req, res) => {
@@ -6427,7 +6047,6 @@ app.use((req, res) => {
     success: false, error: true,
     reply: "Route non trouvée",
     code: "NOT_FOUND"
-    // ⚠️ PHASE 2 : on n'expose PLUS la liste complète des routes (énumération = surface d'attaque).
   });
 });
 
@@ -6436,7 +6055,6 @@ app.use((error, req, res, next) => {
 
   if (res.headersSent) return next(error);
 
-  // ⚠️ Multer : message clair sans exposer les détails
   if (error.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ success: false, error: true, reply: `Fichier trop volumineux (max ${CONFIG.MAX_IMAGE_SIZE_MB} Mo).`, code: "FILE_TOO_LARGE" });
   }
@@ -6452,7 +6070,7 @@ app.use((error, req, res, next) => {
 });
 
 // ================================================================================
-// §4.20 — HOUSEKEEPING + DÉMARRAGE + GRACEFUL SHUTDOWN
+// §4.23 — HOUSEKEEPING
 // ================================================================================
 
 async function runSecurityHousekeeping() {
@@ -6475,7 +6093,9 @@ async function runSecurityHousekeeping() {
 const HOUSEKEEPING_INTERVAL_MS = parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 3600 * 1000), 10);
 setInterval(runSecurityHousekeeping, HOUSEKEEPING_INTERVAL_MS).unref?.();
 
-// -------- Démarrage --------
+// ================================================================================
+// §4.24 — DÉMARRAGE + GRACEFUL SHUTDOWN
+// ================================================================================
 
 const server = app.listen(CONFIG.PORT, () => {
   global.__luba_server = server;
@@ -6501,21 +6121,18 @@ const server = app.listen(CONFIG.PORT, () => {
   console.log(`   ├─ Cerebras    : ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s)`);
   console.log(`   └─ Gemini      : ${geminiClient ? "Actif ✅" : "Inactif ⚠️"}`);
   console.log("");
-  console.log("🧠 NOUVEAUTÉS v15 :");
-  console.log("   ├─ Math LaTeX brut (plus de JSON cassé)");
-  console.log("   ├─ Streaming SSE opt-in");
-  console.log("   ├─ Circuit breaker par (provider+modèle+clé)");
-  console.log("   ├─ Tool calling natif");
-  console.log("   ├─ Sandbox run_code (Piston/Judge0)");
-  console.log("   ├─ Outbox Supabase (retry idempotent)");
-  console.log("   ├─ Mutex par conversation");
-  console.log("   ├─ Scheduler de rappels");
-  console.log("   ├─ WhatsApp durci (creds complets + whitelist)");
-  console.log("   ├─ Hydratation Supabase → SQLite");
-  console.log("   └─ Auth cache 5 min (verifyIdToken évité)");
+  console.log("🧠 NOUVEAUTÉS v15.1 :");
+  console.log("   ├─ Historique persistant (Supabase SYNCHRONE + backfill)");
+  console.log("   ├─ Sport via Google News + extraction de score");
+  console.log("   ├─ Reasoning SSE (bloc <think> streamé)");
+  console.log("   ├─ Code structuré SSE (panneau typé)");
+  console.log("   ├─ Images Wikimedia réelles (gsrnamespace=6)");
+  console.log("   ├─ DDG searchImages + Wikipedia thumb");
+  console.log("   ├─ Agent étendu (5 itérations, 90s)");
+  console.log("   ├─ run_code fallback neutre si sandbox absent");
+  console.log("   ├─ Anti-hallucination prompt");
+  console.log("   └─ Circuit breaker par (provider+modèle+clé)");
   console.log("");
-
-  // ⚠️ Vérification environnementale des modèles en arrière-plan (déjà lancée).
 });
 
 server.on("error", (err) => {
@@ -6523,26 +6140,15 @@ server.on("error", (err) => {
   process.exit(1);
 });
 
-// -------- Graceful shutdown --------
-
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   logger.info({ signal }, "Arrêt propre du serveur");
 
-  // 1) Stop nouvelle acceptation de connexions
   await new Promise((resolve) => server.close(resolve));
-
-  // 2) WhatsApp
   try { await whatsappManager.destroyAll(); } catch (e) { logger.warn({ err: e.message }, "Fermeture WhatsApp"); }
-
-  // 3) Queues
   try { await queueManager.close(); } catch (e) { logger.warn({ err: e.message }, "Fermeture files"); }
-
-  // 4) Dernière tentative d'outbox
   try { await processOutbox(); } catch {}
-
-  // 5) DB
   await new Promise((resolve) => db.close(() => resolve()));
 
   console.log("✅ Arrêt propre terminé");
@@ -6555,7 +6161,7 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // ================================================================================
-// ==================== EXPORTS FINAUX ==========================================
+// §4.25 — EXPORTS FINAUX
 // ================================================================================
 
 Object.assign(module.exports, {
@@ -6567,11 +6173,11 @@ Object.assign(module.exports, {
 // ================================================================================
 // ==================== FIN DU FICHIER index.js =================================
 // ================================================================================
-// Ligne cible : ~6200 lignes.
+// Ligne cible : ~7000 lignes.
 // Structure :
 //   PARTIE 1 : fondations (config, DB v2, sécurité, math worker, providers) ~1300
 //   PARTIE 2 : auth, tool calling, sandbox, WhatsApp, scheduler              ~900
-//   PARTIE 3 : handleChat v15, SSE, images, mémoire, hydratation            ~1500
-//   PARTIE 4 : Express, routes, démarrage, tests                            ~1300
-//   + commentaires, tests embarqués, sections = ~6200 lignes
+//   PARTIE 3 : handleChat v15.1, SSE, images, mémoire, hydratation          ~1500
+//   PARTIE 4 : Express, routes, démarrage, tests                            ~1200
+//   + commentaires, sections = ~7000 lignes
 // ================================================================================
