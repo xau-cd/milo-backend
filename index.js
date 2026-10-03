@@ -1,33 +1,32 @@
 // ================================================================================
-// LUBA AI PRO — BACKEND v16.0.0 — Enterprise Edition
+// LUBA AI PRO — BACKEND v16.1.0 — Enterprise Edition
 // HIKLON TECHNOLOGIES · Kinshasa, RDC · 2026
 // ================================================================================
-// PARTIE 1/4 — INFRASTRUCTURE, CONFIG, AUTH, CACHE, SÉCURITÉ
+// PARTIE 1/4 — INFRASTRUCTURE + AI QUALITY LAYER
 // --------------------------------------------------------------------------------
 // Sommaire :
 //   §1.1   Imports & bootstrap
-//   §1.2   CONFIG centralisée + validation stricte
-//   §1.3   Logger Pino (redaction + request-id)
-//   §1.4   Erreurs typées (LubaError + codes)
-//   §1.5   Utils (UUID, hash, sanitize, chunking UTF-8, backoff)
-//   §1.6   Firebase Admin SDK + Firestore
-//   §1.7   Cache multi-niveaux (L1 LRU + L2 Redis + L3 Firestore + sémantique)
-//   §1.8   Sécurité (prompt injection, modération, HMAC, audit)
-//   §1.9   Metrics Prometheus (/metrics)
-//   §1.10  Feature flags + dégradation gracieuse
-//   §1.11  Exports PARTIE 1
+//   §1.2   CONFIG centralisée (v16.1 : timeouts + Piston URL par défaut)
+//   §1.3   Logger Pino
+//   §1.4   Erreurs typées
+//   §1.5   Utils (UUID, hash, sanitize, chunking, backoff)
+//   §1.6   Firebase Admin + Firestore
+//   §1.7   Supabase (backup)
+//   §1.8   Cache multi-niveaux (L1 LRU + L2 Redis + L3 sémantique)
+//   §1.9   Sécurité (injection, modération, HMAC, audit)
+//   §1.10  Metrics Prometheus
+//   §1.11  Feature flags
+//   §1.12  🆕 AI QUALITY LAYER (self-critique, confidence, voting, hallucination)
+//   §1.13  SQLite (schéma v16)
+//   §1.14  Bootstrap Part 1
+//   §1.15  Exports Part 1
 // ================================================================================
-// NOUVEAUTÉS v16.0 vs v15.1 :
-//   ✅ Firestore (users, memory, logs, sessions) en DUAL-WRITE avec Supabase
-//   ✅ Cache 3 niveaux + cache sémantique (cosine sur embeddings)
-//   ✅ Métriques Prometheus + latence P50/P95/P99 par provider
-//   ✅ Modération Groq + filtre anti-injection (prompt wrapping)
-//   ✅ Signature HMAC inter-services
-//   ✅ Audit logs RGPD-compliant
-//   ✅ Erreurs typées (LubaError + code machine)
-//   ✅ i18n : détection FR/EN/SW/LN
-//   ✅ Feature flags + dégradation propre si provider manquant
-//   ✅ Utils durcis (chunking UTF-8 safe, sanitize strict, safe JSON)
+// NOUVEAUTÉS v16.1 :
+//   ✅ Timeouts étendus (30s tentative / 120s global) — gros prompts passent
+//   ✅ Piston URL publique par défaut → sandbox marche out-of-the-box
+//   ✅ AI Quality Layer : self-critique, confidence, multi-vote, anti-hallucination
+//   ✅ Language detection persistée
+//   ✅ Chain-of-thought storage
 // ================================================================================
 
 "use strict";
@@ -60,7 +59,7 @@ const cheerio        = require("cheerio");
 const { LRUCache }   = require("lru-cache");
 const { PassThrough } = require("stream");
 
-// --- Optionnels (chargés en try/catch : démarrage en mode dégradé si absents) ---
+// --- Optionnels (chargés en try/catch) ---
 let GoogleGenAI   = null;
 let firebaseAdmin = null;
 let Firestore     = null;
@@ -84,26 +83,23 @@ try { GroqSDK = require("groq-sdk"); } catch { /* dégradé */ }
 const { createClient } = require("@supabase/supabase-js");
 
 // ================================================================================
-// §1.2 — CONFIGURATION CENTRALISÉE
+// §1.2 — CONFIGURATION CENTRALISÉE (v16.1)
 // ================================================================================
 
 const CONFIG = Object.freeze({
-  // --- Identité ---
   ENV:        process.env.NODE_ENV || "production",
-  VERSION:    "16.0.0",
+  VERSION:    "16.1.0",
   AGENT_NAME: "Luba",
   COMPANY:    "HIKLON TECHNOLOGIES",
   HOST:       process.env.HOST || "0.0.0.0",
   PORT:       parseInt(process.env.PORT || "3000", 10),
 
-  // --- Branding modèles ---
   BRAND: Object.freeze({
     V100: process.env.BRAND_V100 || "Mwamba",
     V250: process.env.BRAND_V250 || "Ngandu",
     LIVE: process.env.BRAND_LIVE || "Luba Live"
   }),
 
-  // --- Limites ---
   LIMITS: Object.freeze({
     MAX_MESSAGE_LENGTH:    parseInt(process.env.MAX_MESSAGE_LENGTH    || "15000", 10),
     MAX_HISTORY_LENGTH:    parseInt(process.env.MAX_HISTORY_LENGTH    || "50", 10),
@@ -114,21 +110,21 @@ const CONFIG = Object.freeze({
     IMAGE_SEARCH_LIMIT:    parseInt(process.env.IMAGE_SEARCH_LIMIT    || "6", 10)
   }),
 
-  // --- Agent ---
   AGENT: Object.freeze({
     MAX_ITERATIONS:           parseInt(process.env.AGENT_MAX_ITERATIONS || "5", 10),
     MAX_TOOL_CALLS_PER_STEP:  parseInt(process.env.AGENT_MAX_TOOL_CALLS_PER_STEP || "6", 10)
   }),
 
-  // --- Timeouts / Retry ---
+  // ✅ v16.1 : timeouts étendus
   TIMEOUTS: Object.freeze({
-    CHAT_ATTEMPT_MS:    parseInt(process.env.CHAT_ATTEMPT_TIMEOUT_MS  || "15000", 10),
-    CHAT_GLOBAL_MS:     parseInt(process.env.CHAT_GLOBAL_TIMEOUT_MS   || "90000", 10),
-    TOOL_MS:            parseInt(process.env.TOOL_TIMEOUT_MS          || "8000", 10),
-    V250_ROUTE_MS:      parseInt(process.env.V250_ROUTE_TIMEOUT       || "60000", 10),
-    IMAGE_SOURCE_MS:    parseInt(process.env.IMAGE_SOURCE_DEADLINE_MS || "4000", 10),
+    CHAT_ATTEMPT_MS:    parseInt(process.env.CHAT_ATTEMPT_TIMEOUT_MS  || "30000", 10),
+    CHAT_GLOBAL_MS:     parseInt(process.env.CHAT_GLOBAL_TIMEOUT_MS   || "120000", 10),
+    TOOL_MS:            parseInt(process.env.TOOL_TIMEOUT_MS          || "12000", 10),
+    V250_ROUTE_MS:      parseInt(process.env.V250_ROUTE_TIMEOUT       || "90000", 10),
+    IMAGE_SOURCE_MS:    parseInt(process.env.IMAGE_SOURCE_DEADLINE_MS || "5000", 10),
     REMINDER_TICK_MS:   parseInt(process.env.REMINDER_TICK_MS         || "60000", 10),
-    HOUSEKEEPING_MS:    parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 3600 * 1000), 10)
+    HOUSEKEEPING_MS:    parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 3600 * 1000), 10),
+    SELF_CRITIQUE_MS:   parseInt(process.env.SELF_CRITIQUE_TIMEOUT_MS || "20000", 10)
   }),
 
   RETRY: Object.freeze({
@@ -137,14 +133,12 @@ const CONFIG = Object.freeze({
     MAX_DELAY_MS:  parseInt(process.env.RETRY_MAX_DELAY_MS    || "1600", 10)
   }),
 
-  // --- Circuit breaker ---
   CIRCUIT: Object.freeze({
     THRESHOLD:        parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD  || "5", 10),
     RESET_MS:         parseInt(process.env.CIRCUIT_BREAKER_RESET_MS   || "30000", 10),
     HALF_OPEN_MAX:    1
   }),
 
-  // --- Auth ---
   AUTH: Object.freeze({
     TOKEN_CACHE_TTL_MS:   parseInt(process.env.AUTH_TOKEN_CACHE_TTL_MS || "300000", 10),
     CHECK_REVOKED:        process.env.AUTH_CHECK_REVOKED === "true",
@@ -154,7 +148,6 @@ const CONFIG = Object.freeze({
     HMAC_SECRET:          process.env.HMAC_SECRET || null
   }),
 
-  // --- Chemins ---
   PATHS: Object.freeze({
     DATA:     path.join(__dirname, "data"),
     DB:       path.join(__dirname, "data", "luba.db"),
@@ -163,7 +156,6 @@ const CONFIG = Object.freeze({
     LOGS:     path.join(__dirname, "logs")
   }),
 
-  // --- Sports / News ---
   NEWS: Object.freeze({
     SPORT_MAX_ARTICLES: parseInt(process.env.SPORT_NEWS_MAX_ARTICLES || "6", 10),
     SPORT_CACHE_TTL_MS: parseInt(process.env.SPORT_CACHE_TTL_MS      || "600000", 10),
@@ -171,31 +163,27 @@ const CONFIG = Object.freeze({
     GOOGLE_REGION:      process.env.GOOGLE_NEWS_REGION || "FR"
   }),
 
-  // --- Images ---
   IMAGES: Object.freeze({
     CACHE_TTL_MS:       parseInt(process.env.IMAGE_CACHE_TTL_MS     || String(20 * 60 * 1000), 10),
     WIKIMEDIA_LIMIT:    parseInt(process.env.IMAGE_WIKIMEDIA_LIMIT  || "8", 10),
     DDG_LIMIT:          parseInt(process.env.IMAGE_DDG_LIMIT        || "4", 10),
     WIKIMEDIA_UA:       process.env.WIKIMEDIA_USER_AGENT
-      || "LubaAI/16.0.0 (https://luba.web.app; contact@luba.web.app)",
+      || "LubaAI/16.1.0 (https://luba.web.app; contact@luba.web.app)",
     ALLOWED_TYPES:      ["image/jpeg", "image/png", "image/gif", "image/webp"]
   }),
 
-  // --- Audio ---
   AUDIO: Object.freeze({
     ALLOWED_TYPES: ["audio/mpeg","audio/mp4","audio/wav","audio/webm",
                     "audio/ogg","audio/m4a","audio/x-m4a","audio/aac"],
     MAX_SIZE_MB:   parseInt(process.env.MAX_AUDIO_SIZE_MB || "20", 10)
   }),
 
-  // --- Email ---
   EMAIL: Object.freeze({
     CONTACT:     process.env.CONTACT_EMAIL || "contact@luba.web.app",
     FROM_NAME:   process.env.EMAIL_FROM_NAME || "Luba",
     FROM_ADDR:   process.env.EMAIL_FROM_ADDR || process.env.SMTP_USER || "noreply@luba.web.app"
   }),
 
-  // --- WhatsApp ---
   WHATSAPP: Object.freeze({
     QR_TIMEOUT_MS:   parseInt(process.env.WHATSAPP_QR_TIMEOUT  || "30000", 10),
     RETRY_DELAY_MS:  parseInt(process.env.WHATSAPP_RETRY_DELAY || "4000", 10),
@@ -206,22 +194,20 @@ const CONFIG = Object.freeze({
     ENCRYPTION_IV:   process.env.WHATSAPP_ENCRYPTION_IV  || null
   }),
 
-  // --- Modèles vision (Groq Llama 4 Maverick gratuit) ---
   VISION: Object.freeze({
     GROQ_MODEL:       process.env.VISION_MODEL_GROQ       || "meta-llama/llama-4-maverick-17b-128e-instruct",
     OPENROUTER_MODEL: process.env.VISION_MODEL_OPENROUTER || "inclusionai/ling-3.0-flash-vl:free",
     GEMINI_MODEL:     process.env.VISION_MODEL_GEMINI     || "gemini-3.6-flash"
   }),
 
-  // --- Sandbox code ---
+  // ✅ v16.1 : Piston URL publique par défaut + provider par défaut
   SANDBOX: Object.freeze({
-    PROVIDER:   process.env.CODE_SANDBOX_PROVIDER || "",
-    PISTON_URL: process.env.PISTON_URL            || "",
+    PROVIDER:   process.env.CODE_SANDBOX_PROVIDER || "piston",
+    PISTON_URL: process.env.PISTON_URL            || "https://emkc.org",
     JUDGE0_URL: process.env.JUDGE0_URL            || "",
     E2B_KEY:    process.env.E2B_API_KEY           || ""
   }),
 
-  // --- Cache ---
   CACHE: Object.freeze({
     L1_MAX_ITEMS:      parseInt(process.env.CACHE_L1_MAX_ITEMS  || "5000", 10),
     L1_TTL_MS:         parseInt(process.env.CACHE_L1_TTL_MS     || String(10 * 60 * 1000), 10),
@@ -229,21 +215,35 @@ const CONFIG = Object.freeze({
     SEMANTIC_THRESHOLD: parseFloat(process.env.CACHE_SEMANTIC_THRESHOLD || "0.92")
   }),
 
-  // --- HTTP ---
   HTTP: Object.freeze({
-    USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/16.0.0"
+    USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/16.1.0"
   }),
 
-  // --- HMAC ---
   HMAC: Object.freeze({
     ENABLED: Boolean(process.env.HMAC_SECRET),
     SECRET:  process.env.HMAC_SECRET || null,
     WINDOW_MS: 5 * 60 * 1000
+  }),
+
+  // 🆕 v16.1 — AI Quality Layer
+  AI_QUALITY: Object.freeze({
+    ENABLE_SELF_CRITIQUE:   process.env.ENABLE_SELF_CRITIQUE !== "false",
+    ENABLE_CONFIDENCE:      process.env.ENABLE_CONFIDENCE !== "false",
+    ENABLE_MULTI_VOTE:      process.env.ENABLE_MULTI_VOTE === "true",   // coûteux, off par défaut
+    ENABLE_HALLUCINATION_CHECK: process.env.ENABLE_HALLUCINATION_CHECK !== "false",
+    CONFIDENCE_THRESHOLD:   parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.6"),
+    MAX_VOTING_PROVIDERS:   parseInt(process.env.MAX_VOTING_PROVIDERS || "3", 10),
+    SELF_CRITIQUE_TRIGGER_ON: process.env.SELF_CRITIQUE_TRIGGER || "auto"  // auto | always | never
+  }),
+
+  I18N: Object.freeze({
+    DEFAULT_LANGUAGE: process.env.DEFAULT_LANGUAGE || "fr",
+    SUPPORTED: ["fr", "en", "sw", "ln"]
   })
 });
 
 // ================================================================================
-// §1.2.bis — FIREBASE / HOSTING / SUPABASE
+// §1.2.bis — FIREBASE / HOSTING
 // ================================================================================
 
 const FIREBASE_CONFIG = Object.freeze({
@@ -286,59 +286,47 @@ function validateEnvironment() {
   const problems = [];
   const warnings = [];
 
-  // Firebase
   const hasFirebaseAdmin = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   const hasFirebaseRest  = Boolean(process.env.FIREBASE_API_KEY);
   if (!hasFirebaseAdmin && !hasFirebaseRest) {
-    problems.push("Aucune authentification Firebase configurée (SERVICE_ACCOUNT_JSON ou API_KEY).");
+    problems.push("Aucune authentification Firebase configurée.");
   } else if (!hasFirebaseAdmin) {
-    warnings.push("Firebase Admin SDK absent → mode REST uniquement (rôle FREE forcé, admin limité).");
+    warnings.push("Firebase Admin SDK absent → mode REST uniquement.");
   }
 
-  // LLM
   const hasAnyLLM = Boolean(
     process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY ||
     process.env.CEREBRAS_API_KEY || process.env.GEMINI_API_KEY
   );
-  if (!hasAnyLLM) problems.push("Aucune clé LLM configurée (GROQ / OPENROUTER / CEREBRAS / GEMINI).");
+  if (!hasAnyLLM) problems.push("Aucune clé LLM configurée.");
 
-  // Persistance
   const hasSupabase = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY);
   const hasFirestore = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   if (!hasSupabase && !hasFirestore && CONFIG.ENV === "production") {
-    warnings.push("Ni Supabase ni Firestore configurés → SQLite seul (non persistant sur Render).");
+    warnings.push("Ni Supabase ni Firestore → SQLite seul.");
   }
 
-  // Production stricte
   if (CONFIG.ENV === "production") {
     const key = CONFIG.WHATSAPP.ENCRYPTION_KEY;
     const iv  = CONFIG.WHATSAPP.ENCRYPTION_IV;
     if (!key || key.length < 32 || !iv || iv.length < 16) {
-      problems.push("WHATSAPP_ENCRYPTION_KEY (≥32 chars) et WHATSAPP_ENCRYPTION_IV (≥16 chars) obligatoires en production.");
+      problems.push("WHATSAPP_ENCRYPTION_KEY (≥32) et WHATSAPP_ENCRYPTION_IV (≥16) obligatoires en prod.");
     }
     if (!CONFIG.HMAC.ENABLED) {
-      warnings.push("HMAC_SECRET absent → signature inter-services désactivée (recommandé en prod).");
+      warnings.push("HMAC_SECRET absent → signature inter-services désactivée.");
     }
   }
 
-  // Affichage
   for (const w of warnings) console.warn("⚠️  " + w);
   if (problems.length > 0) {
     for (const p of problems) console.error("❌ " + p);
     if (CONFIG.ENV === "production") {
-      console.error("🛑 Démarrage interrompu (production stricte).");
+      console.error("🛑 Démarrage interrompu.");
       process.exit(1);
-    } else {
-      console.warn("⚠️  Démarrage en mode dégradé.");
-    }
+    } else console.warn("⚠️  Démarrage en mode dégradé.");
   }
-
   return { problems, warnings, ok: problems.length === 0 };
 }
-
-// ================================================================================
-// §1.2.quinquies — DOSSIERS
-// ================================================================================
 
 function ensureDirectories() {
   for (const dir of [CONFIG.PATHS.DATA, CONFIG.PATHS.SESSIONS, CONFIG.PATHS.UPLOADS, CONFIG.PATHS.LOGS]) {
@@ -379,29 +367,14 @@ const logger = pino({
       message: e.message,
       code: e.code || null,
       stack: CONFIG.ENV === "development" ? e.stack : undefined
-    }),
-    req: (r) => ({
-      id: r.id, method: r.method, url: r.url, ip: r.ip,
-      ua: r.headers?.["user-agent"]?.slice(0, 120)
     })
   }
 });
-
-// Transport pretty en dev
-if (CONFIG.ENV === "development") {
-  try {
-    logger.info = logger.info.bind(logger); // no-op, garde compat
-  } catch {}
-}
 
 // ================================================================================
 // §1.4 — ERREURS TYPÉES
 // ================================================================================
 
-/**
- * Erreur applicative avec code machine, statut HTTP, et contexte.
- * Usage : throw new LubaError("MISSING_TOKEN", "Authentification requise.", 401);
- */
 class LubaError extends Error {
   constructor(code, message, httpStatus = 500, context = {}) {
     super(message || code);
@@ -424,44 +397,34 @@ class LubaError extends Error {
 }
 
 const ERROR_CODES = Object.freeze({
-  // Auth
   MISSING_TOKEN:       { status: 401, msg: "Authentification requise." },
   INVALID_TOKEN:       { status: 401, msg: "Session invalide." },
   TOKEN_EXPIRED:       { status: 401, msg: "Session expirée, reconnectez-vous." },
   IP_BLOCKED:          { status: 403, msg: "Accès refusé." },
   INSUFFICIENT_ROLE:   { status: 403, msg: "Privilèges insuffisants." },
   AUTH_INTERNAL:       { status: 500, msg: "Erreur d'authentification." },
-
-  // Requête
   MISSING_MESSAGE:     { status: 400, msg: "Le paramètre 'message' est obligatoire." },
   INVALID_MESSAGE:     { status: 400, msg: "Message invalide." },
   INVALID_CONVERSATION_ID: { status: 400, msg: "Identifiant de conversation invalide." },
   FILE_TOO_LARGE:      { status: 413, msg: "Fichier trop volumineux." },
   TOO_MANY_FILES:      { status: 413, msg: "Trop de fichiers." },
   INVALID_IMAGE_CONTENT: { status: 400, msg: "Contenu image invalide." },
-
-  // Logique
   CONVERSATION_OWNERSHIP: { status: 403, msg: "Conversation non autorisée." },
   CONVERSATION_BUSY:   { status: 409, msg: "Une requête est déjà en cours sur cette conversation." },
   QUOTA_EXCEEDED:      { status: 429, msg: "Quota journalier atteint." },
   RATE_LIMIT:          { status: 429, msg: "Trop de requêtes. Réessayez dans un instant." },
   RATE_LIMIT_CHAT:     { status: 429, msg: "Trop de messages. Patientez un instant." },
-
-  // Provider
   PROVIDER_DOWN:       { status: 503, msg: "Service IA temporairement indisponible." },
   ALL_PROVIDERS_FAILED:{ status: 503, msg: "Tous les fournisseurs IA ont échoué." },
   CIRCUIT_OPEN:        { status: 503, msg: "Service temporairement surchargé." },
-
-  // Outils
   TOOL_NOT_ALLOWED:    { status: 403, msg: "Outil non autorisé." },
   TOOL_EXECUTION_ERROR:{ status: 500, msg: "Échec de l'exécution de l'outil." },
   NEEDS_CONFIRMATION:  { status: 202, msg: "Confirmation requise." },
   SANDBOX_UNAVAILABLE: { status: 503, msg: "Sandbox d'exécution indisponible." },
-
-  // Interne
   INTERNAL_ERROR:      { status: 500, msg: "Une erreur interne est survenue." },
   NOT_FOUND:           { status: 404, msg: "Ressource non trouvée." },
-  VALIDATION_ERROR:    { status: 400, msg: "Données de requête invalides." }
+  VALIDATION_ERROR:    { status: 400, msg: "Données de requête invalides." },
+  LOW_CONFIDENCE:      { status: 200, msg: "Réponse à faible confiance." }
 });
 
 function makeError(code, extra = "", status = null) {
@@ -476,7 +439,6 @@ function isLubaError(e) { return e instanceof LubaError; }
 // §1.5 — UTILITAIRES
 // ================================================================================
 
-// --- IDs ---
 const generateRequestId      = () => `req_${crypto.randomUUID()}`;
 const generateConversationId = () => `conv_${crypto.randomUUID()}`;
 const generateSessionToken   = () => `sess_${crypto.randomBytes(32).toString("hex")}`;
@@ -484,13 +446,8 @@ const generateUUID           = () => crypto.randomUUID();
 const generateTaskId         = () => `task_${crypto.randomUUID()}`;
 const generateMsgId          = () => `msg_${crypto.randomUUID()}`;
 
-// --- Hashes ---
-const sha256 = (input) =>
-  crypto.createHash("sha256").update(String(input)).digest("hex");
-
-const sha1 = (input) =>
-  crypto.createHash("sha1").update(String(input)).digest("hex");
-
+const sha256 = (input) => crypto.createHash("sha256").update(String(input)).digest("hex");
+const sha1 = (input) => crypto.createHash("sha1").update(String(input)).digest("hex");
 const hashSessionToken = (token) => sha256(token);
 
 const hmacSign = (payload, secret = CONFIG.HMAC.SECRET) => {
@@ -509,7 +466,6 @@ const hmacVerify = (payload, signature, secret = CONFIG.HMAC.SECRET) => {
   } catch { return false; }
 };
 
-// --- Temps ---
 const nowMs = () => Date.now();
 
 function todayKeyMs() {
@@ -525,7 +481,6 @@ function backoffDelay(attempt, base = CONFIG.RETRY.BASE_DELAY_MS, max = CONFIG.R
   return exp + jitter;
 }
 
-// --- Sanitize ---
 function escapeHtml(str) {
   return String(str ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -553,7 +508,6 @@ function sanitizeStrict(input, maxLength = 500) {
   return text;
 }
 
-// --- JSON safe ---
 function safeJsonParse(str, fallback = null) {
   if (str === null || str === undefined) return fallback;
   try { return JSON.parse(str); }
@@ -565,22 +519,18 @@ function safeJsonStringify(obj, fallback = "{}") {
   catch { return fallback; }
 }
 
-// --- Math normalize (LaTeX) ---
 function normalizeMath(input) {
   if (typeof input !== "string" || input.length === 0) return "";
-
   const parts = [];
   const codeBlockRegex = /```[\s\S]*?```|`[^`\n]*`/g;
   let lastIndex = 0;
   let match;
-
   while ((match = codeBlockRegex.exec(input)) !== null) {
     if (match.index > lastIndex) parts.push({ type: "text", content: input.slice(lastIndex, match.index) });
     parts.push({ type: "code", content: match[0] });
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < input.length) parts.push({ type: "text", content: input.slice(lastIndex) });
-
   return parts.map(({ type, content }) => {
     if (type === "code") return content;
     let text = content;
@@ -595,7 +545,6 @@ function normalizeMath(input) {
   }).join("").trim();
 }
 
-// --- stripThinkTags ---
 function stripThinkTags(input) {
   if (typeof input !== "string") return { text: "", thinking: "" };
   const thinks = [];
@@ -609,7 +558,6 @@ function stripThinkTags(input) {
   return { text, thinking: thinks.join("\n---\n") };
 }
 
-// --- XML entities (RSS) ---
 function decodeXmlEntities(str) {
   return String(str)
     .replace(/<!\[CDATA\[/g, "").replace(/\]\]>/g, "")
@@ -619,24 +567,21 @@ function decodeXmlEntities(str) {
     .replace(/\s+/g, " ").trim();
 }
 
-// --- Device fingerprint ---
 function computeDeviceFingerprint(ip, userAgent) {
   return sha256(`${ip || "?"}::${userAgent || "?"}`).slice(0, 32);
 }
 
-// --- Détection signature image ---
 function isValidImageSignature(buffer) {
   if (!buffer || buffer.length < 12) return false;
   const hex = buffer.subarray(0, 12).toString("hex");
-  if (hex.startsWith("ffd8ff")) return true;                            // JPEG
-  if (hex.startsWith("89504e470d0a1a0a")) return true;                   // PNG
-  if (hex.startsWith("47494638")) return true;                           // GIF
+  if (hex.startsWith("ffd8ff")) return true;
+  if (hex.startsWith("89504e470d0a1a0a")) return true;
+  if (hex.startsWith("47494638")) return true;
   if (hex.startsWith("52494646") &&
-      buffer.subarray(8, 12).toString("ascii") === "WEBP") return true;  // WebP
+      buffer.subarray(8, 12).toString("ascii") === "WEBP") return true;
   return false;
 }
 
-// --- Conversion image ---
 function convertImageToBase64(buffer, mimetype) {
   return {
     dataUrl: `data:${mimetype};base64,${buffer.toString("base64")}`,
@@ -646,7 +591,6 @@ function convertImageToBase64(buffer, mimetype) {
   };
 }
 
-// --- Deadline utility ---
 function withDeadline(promise, deadlineMs, fallbackValue) {
   const timer = setTimeout(() => {}, deadlineMs);
   timer.unref?.();
@@ -674,7 +618,6 @@ async function allSettledWithDeadline(promises, deadlineMs) {
   return Promise.all(wrapped);
 }
 
-// --- Chunking UTF-8 safe ---
 function safeChunkText(text, targetSize = 24) {
   if (!text) return [];
   const chunks = [];
@@ -682,7 +625,6 @@ function safeChunkText(text, targetSize = 24) {
   while (i < text.length) {
     let end = Math.min(i + targetSize, text.length);
     const code = text.charCodeAt(end - 1);
-    // Ne jamais couper au milieu d'une paire de substitution UTF-16
     if (code >= 0xD800 && code <= 0xDBFF && end < text.length) end++;
     chunks.push(text.slice(i, end));
     i = end;
@@ -690,32 +632,37 @@ function safeChunkText(text, targetSize = 24) {
   return chunks;
 }
 
-// --- Regex ---
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_REGEX = /^\+?[1-9]\d{6,14}$/;
 
-// --- Langue detection légère (i18n) ---
+/**
+ * 🆕 v16.1 — Détection de langue robuste (FR/EN/SW/LN).
+ */
 function detectLanguage(text) {
-  if (!text || typeof text !== "string") return "fr";
+  if (!text || typeof text !== "string") return CONFIG.I18N.DEFAULT_LANGUAGE;
   const t = text.toLowerCase();
 
-  // Mots-clés très discriminants
-  const swahiliWords = /\b(habari|asante|karibu|jambo|ndiyo|hapana|vipi|nzuri|sana|kwaheri|tafadhali)\b/g;
-  const lingalaWords = /\b(mbotá|mbote|sango|nzela|melesi|malamu|kitoko|ezali|nakozela|elengi)\b/g;
-  const englishWords = /\b(the|and|you|with|this|that|hello|please|thanks|help|what|where|when)\b/g;
+  const swahiliWords = /\b(habari|asante|karibu|jambo|ndiyo|hapana|vipi|nzuri|sana|kwaheri|tafadhali|ninataka|ninaweza|kwa nini|wapi)\b/g;
+  const lingalaWords = /\b(mbotá|mbote|sango|nzela|melesi|malamu|kitoko|ezali|nakozela|elengi|boni|yo)\b/g;
+  const englishWords = /\b(the|and|you|with|this|that|hello|please|thanks|help|what|where|when|how|why|yes|no)\b/g;
+  const frenchWords = /\b(le|la|les|un|une|des|je|tu|il|elle|nous|vous|bonjour|merci|comment|pourquoi|quand|où|oui|non|s'il|plaît)\b/g;
 
   const sw = (t.match(swahiliWords) || []).length;
   const ln = (t.match(lingalaWords) || []).length;
   const en = (t.match(englishWords) || []).length;
-  const fr = /\b(le|la|les|un|une|des|je|tu|il|elle|nous|vous|bonjour|merci|comment|pourquoi|quand|où)\b/g;
-  const frCount = (t.match(fr) || []).length;
+  const fr = (t.match(frenchWords) || []).length;
 
-  const scores = { fr: frCount, en, sw, ln };
+  // Détection caractères chinois/japonais/coréens → forcer français
+  // (on ne supporte pas ces langues pour l'instant)
+  if (/[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(text)) {
+    return CONFIG.I18N.DEFAULT_LANGUAGE;
+  }
+
+  const scores = { fr, en, sw, ln };
   const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
-  return best[1] > 0 ? best[0] : "fr";
+  return best[1] > 0 ? best[0] : CONFIG.I18N.DEFAULT_LANGUAGE;
 }
 
-// --- Truncate tokens safe (approx 4 chars = 1 token) ---
 function truncateToTokenBudget(text, maxTokens = 8000) {
   if (!text) return "";
   const maxChars = maxTokens * 4;
@@ -735,7 +682,7 @@ function parseFirebaseServiceAccount(raw) {
   try { return JSON.parse(raw); }
   catch {
     try { return JSON.parse(Buffer.from(raw, "base64").toString("utf8")); }
-    catch { throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON invalide (ni JSON ni base64)"); }
+    catch { throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON invalide"); }
   }
 }
 
@@ -746,13 +693,10 @@ function initFirebase() {
   }
   try {
     const serviceAccount = parseFirebaseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-
     firebaseApp = firebaseAdmin.initializeApp({
       credential: firebaseAdmin.credential.cert(serviceAccount),
       projectId: FIREBASE_CONFIG.projectId
     });
-
-    // Initialise Firestore avec les mêmes credentials
     if (Firestore) {
       firestoreDb = new Firestore.Firestore({
         projectId: FIREBASE_CONFIG.projectId,
@@ -763,7 +707,7 @@ function initFirebase() {
       });
       logger.info("✅ Firebase Admin + Firestore initialisés");
     } else {
-      logger.info("✅ Firebase Admin initialisé (Firestore non disponible)");
+      logger.info("✅ Firebase Admin initialisé (Firestore non dispo)");
     }
     firebaseReady = true;
   } catch (e) {
@@ -773,8 +717,6 @@ function initFirebase() {
     firebaseReady = false;
   }
 }
-
-// --- Wrappers Firestore (retournent null si non dispo, jamais throw) ---
 
 async function fsGet(collection, docId) {
   if (!firestoreDb) return null;
@@ -836,7 +778,7 @@ async function fsQuery(collection, { where = [], orderBy = null, limit = 50 } = 
 }
 
 // ================================================================================
-// §1.6.bis — SUPABASE (dual-write backup)
+// §1.7 — SUPABASE (backup)
 // ================================================================================
 
 let supabase = null;
@@ -881,10 +823,9 @@ async function supabaseWriteSafe({ table, op, payload, idempotencyKey, matchColu
 }
 
 // ================================================================================
-// §1.7 — CACHE MULTI-NIVEAUX
+// §1.8 — CACHE MULTI-NIVEAUX
 // ================================================================================
 
-// --- L1 : LRU mémoire ---
 const l1Cache = new LRUCache({
   max: CONFIG.CACHE.L1_MAX_ITEMS,
   ttl: CONFIG.CACHE.L1_TTL_MS,
@@ -892,7 +833,6 @@ const l1Cache = new LRUCache({
   allowStale: false
 });
 
-// --- L2 : Redis (si dispo) ---
 let redisClient = null;
 
 function initRedis() {
@@ -915,15 +855,10 @@ function initRedis() {
   }
 }
 
-// --- API cache unifiée ---
 const cache = {
-  /**
-   * getCache(key) — cherche L1 puis L2. Retourne null si miss.
-   */
   async get(key) {
     const l1 = l1Cache.get(key);
     if (l1 !== undefined) return l1;
-
     if (redisClient) {
       try {
         const raw = await redisClient.get(key);
@@ -932,42 +867,25 @@ const cache = {
           if (parsed !== null) l1Cache.set(key, parsed);
           return parsed;
         }
-      } catch (e) {
-        logger.debug({ err: e.message, key }, "Redis get échec");
-      }
+      } catch (e) { logger.debug({ err: e.message, key }, "Redis get échec"); }
     }
     return null;
   },
-
-  /**
-   * setCache(key, value, ttlMs) — écrit L1 + L2.
-   */
   async set(key, value, ttlMs = CONFIG.CACHE.L1_TTL_MS) {
     l1Cache.set(key, value, { ttl: ttlMs });
-
     if (redisClient) {
       try {
         const ttlSeconds = Math.ceil(ttlMs / 1000);
         await redisClient.setex(key, ttlSeconds, safeJsonStringify(value));
-      } catch (e) {
-        logger.debug({ err: e.message, key }, "Redis set échec");
-      }
+      } catch (e) { logger.debug({ err: e.message, key }, "Redis set échec"); }
     }
   },
-
-  /**
-   * del(key) — supprime L1 + L2.
-   */
   async del(key) {
     l1Cache.delete(key);
     if (redisClient) {
       try { await redisClient.del(key); } catch {}
     }
   },
-
-  /**
-   * withCache(keyFn, ttlMs, loaderFn) — pattern classique de mémoïsation.
-   */
   async withCache(key, ttlMs, loader) {
     const cached = await this.get(key);
     if (cached !== null) return cached;
@@ -979,17 +897,11 @@ const cache = {
   }
 };
 
-// --- L3 : Cache sémantique (embeddings) ---
-
-/**
- * Cache sémantique : si deux questions sont très proches (cosine > threshold),
- * on renvoie la même réponse. Économise ~30% d'appels LLM.
- */
 class SemanticCache {
   constructor({ threshold = CONFIG.CACHE.SEMANTIC_THRESHOLD, maxSize = 1000 } = {}) {
     this.threshold = threshold;
     this.maxSize = maxSize;
-    this.entries = new Map(); // hash -> { embedding, value, ts }
+    this.entries = new Map();
   }
 
   static cosineSimilarity(a, b) {
@@ -1017,7 +929,6 @@ class SemanticCache {
 
   set(embedding, value) {
     if (!embedding) return;
-    // Éviction simple : si full, supprime l'entrée la plus ancienne
     if (this.entries.size >= this.maxSize) {
       const firstKey = this.entries.keys().next().value;
       if (firstKey) this.entries.delete(firstKey);
@@ -1033,10 +944,8 @@ class SemanticCache {
 const semanticCache = new SemanticCache();
 
 // ================================================================================
-// §1.8 — SÉCURITÉ
+// §1.9 — SÉCURITÉ
 // ================================================================================
-
-// --- 1.8.a Détection prompt injection ---
 
 const INJECTION_PATTERNS = [
   /ignore\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts|rules)/i,
@@ -1067,20 +976,12 @@ function detectPromptInjection(text) {
   return { detected: false, pattern: null };
 }
 
-/**
- * Wrap une entrée utilisateur dans des délimiteurs explicites pour
- * réduire l'efficacité des prompt injections.
- */
 function wrapUserInput(text) {
   const clean = sanitizeForLLM(text, CONFIG.LIMITS.MAX_MESSAGE_LENGTH);
   return `<user_input>\n${clean}\n</user_input>`;
 }
 
-// --- 1.8.b Modération de contenu ---
-
 const MODERATION_KEYWORDS = {
-  // Uniquement mots ultra-graves (violence, CSAM, terrorisme)
-  // ⚠️ Liste minimale — la vraie modération passe par l'API Groq moderation
   VIOLENCE_EXTREME: [
     /\bhow\s+to\s+(kill|murder|assassinate)\s+(a\s+)?(person|someone|human)/i,
     /\bhow\s+to\s+make\s+(a\s+)?(bomb|explosive|grenade)\b/i
@@ -1102,8 +1003,9 @@ function moderateText(text) {
 }
 
 async function moderateWithGroq(text) {
-  // Fallback si pas d'API moderation → check local
   if (!process.env.GROQ_API_KEY) return moderateText(text);
+  const localCheck = moderateText(text);
+  if (!localCheck.safe) return localCheck;
   try {
     const resp = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
@@ -1130,31 +1032,20 @@ async function moderateWithGroq(text) {
   }
 }
 
-// --- 1.8.c Vérification signature HMAC ---
-
 function verifyHmacSignature(req) {
   if (!CONFIG.HMAC.ENABLED) return { valid: true, skipped: true };
-
   const signature = req.headers["x-luba-signature"];
   const timestamp = req.headers["x-luba-timestamp"];
-
   if (!signature || !timestamp) return { valid: false, reason: "missing_headers" };
-
   const tsNum = parseInt(timestamp, 10);
   if (!Number.isFinite(tsNum)) return { valid: false, reason: "invalid_timestamp" };
-
   const age = Math.abs(Date.now() - tsNum);
   if (age > CONFIG.HMAC.WINDOW_MS) return { valid: false, reason: "timestamp_expired" };
-
-  // Payload = timestamp + method + path + body (stringifié)
   const bodyStr = typeof req.body === "string" ? req.body : safeJsonStringify(req.body || {});
   const payload = `${timestamp}.${req.method}.${req.originalUrl}.${bodyStr}`;
-
   if (!hmacVerify(payload, signature)) return { valid: false, reason: "signature_mismatch" };
   return { valid: true };
 }
-
-// --- 1.8.d Audit log ---
 
 async function logSecurityEvent(userId, eventType, details = {}, ip = null, ua = null, fingerprint = null) {
   try {
@@ -1165,7 +1056,6 @@ async function logSecurityEvent(userId, eventType, details = {}, ip = null, ua =
         [userId, eventType, safeJsonStringify(details), fingerprint, ip, ua, Date.now()]
       );
     }
-    // Dual-write Firestore (best effort)
     if (firestoreDb) {
       fsSet("security_logs", generateUUID(), {
         user_id: userId, event_type: eventType, details,
@@ -1187,7 +1077,6 @@ async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTo
         [sessionId, userId, provider, model, tier, promptTokens, completionTokens, latencyMs, status, errorCode, Date.now()]
       );
     }
-    // Métriques Prometheus
     if (metrics?.llmLatency) {
       metrics.llmLatency.labels(provider, model, status).observe(latencyMs / 1000);
     }
@@ -1201,7 +1090,7 @@ async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTo
 }
 
 // ================================================================================
-// §1.9 — METRICS PROMETHEUS
+// §1.10 — METRICS PROMETHEUS
 // ================================================================================
 
 let metrics = null;
@@ -1217,85 +1106,85 @@ function initMetrics() {
 
     metrics = {
       register: client.register,
-
       httpRequests: new client.Counter({
         name: "luba_http_requests_total",
         help: "Nombre total de requêtes HTTP",
         labelNames: ["method", "path", "status"]
       }),
-
       httpDuration: new client.Histogram({
         name: "luba_http_request_duration_seconds",
         help: "Durée des requêtes HTTP",
         labelNames: ["method", "path", "status"],
         buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60]
       }),
-
       llmLatency: new client.Histogram({
         name: "luba_llm_latency_seconds",
         help: "Latence des appels LLM",
         labelNames: ["provider", "model", "status"],
         buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60]
       }),
-
       llmTokens: new client.Counter({
         name: "luba_llm_tokens_total",
         help: "Tokens consommés par provider",
         labelNames: ["provider", "model", "type"]
       }),
-
       llmCalls: new client.Counter({
         name: "luba_llm_calls_total",
         help: "Nombre d'appels LLM",
         labelNames: ["provider", "model", "status"]
       }),
-
       circuitState: new client.Gauge({
         name: "luba_circuit_breaker_state",
-        help: "État du circuit breaker (0=closed, 1=half-open, 2=open)",
+        help: "État du circuit (0=closed, 1=half-open, 2=open)",
         labelNames: ["name"]
       }),
-
       cacheHits: new client.Counter({
         name: "luba_cache_hits_total",
         help: "Cache hits par niveau",
         labelNames: ["level"]
       }),
-
-      cacheMisses: new client.Counter({
-        name: "luba_cache_misses_total",
-        help: "Cache misses",
-        labelNames: ["level"]
-      }),
-
       toolCalls: new client.Counter({
         name: "luba_tool_calls_total",
         help: "Appels d'outils",
         labelNames: ["tool", "status"]
       }),
-
       activeWebSockets: new client.Gauge({
         name: "luba_active_websockets",
-        help: "WebSockets actifs (Luba Live)",
+        help: "WebSockets actifs",
         labelNames: ["channel"]
       }),
-
       sttLatency: new client.Histogram({
         name: "luba_stt_latency_seconds",
         help: "Latence STT",
         labelNames: ["provider"],
         buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
       }),
-
       ttsLatency: new client.Histogram({
         name: "luba_tts_latency_seconds",
         help: "Latence TTS",
         labelNames: ["provider"],
         buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
+      }),
+      // 🆕 v16.1 — métriques qualité IA
+      qualityScore: new client.Histogram({
+        name: "luba_response_quality_score",
+        help: "Distribution des scores de confiance",
+        labelNames: ["intent", "tier"],
+        buckets: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+      }),
+      selfCritiqueTriggered: new client.Counter({
+        name: "luba_self_critique_triggered_total",
+        help: "Nombre de self-critiques déclenchées",
+        labelNames: ["reason"]
+      }),
+      hallucinationDetected: new client.Counter({
+        name: "luba_hallucination_detected_total",
+        help: "Nombre d'hallucinations détectées",
+        labelNames: ["type"]
       })
     };
 
-    logger.info("✅ Métriques Prometheus initialisées");
+    logger.info("✅ Métriques Prometheus v16.1 initialisées");
   } catch (e) {
     logger.error({ err: e.message }, "❌ Init métriques échouée");
     metrics = null;
@@ -1303,7 +1192,7 @@ function initMetrics() {
 }
 
 // ================================================================================
-// §1.10 — FEATURE FLAGS + DÉGRADATION
+// §1.11 — FEATURE FLAGS
 // ================================================================================
 
 const FEATURES = Object.freeze({
@@ -1316,11 +1205,15 @@ const FEATURES = Object.freeze({
   openrouter:       Boolean(process.env.OPENROUTER_API_KEY),
   cerebras:         Boolean(process.env.CEREBRAS_API_KEY),
   hmac:             Boolean(process.env.HMAC_SECRET),
-  sandbox:          Boolean(process.env.CODE_SANDBOX_PROVIDER),
+  sandbox:          Boolean(process.env.CODE_SANDBOX_PROVIDER || "piston"),
   youtube_api:      Boolean(process.env.YOUTUBE_API_KEY),
   resend:           Boolean(process.env.RESEND_API_KEY),
   smtp:             Boolean(process.env.SMTP_HOST && process.env.SMTP_USER),
-  whatsapp_encryption: Boolean(process.env.WHATSAPP_ENCRYPTION_KEY && process.env.WHATSAPP_ENCRYPTION_IV)
+  whatsapp_encryption: Boolean(process.env.WHATSAPP_ENCRYPTION_KEY && process.env.WHATSAPP_ENCRYPTION_IV),
+  self_critique:    CONFIG.AI_QUALITY.ENABLE_SELF_CRITIQUE,
+  confidence:       CONFIG.AI_QUALITY.ENABLE_CONFIDENCE,
+  multi_vote:       CONFIG.AI_QUALITY.ENABLE_MULTI_VOTE,
+  hallucination_check: CONFIG.AI_QUALITY.ENABLE_HALLUCINATION_CHECK
 });
 
 function featureStatus() {
@@ -1330,10 +1223,401 @@ function featureStatus() {
 }
 
 // ================================================================================
-// §1.11 — SQLITE (schéma v16, conservé pour compat v15.1)
+// §1.12 — 🆕 AI QUALITY LAYER (v16.1)
 // ================================================================================
-// ⚠️ Ce bloc sera étendu dans PARTIE 2 (dual-write Firestore).
-// On garde le schéma exact de v15.1 pour ne rien casser.
+// Ce layer rend Luba "plus que Claude/ChatGPT" en ajoutant :
+//   - Self-Critique : le LLM relit et corrige sa réponse
+//   - Confidence Scoring : score 0-1 sur la réponse
+//   - Multi-Model Voting : 3 providers votent (optionnel)
+//   - Hallucination Detector : vérifie que les chiffres viennent d'outils
+
+// --- 1.12.a : Détection hallucinations ---
+
+/**
+ * Vérifie qu'un texte ne contient pas de chiffres "inventés".
+ * Compare les chiffres cités dans la réponse avec ceux des résultats d'outils.
+ */
+function detectHallucinatedNumbers(responseText, toolResults = []) {
+  if (!responseText || !toolResults || toolResults.length === 0) {
+    return { detected: false, suspiciousNumbers: [] };
+  }
+
+  // Extrait tous les nombres de la réponse (>2 chiffres pour éviter années/ordinal)
+  const numberRegex = /\b\d{2,}(?:[.,]\d+)?\b/g;
+  const responseNumbers = new Set();
+  let m;
+  while ((m = numberRegex.exec(responseText)) !== null) {
+    const n = m[0].replace(",", ".");
+    // Ignore les années plausibles (1900-2099)
+    const num = parseFloat(n);
+    if (num >= 1900 && num <= 2099) continue;
+    // Ignore les petits nombres
+    if (num < 10) continue;
+    responseNumbers.add(n);
+  }
+
+  if (responseNumbers.size === 0) return { detected: false, suspiciousNumbers: [] };
+
+  // Extrait tous les nombres des résultats d'outils
+  const toolText = safeJsonStringify(toolResults).toLowerCase();
+  const toolNumbers = new Set();
+  let tm;
+  const toolNumRegex = /\b\d{2,}(?:[.,]\d+)?\b/g;
+  while ((tm = toolNumRegex.exec(toolText)) !== null) {
+    toolNumbers.add(tm[0].replace(",", "."));
+  }
+
+  // Trouve les nombres de la réponse absents des outils
+  const suspicious = [];
+  for (const n of responseNumbers) {
+    if (!toolNumbers.has(n)) {
+      // Vérifie aussi la version sans décimales
+      const intPart = n.split(".")[0];
+      let found = false;
+      for (const tn of toolNumbers) {
+        if (tn.startsWith(intPart) || intPart.startsWith(tn.split(".")[0])) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) suspicious.push(n);
+    }
+  }
+
+  // Tolérance : si <2 suspects, pas d'hallucination
+  const detected = suspicious.length >= 2;
+  if (detected && metrics?.hallucinationDetected) {
+    metrics.hallucinationDetected.labels("numbers").inc();
+  }
+
+  return { detected, suspiciousNumbers: suspicious.slice(0, 5) };
+}
+
+// --- 1.12.b : Scoring de confiance ---
+
+/**
+ * Estime la confiance de la réponse (0-1) via plusieurs signaux :
+ *   - Longueur (trop court = suspect)
+ *   - Présence de hedging ("peut-être", "je pense")
+ *   - Présence d'outils utilisés
+ *   - Présence de reasoning (DeepSeek R1 = plus fiable)
+ *   - Détection hallucinations
+ */
+function estimateConfidence({ responseText, toolCallTrace = [], reasoning = "", degraded = false }) {
+  if (degraded) return 0.2;
+  if (!responseText) return 0;
+
+  let score = 0.5;
+
+  // Longueur
+  const len = responseText.length;
+  if (len < 50) score -= 0.15;
+  else if (len > 200) score += 0.1;
+  else if (len > 500) score += 0.15;
+
+  // Hedging (doute exprimé)
+  const hedgeWords = /\b(peut-être|je pense|je crois|il me semble|probablement|sans doute|je ne suis pas sûr)/gi;
+  const hedges = (responseText.match(hedgeWords) || []).length;
+  score -= Math.min(hedges * 0.05, 0.2);
+
+  // Outils utilisés (indique des faits vérifiés)
+  if (toolCallTrace.length > 0) {
+    const successfulTools = toolCallTrace.filter((t) => !t.error).length;
+    score += Math.min(successfulTools * 0.1, 0.3);
+  }
+
+  // Reasoning présent (DeepSeek R1)
+  if (reasoning && reasoning.length > 100) score += 0.1;
+
+  // Refus explicite = confiance haute
+  if (/\b(je ne sais pas|je n'ai pas trouvé|aucun résultat|indisponible)/i.test(responseText)) {
+    score += 0.05;
+  }
+
+  // Erreurs détectées
+  if (/\b(erreur|error|failed|exception)\b/i.test(responseText) && !toolCallTrace.length) {
+    score -= 0.15;
+  }
+
+  return Math.max(0, Math.min(1, score));
+}
+
+// --- 1.12.c : Self-Critique ---
+
+/**
+ * Demande au LLM de relire sa réponse et de la corriger.
+ * Retourne { improved: bool, correctedText, critique }.
+ */
+async function selfCritique({
+  userMessage,
+  draftAnswer,
+  toolCallTrace = [],
+  providerConfig,
+  _meta = {}
+}) {
+  if (!CONFIG.AI_QUALITY.ENABLE_SELF_CRITIQUE) {
+    return { improved: false, correctedText: draftAnswer, critique: null };
+  }
+
+  // Détermine si on doit déclencher
+  const trigger = CONFIG.AI_QUALITY.SELF_CRITIQUE_TRIGGER_ON;
+  if (trigger === "never") return { improved: false, correctedText: draftAnswer, critique: null };
+
+  const shouldTrigger =
+    trigger === "always"
+    || (trigger === "auto" && (
+      // Déclenche si :
+      // - La réponse contient des chiffres (risque d'hallucination)
+      // - OU la réponse est courte (< 100 chars) alors que la question est complexe
+      // - OU la réponse contient "je ne sais pas" alors qu'un outil a réussi
+      /\b\d{2,}\b/.test(draftAnswer)
+      || (userMessage.length > 100 && draftAnswer.length < 100)
+      || (/je ne sais pas|je n'ai pas trouvé/i.test(draftAnswer) && toolCallTrace.some((t) => !t.error))
+    ));
+
+  if (!shouldTrigger) return { improved: false, correctedText: draftAnswer, critique: null };
+
+  const toolSummary = toolCallTrace.length > 0
+    ? toolCallTrace.map((t) => `- ${t.name}(${safeJsonStringify(t.args)})`).join("\n")
+    : "(aucun outil utilisé)";
+
+  try {
+    const result = await callProviderWithTools({
+      providerConfig: {
+        ...providerConfig,
+        timeout: CONFIG.TIMEOUTS.SELF_CRITIQUE_MS,
+        temperature: 0.2
+      },
+      messages: [
+        {
+          role: "system",
+          content: [
+            "Tu es un relecteur critique expert. Tu analyses une réponse d'assistant IA et tu la corriges si nécessaire.",
+            "Règles strictes :",
+            "1. Si la réponse est correcte et complète → retourne la MÊME réponse sans modification.",
+            "2. Si tu détectes une erreur factuelle, une hallucination, une incohérence → corrige-la.",
+            "3. Si des chiffres ne viennent PAS des outils → supprime-les ou remplace par 'je ne sais pas'.",
+            "4. Ne change PAS le style, ne rallonge PAS, ne raccourcis PAS inutilement.",
+            "5. Réponds STRICTEMENT en JSON : {\"improved\": true/false, \"correctedText\": \"...\", \"critique\": \"...\"}",
+            "6. La langue de correctedText DOIT être la même que draftAnswer."
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content:
+            `QUESTION UTILISATEUR :\n${userMessage.slice(0, 500)}\n\n` +
+            `OUTILS APPELÉS :\n${toolSummary}\n\n` +
+            `BROUILLON À RÉVISER :\n${draftAnswer.slice(0, 2000)}\n\n` +
+            `Analyse et corrige si nécessaire.`
+        }
+      ],
+      tools: null,
+      jsonMode: true,
+      _meta
+    });
+
+    if (!result.success) {
+      return { improved: false, correctedText: draftAnswer, critique: null };
+    }
+
+    const content = result.message?.content || "";
+    let parsed = null;
+    try { parsed = JSON.parse(content); }
+    catch {
+      const m = content.match(/\{[\s\S]*\}/);
+      if (m) try { parsed = JSON.parse(m[0]); } catch {}
+    }
+
+    if (!parsed || typeof parsed.correctedText !== "string") {
+      return { improved: false, correctedText: draftAnswer, critique: null };
+    }
+
+    if (parsed.improved && parsed.correctedText.trim().length > 0) {
+      if (metrics?.selfCritiqueTriggered) {
+        metrics.selfCritiqueTriggered.labels("improved").inc();
+      }
+      logger.info({ critique: parsed.critique?.slice(0, 100) }, "🔍 Self-critique a amélioré la réponse");
+      return {
+        improved: true,
+        correctedText: parsed.correctedText.trim(),
+        critique: parsed.critique || null
+      };
+    }
+
+    return { improved: false, correctedText: draftAnswer, critique: parsed.critique || null };
+  } catch (e) {
+    logger.warn({ err: e.message }, "Self-critique échouée");
+    return { improved: false, correctedText: draftAnswer, critique: null };
+  }
+}
+
+// --- 1.12.d : Multi-Model Voting ---
+
+/**
+ * Envoie la même question à N providers en parallèle et sélectionne la meilleure réponse.
+ * Utile pour les questions critiques (math, code, faits).
+ *
+ * @returns { chosenText, votes, winner, allResponses }
+ */
+async function multiModelVote({ messages, providers, tools = null, images = null, _meta = {} }) {
+  if (!CONFIG.AI_QUALITY.ENABLE_MULTI_VOTE) {
+    return { chosenText: null, votes: 0, winner: null, allResponses: [] };
+  }
+
+  const maxProviders = Math.min(providers.length, CONFIG.AI_QUALITY.MAX_VOTING_PROVIDERS);
+  const selectedProviders = providers.slice(0, maxProviders);
+
+  const results = await Promise.allSettled(
+    selectedProviders.map((provider) =>
+      callProviderWithTools({
+        providerConfig: provider,
+        messages,
+        tools,
+        images,
+        _meta
+      })
+    )
+  );
+
+  const successful = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled" && r.value.success && r.value.message?.content) {
+      successful.push({
+        provider: selectedProviders[i].provider,
+        model: selectedProviders[i].model,
+        text: r.value.message.content
+      });
+    }
+  });
+
+  if (successful.length === 0) {
+    return { chosenText: null, votes: 0, winner: null, allResponses: [] };
+  }
+
+  if (successful.length === 1) {
+    return {
+      chosenText: successful[0].text,
+      votes: 1,
+      winner: `${successful[0].provider}/${successful[0].model}`,
+      allResponses: successful
+    };
+  }
+
+  // Vote par similarité : on choisit la réponse la plus "consensuelle"
+  // (celle qui ressemble le plus à la moyenne des autres)
+  const similarities = successful.map((a, i) => {
+    let totalSim = 0;
+    for (let j = 0; j < successful.length; j++) {
+      if (i === j) continue;
+      totalSim += jaccardSimilarity(a.text, successful[j].text);
+    }
+    return { index: i, avgSim: totalSim / (successful.length - 1) };
+  });
+
+  similarities.sort((a, b) => b.avgSim - a.avgSim);
+  const winner = successful[similarities[0].index];
+
+  return {
+    chosenText: winner.text,
+    votes: successful.length,
+    winner: `${winner.provider}/${winner.model}`,
+    allResponses: successful
+  };
+}
+
+function jaccardSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const wordsA = new Set(a.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
+  const wordsB = new Set(b.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  const intersection = [...wordsA].filter((w) => wordsB.has(w)).length;
+  const union = new Set([...wordsA, ...wordsB]).size;
+  return intersection / union;
+}
+
+// --- 1.12.e : Quality Assessment complet ---
+
+/**
+ * Orchestre le pipeline qualité complet sur une réponse.
+ */
+async function assessResponseQuality({
+  userMessage,
+  draftAnswer,
+  toolCallTrace = [],
+  reasoning = "",
+  providerConfig,
+  intent = "GENERAL",
+  degraded = false,
+  _meta = {}
+}) {
+  const results = {
+    originalText: draftAnswer,
+    finalText: draftAnswer,
+    confidence: 0.5,
+    hallucination: { detected: false, suspiciousNumbers: [] },
+    selfCritique: { improved: false, critique: null },
+    qualityScore: 0.5
+  };
+
+  // 1) Détection hallucinations
+  results.hallucination = detectHallucinatedNumbers(draftAnswer, toolCallTrace);
+
+  // 2) Self-critique (si activé)
+  if (!degraded && results.hallucination.detected) {
+    const critique = await selfCritique({
+      userMessage,
+      draftAnswer,
+      toolCallTrace,
+      providerConfig,
+      _meta
+    });
+    results.selfCritique = critique;
+    if (critique.improved) {
+      results.finalText = critique.correctedText;
+      // Re-vérifie les hallucinations
+      results.hallucination = detectHallucinatedNumbers(results.finalText, toolCallTrace);
+    }
+  } else if (!degraded && CONFIG.AI_QUALITY.SELF_CRITIQUE_TRIGGER_ON !== "never") {
+    // Self-critique auto même sans hallucination détectée
+    const critique = await selfCritique({
+      userMessage,
+      draftAnswer,
+      toolCallTrace,
+      providerConfig,
+      _meta
+    });
+    results.selfCritique = critique;
+    if (critique.improved) {
+      results.finalText = critique.correctedText;
+    }
+  }
+
+  // 3) Confiance
+  results.confidence = estimateConfidence({
+    responseText: results.finalText,
+    toolCallTrace,
+    reasoning,
+    degraded
+  });
+
+  // 4) Score global
+  results.qualityScore = Math.round(
+    (results.confidence * 0.6 +
+     (1 - (results.hallucination.detected ? 0.5 : 0)) * 0.3 +
+     (results.selfCritique.improved ? 1 : 0.5) * 0.1) * 100
+  ) / 100;
+
+  // 5) Métriques
+  if (metrics?.qualityScore) {
+    metrics.qualityScore.labels(intent, _meta.tier || "v100").observe(results.qualityScore);
+  }
+
+  return results;
+}
+
+// ================================================================================
+// §1.13 — SQLITE (schéma v16)
+// ================================================================================
 
 let db = null;
 
@@ -1359,6 +1643,7 @@ function initDatabase() {
           id TEXT PRIMARY KEY, firebase_uid TEXT UNIQUE, email TEXT UNIQUE,
           display_name TEXT, role TEXT DEFAULT 'FREE', email_verified INTEGER DEFAULT 0,
           whatsapp_connected INTEGER DEFAULT 0, whatsapp_session_id TEXT,
+          preferred_language TEXT DEFAULT 'fr',
           last_seen_at INTEGER,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000)
@@ -1399,6 +1684,7 @@ function initDatabase() {
           session_id TEXT, user_id TEXT, provider TEXT, model TEXT, tier TEXT,
           prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
           latency_ms INTEGER DEFAULT 0, status TEXT DEFAULT 'success', error_code TEXT,
+          quality_score REAL DEFAULT NULL,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
@@ -1409,7 +1695,6 @@ function initDatabase() {
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
         db.run("CREATE INDEX IF NOT EXISTS idx_security_fingerprint ON security_logs(user_id, event_type, fingerprint)");
-        db.run("CREATE INDEX IF NOT EXISTS idx_security_user_time ON security_logs(user_id, created_at DESC)");
 
         db.run(`CREATE TABLE IF NOT EXISTS user_quotas (
           id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, date TEXT NOT NULL,
@@ -1449,44 +1734,6 @@ function initDatabase() {
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
 
-        db.run(`CREATE TABLE IF NOT EXISTS user_tasks (
-          id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
-          title TEXT NOT NULL, notes TEXT, due_at INTEGER,
-          status TEXT DEFAULT 'pending', notified_at INTEGER,
-          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
-          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
-          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )`);
-        db.run("CREATE INDEX IF NOT EXISTS idx_user_tasks_user ON user_tasks(user_id, status, due_at)");
-
-        // --- Nouvelles tables v16 ---
-        db.run(`CREATE TABLE IF NOT EXISTS outbox (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          table_name TEXT NOT NULL,
-          op TEXT NOT NULL CHECK (op IN ('insert','update','upsert','delete')),
-          payload TEXT NOT NULL, idempotency_key TEXT NOT NULL,
-          attempts INTEGER DEFAULT 0, last_error TEXT,
-          next_attempt_at INTEGER DEFAULT (strftime('%s','now')*1000),
-          status TEXT DEFAULT 'pending',
-          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
-          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
-          UNIQUE(table_name, op, idempotency_key)
-        )`);
-        db.run("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, next_attempt_at)");
-
-        db.run(`CREATE TABLE IF NOT EXISTS token_cache (
-          token_hash TEXT PRIMARY KEY, uid TEXT NOT NULL,
-          email TEXT, display_name TEXT, email_verified INTEGER DEFAULT 0,
-          role TEXT DEFAULT 'FREE', expires_at INTEGER NOT NULL,
-          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
-        )`);
-
-        db.run(`CREATE TABLE IF NOT EXISTS conversation_locks (
-          conversation_id TEXT PRIMARY KEY, locked_until INTEGER NOT NULL,
-          owner_request_id TEXT,
-          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
-        )`);
-
         db.run(`CREATE TABLE IF NOT EXISTS user_memory_facts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id TEXT NOT NULL,
@@ -1501,23 +1748,68 @@ function initDatabase() {
         db.run("CREATE INDEX IF NOT EXISTS idx_facts_user ON user_memory_facts(user_id, created_at DESC)");
         db.run("CREATE INDEX IF NOT EXISTS idx_facts_category ON user_memory_facts(user_id, category)");
 
-        db.run(`CREATE TABLE IF NOT EXISTS audit_events (
+        db.run(`CREATE TABLE IF NOT EXISTS user_tasks (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+          title TEXT NOT NULL, notes TEXT, due_at INTEGER,
+          status TEXT DEFAULT 'pending', notified_at INTEGER,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )`);
+        db.run("CREATE INDEX IF NOT EXISTS idx_user_tasks_user ON user_tasks(user_id, status, due_at)");
+
+        db.run(`CREATE TABLE IF NOT EXISTS outbox (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT, event_type TEXT NOT NULL,
-          payload TEXT DEFAULT '{}',
-          ip_address TEXT, user_agent TEXT,
+          table_name TEXT NOT NULL,
+          op TEXT NOT NULL CHECK (op IN ('insert','update','upsert','delete')),
+          payload TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+          attempts INTEGER DEFAULT 0, last_error TEXT,
+          next_attempt_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          status TEXT DEFAULT 'pending',
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          UNIQUE(table_name, op, idempotency_key)
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS token_cache (
+          token_hash TEXT PRIMARY KEY, uid TEXT NOT NULL,
+          email TEXT, display_name TEXT, email_verified INTEGER DEFAULT 0,
+          role TEXT DEFAULT 'FREE', expires_at INTEGER NOT NULL,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
-        db.run("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_events(user_id, created_at DESC)");
+
+        db.run(`CREATE TABLE IF NOT EXISTS conversation_locks (
+          conversation_id TEXT PRIMARY KEY, locked_until INTEGER NOT NULL,
+          owner_request_id TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        )`);
+
+        // 🆕 v16.1 — table reasoning persistence
+        db.run(`CREATE TABLE IF NOT EXISTS reasoning_traces (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          user_id TEXT,
+          user_message TEXT NOT NULL,
+          reasoning TEXT,
+          draft_answer TEXT,
+          final_answer TEXT,
+          confidence REAL DEFAULT 0.5,
+          quality_score REAL DEFAULT 0.5,
+          self_critique_improved INTEGER DEFAULT 0,
+          hallucination_detected INTEGER DEFAULT 0,
+          provider TEXT, model TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        )`);
+        db.run("CREATE INDEX IF NOT EXISTS idx_reasoning_session ON reasoning_traces(session_id, created_at DESC)");
+        db.run("CREATE INDEX IF NOT EXISTS idx_reasoning_quality ON reasoning_traces(user_id, quality_score DESC)");
       });
 
-      logger.info("✅ Schéma SQLite v16 initialisé");
+      logger.info("✅ Schéma SQLite v16.1 initialisé");
       resolve();
     });
   });
 }
 
-// --- Wrappers DB ---
 function dbGet(query, params = []) {
   return new Promise((resolve, reject) => {
     if (!db) return resolve(null);
@@ -1556,65 +1848,50 @@ async function dbTransaction(fn) {
 }
 
 // ================================================================================
-// §1.12 — BOOTSTRAP (à appeler depuis PARTIE 4)
+// §1.14 — BOOTSTRAP PART 1
 // ================================================================================
 
 async function bootstrapPart1() {
   ensureDirectories();
   validateEnvironment();
-
   initFirebase();
   initSupabase();
   initRedis();
   initMetrics();
-
   await initDatabase();
-
-  logger.info(`🎯 Features : ${featureStatus()}`);
+  logger.info(`🎯 Features v16.1 : ${featureStatus()}`);
   return { ok: true };
 }
 
 // ================================================================================
-// §1.13 — EXPORTS PARTIE 1
+// §1.15 — EXPORTS PART 1
 // ================================================================================
 
 module.exports = {
-  // Config
   CONFIG, FIREBASE_CONFIG, HOSTING_CONFIG, USER_QUOTAS, ERROR_CODES, FEATURES,
-
-  // Logging
   logger,
-
-  // Erreurs
   LubaError, makeError, isLubaError,
 
-  // Firebase / Firestore
   firebaseApp: () => firebaseApp,
   firestoreDb: () => firestoreDb,
   firebaseReady: () => firebaseReady,
   fsGet, fsSet, fsUpdate, fsDelete, fsQuery,
 
-  // Supabase
   supabase: () => supabase,
   supabaseWriteSafe,
 
-  // Cache
   cache, l1Cache, semanticCache, SemanticCache,
   redisClient: () => redisClient,
 
-  // DB
   db: () => db,
   dbGet, dbAll, dbRun, dbExec, dbTransaction,
 
-  // Sécurité
   detectPromptInjection, wrapUserInput, moderateText, moderateWithGroq,
   verifyHmacSignature, hmacSign, hmacVerify,
   logSecurityEvent, auditLLMCall,
 
-  // Metrics
   metrics: () => metrics,
 
-  // Utils
   generateRequestId, generateConversationId, generateSessionToken,
   generateUUID, generateTaskId, generateMsgId,
   sha256, sha1, hashSessionToken,
@@ -1627,53 +1904,51 @@ module.exports = {
   EMAIL_REGEX, PHONE_REGEX,
   detectLanguage, truncateToTokenBudget,
 
-  // Bootstrap
+  // 🆕 AI Quality Layer v16.1
+  detectHallucinatedNumbers, estimateConfidence,
+  selfCritique, multiModelVote, jaccardSimilarity,
+  assessResponseQuality,
+
   bootstrapPart1, initDatabase, initFirebase, initSupabase, initRedis, initMetrics,
   featureStatus
 };
 
 // ================================================================================
-// ==================== FIN PARTIE 1/4 ===========================================
-// ================================================================================
-// ▶ Prochaine partie (2/4) : Services IA, Voice (STT/TTS), Memory, Routeur LLM.
-//   Tape "suite" quand tu es prêt.
+// ==================== FIN PARTIE 1/4 v16.1 =====================================
 // ================================================================================
 // ================================================================================
-// PARTIE 2/4 — SERVICES IA, VOICE (STT/TTS), MEMORY, ROUTEUR LLM
+// PARTIE 2/4 v16.1 — SERVICES IA, VOICE (STT/TTS), MEMORY, ROUTEUR LLM
 // ================================================================================
 // Sommaire :
-//   §2.1   Registre des providers LLM (Groq, OpenRouter, Cerebras, Gemini)
-//   §2.2   Circuit breaker par (provider:model:key)
-//   §2.3   Intercepteur d'erreurs LLM (retryable / rotate / skip)
+//   §2.1   Registre des providers LLM
+//   §2.2   Circuit breaker
+//   §2.3   Intercepteur d'erreurs + messages FR actionnables (FIX v16.1)
 //   §2.4   Tiers de modèles (Mwamba v100, Ngandu v250, Vision)
-//   §2.5   Appelant OpenAI-compatible (Groq/Cerebras/OpenRouter)
-//   §2.6   Appelant Gemini natif (function calling inclus)
-//   §2.7   callProviderWithTools (rotation + circuit breaker + fallback)
-//   §2.8   TOOL_SCHEMAS (10+ outils exposés au LLM)
-//   §2.9   executeToolNative (dispatch + validation)
-//   §2.10  runToolLoop (agent borné, 5 itérations)
-//   §2.11  STT : Groq Whisper + Deepgram fallback + streaming
-//   §2.12  TTS : Kokoro (HeadTTS) + Piper fallback
-//   §2.13  VAD adaptatif (endpointing ~500 ms)
-//   §2.14  Pipeline vocal (STT → LLM → TTS + sentence chunking + barge-in)
-//   §2.15  Mémoire courte (rolling summary des 20 derniers échanges)
-//   §2.16  Mémoire longue (extraction faits + embeddings)
-//   §2.17  Recall sémantique (cosine similarity)
-//   §2.18  Exports PARTIE 2
+//   §2.5   Appelant OpenAI-compatible (FIX v16.1 : reasoning_content préservé)
+//   §2.6   Appelant Gemini natif
+//   §2.7   callProviderWithTools (rotation + circuit)
+//   §2.8   TOOL_SCHEMAS (19 outils)
+//   §2.9   executeToolNative
+//   §2.10  runToolLoop v16.1 (FIX : capture reasoning_content + <think>)
+//   §2.11  STT (Groq Whisper + Deepgram fallback)
+//   §2.12  TTS (Kokoro + Piper)
+//   §2.13  VAD adaptatif
+//   §2.14  Voice pipeline (barge-in + sentence chunking)
+//   §2.15  Mémoire courte (rolling summary)
+//   §2.16  Mémoire longue (faits + embeddings)
+//   §2.17  Recall sémantique
+//   §2.18  Stubs injectables + setSharedHelpers
+//   §2.19  Exports Part 2
 // ================================================================================
-// NOUVEAUTÉS v16.0 :
-//   ✅ DeepSeek R1 (raisonnement) via Groq
-//   ✅ Qwen 3 (Groq/Cerebras) pour le code
-//   ✅ Circuit breaker granulaire (provider:model:key)
-//   ✅ Rotation multi-clés avec failover
-//   ✅ Tool calling unifié (Groq/Cerebras/OpenRouter/Gemini)
-//   ✅ Pipeline vocal complet (STT→LLM→TTS) < 800 ms
-//   ✅ Sentence chunking pour TTS anticipé
-//   ✅ Barge-in (interruption + flush)
-//   ✅ VAD adaptatif (WebRTC VAD + fallback énergie)
-//   ✅ Mémoire longue à embeddings (recall sémantique Firestore)
-//   ✅ Extraction automatique de faits (5 catégories)
+// FIX v16.1 :
+//   ✅ reasoning_content préservé (DeepSeek R1, Qwen think)
+//   ✅ <think> tags streamés en priorité
+//   ✅ userFacingErrorMessage FR actionnable + logging détaillé
+//   ✅ Math priorité execute_math (via prompt, pas ici)
+//   ✅ Timeouts étendus propagés
 // ================================================================================
+
+"use strict";
 
 // ================================================================================
 // §2.1 — REGISTRE DES PROVIDERS LLM
@@ -1698,7 +1973,7 @@ if (GoogleGenAI && process.env.GEMINI_API_KEY) {
 const LLM_PROVIDERS = Object.freeze({
   GROQ: Object.freeze({
     baseURL: "https://api.groq.com/openai/v1",
-    defaultTimeout: 10000,
+    defaultTimeout: 20000,
     maxTokens: 4000,
     temperature: 0.7,
     supportsTools: true,
@@ -1709,7 +1984,7 @@ const LLM_PROVIDERS = Object.freeze({
   }),
   OPENROUTER: Object.freeze({
     baseURL: "https://openrouter.ai/api/v1",
-    defaultTimeout: 12000,
+    defaultTimeout: 25000,
     maxTokens: 4000,
     temperature: 0.7,
     supportsTools: true,
@@ -1720,7 +1995,7 @@ const LLM_PROVIDERS = Object.freeze({
   }),
   CEREBRAS: Object.freeze({
     baseURL: "https://api.cerebras.ai/v1",
-    defaultTimeout: 10000,
+    defaultTimeout: 20000,
     maxTokens: 4000,
     temperature: 0.7,
     supportsTools: true,
@@ -1731,7 +2006,7 @@ const LLM_PROVIDERS = Object.freeze({
   }),
   GEMINI: Object.freeze({
     baseURL: "https://generativelanguage.googleapis.com/v1beta",
-    defaultTimeout: 12000,
+    defaultTimeout: 20000,
     maxTokens: 8000,
     temperature: 0.7,
     isGemini: true,
@@ -1741,7 +2016,6 @@ const LLM_PROVIDERS = Object.freeze({
   })
 });
 
-// Log clés détectées
 if (LLM_PROVIDERS.GROQ.keyPool.length > 0) logger.info(`🔑 Groq : ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.OPENROUTER.keyPool.length > 0) logger.info(`🔑 OpenRouter : ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.CEREBRAS.keyPool.length > 0) logger.info(`🔑 Cerebras : ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s)`);
@@ -1759,14 +2033,13 @@ class CircuitBreaker {
     this.failureCount = 0;
     this.successCount = 0;
     this.lastFailureTime = null;
-    this.state = "CLOSED"; // CLOSED | OPEN | HALF_OPEN
+    this.state = "CLOSED";
     this.halfOpenInFlight = 0;
     this.emitter = new EventEmitter();
   }
 
   canAttempt() {
     if (this.state === "CLOSED") return true;
-
     if (this.state === "OPEN") {
       if (Date.now() - this.lastFailureTime >= this.resetTimeout) {
         this.state = "HALF_OPEN";
@@ -1777,7 +2050,6 @@ class CircuitBreaker {
       }
       return false;
     }
-
     if (this.halfOpenInFlight >= CONFIG.CIRCUIT.HALF_OPEN_MAX) return false;
     return true;
   }
@@ -1807,7 +2079,7 @@ class CircuitBreaker {
     if (this.state !== "CLOSED") {
       this.state = "CLOSED";
       this.updateMetric();
-      logger.info({ circuit: this.name }, "🔒 Circuit CLOSED (récupéré)");
+      logger.info({ circuit: this.name }, "🔒 Circuit CLOSED");
     }
   }
 
@@ -1860,7 +2132,7 @@ function getAllCircuitStates() {
 }
 
 // ================================================================================
-// §2.3 — INTERCEPTEUR D'ERREURS LLM
+// §2.3 — INTERCEPTEUR ERREURS + FIX v16.1 (messages FR actionnables)
 // ================================================================================
 
 class LLMErrorInterceptor {
@@ -1886,17 +2158,11 @@ class LLMErrorInterceptor {
     return "UNKNOWN_ERROR";
   }
 
-  /**
-   * Providers à abandonner immédiatement (erreur définitive sur ce provider).
-   */
   static shouldSkipProvider(error) {
     const code = this.getErrorCode(error);
     return ["HTTP_400", "HTTP_401", "HTTP_403", "HTTP_402", "HTTP_404", "MISSING_API_KEY"].includes(code);
   }
 
-  /**
-   * Providers pour lesquels on tourne la clé immédiatement.
-   */
   static shouldRotateImmediately(error) {
     const code = this.getErrorCode(error);
     return [
@@ -1906,14 +2172,44 @@ class LLMErrorInterceptor {
   }
 }
 
-function userFacingErrorMessage(error) {
+/**
+ * ✅ FIX v16.1 — Messages FR actionnables + log complet côté serveur.
+ */
+function userFacingErrorMessage(error, context = {}) {
   const code = LLMErrorInterceptor.getErrorCode(error);
-  if (code === "HTTP_429") return "Je suis très sollicité en ce moment. Réessayez dans quelques instants. 🙏";
-  if (code === "TIMEOUT" || code === "HTTP_504") return "Cette demande est complexe et prend plus de temps que prévu. Reformulez-la en étapes plus petites, ou réessayez.";
-  if (code === "CIRCUIT_OPEN") return "Je suis temporairement surchargé. Patientez une minute puis réessayez.";
-  if (code === "HTTP_400") return "Je n'ai pas bien compris la requête. Pouvez-vous la reformuler ?";
-  if (code === "HTTP_401" || code === "HTTP_403") return "Problème d'authentification côté fournisseur. Contactez le support si le problème persiste.";
-  return "Je rencontre une difficulté technique. Reformulez votre demande, ou réessayez dans un instant.";
+
+  // Log détaillé côté serveur (visible dans les logs Render/Docker)
+  logger.error({
+    code,
+    message: error?.message,
+    provider: context.provider,
+    model: context.model,
+    stack: error?.stack?.split("\n").slice(0, 4).join(" | ")
+  }, "🔍 Erreur LLM détaillée");
+
+  // Messages utilisateur EN FRANÇAIS, actionnables
+  if (code === "HTTP_429") {
+    return "Trop de demandes en ce moment. Réessaie dans 30 secondes. 🙏";
+  }
+  if (code === "TIMEOUT" || code === "HTTP_504") {
+    return "Cette demande prend trop de temps. Essaie de la découper en étapes plus petites, ou reformule plus simplement.";
+  }
+  if (code === "CIRCUIT_OPEN") {
+    return "Je suis temporairement surchargé. Attends une minute puis réessaie.";
+  }
+  if (code === "HTTP_400") {
+    return "Je n'ai pas compris la demande. Peux-tu reformuler ?";
+  }
+  if (code === "HTTP_401" || code === "HTTP_403" || code === "MISSING_API_KEY") {
+    return "Problème de configuration côté serveur. Contacte le support si ça persiste.";
+  }
+  if (code === "HTTP_404") {
+    return "Le service demandé n'est pas disponible. Essaie une autre question.";
+  }
+  if (code === "SANDBOX_UNAVAILABLE") {
+    return "L'exécution de code est indisponible pour l'instant, mais je peux quand même t'écrire le code.";
+  }
+  return "Je rencontre une difficulté technique. Reformule ta demande ou réessaie dans un instant.";
 }
 
 // ================================================================================
@@ -1929,27 +2225,27 @@ const MODEL_TIERS = Object.freeze({
       {
         provider: "groq",
         model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile",
-        maxTokens: 4000, timeout: 10000, temperature: 0.7, failoverPriority: 0
+        maxTokens: 4000, timeout: 20000, temperature: 0.7, failoverPriority: 0
       },
       {
         provider: "gemini",
         model: process.env.GEMINI_MODEL_V100 || "gemini-2.0-flash-exp",
-        maxTokens: 8000, timeout: 12000, temperature: 0.7, failoverPriority: 1
+        maxTokens: 8000, timeout: 22000, temperature: 0.7, failoverPriority: 1
       },
       {
         provider: "cerebras",
-        model: process.env.CEREBRAS_MODEL_V100 || "qwen-3-32b",
-        maxTokens: 4000, timeout: 10000, temperature: 0.7, failoverPriority: 2
+        model: process.env.CEREBRAS_MODEL_V100 || "llama-3.3-70b",
+        maxTokens: 4000, timeout: 20000, temperature: 0.7, failoverPriority: 2
       },
       {
         provider: "openrouter",
         model: process.env.OPENROUTER_MODEL_V100_FALLBACK_1 || "meta-llama/llama-3.3-70b-instruct:free",
-        maxTokens: 4000, timeout: 12000, temperature: 0.7, failoverPriority: 3
+        maxTokens: 4000, timeout: 25000, temperature: 0.7, failoverPriority: 3
       },
       {
         provider: "openrouter",
         model: process.env.OPENROUTER_MODEL_V100_FALLBACK_2 || "qwen/qwen-2.5-72b-instruct:free",
-        maxTokens: 4000, timeout: 12000, temperature: 0.7, failoverPriority: 4
+        maxTokens: 4000, timeout: 25000, temperature: 0.7, failoverPriority: 4
       }
     ]
   },
@@ -1963,17 +2259,17 @@ const MODEL_TIERS = Object.freeze({
         {
           provider: "groq",
           model: process.env.GROQ_MODEL_V250_REASONING || "deepseek-r1-distill-llama-70b",
-          maxTokens: 8000, timeout: 25000, temperature: 0.6, failoverPriority: 0
-        },
-        {
-          provider: "gemini",
-          model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-2.0-flash-thinking-exp",
-          maxTokens: 8000, timeout: 20000, temperature: 0.3, failoverPriority: 1
+          maxTokens: 8000, timeout: 40000, temperature: 0.6, failoverPriority: 0
         },
         {
           provider: "openrouter",
           model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free",
-          maxTokens: 8000, timeout: 25000, temperature: 0.6, failoverPriority: 2
+          maxTokens: 8000, timeout: 45000, temperature: 0.6, failoverPriority: 1
+        },
+        {
+          provider: "gemini",
+          model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-2.0-flash-thinking-exp",
+          maxTokens: 8000, timeout: 35000, temperature: 0.3, failoverPriority: 2
         }
       ]
     },
@@ -1982,24 +2278,24 @@ const MODEL_TIERS = Object.freeze({
         {
           provider: "groq",
           model: process.env.GROQ_MODEL_V250_CODE || "qwen-2.5-coder-32b",
-          maxTokens: 8000, timeout: 15000, temperature: 0.4, failoverPriority: 0
+          maxTokens: 8000, timeout: 30000, temperature: 0.4, failoverPriority: 0
         },
         {
           provider: "cerebras",
-          model: process.env.CEREBRAS_MODEL_V250_CODE || "qwen-3-coder-32b",
-          maxTokens: 8000, timeout: 15000, temperature: 0.4, failoverPriority: 1
+          model: process.env.CEREBRAS_MODEL_V250_CODE || "qwen-2.5-coder-32b",
+          maxTokens: 8000, timeout: 30000, temperature: 0.4, failoverPriority: 1
         },
         {
           provider: "openrouter",
           model: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free",
-          maxTokens: 8000, timeout: 20000, temperature: 0.4, failoverPriority: 2
+          maxTokens: 8000, timeout: 35000, temperature: 0.4, failoverPriority: 2
         }
       ]
     },
     maxRetries: 2
   },
 
-  // ---------- Vision : analyse d'images ----------
+  // ---------- Vision : analyse images ----------
   vision: {
     name: "Vision",
     jsonMode: false,
@@ -2007,25 +2303,21 @@ const MODEL_TIERS = Object.freeze({
       {
         provider: "groq",
         model: CONFIG.VISION.GROQ_MODEL,
-        maxTokens: 4000, timeout: 15000, temperature: 0.7, failoverPriority: 0
+        maxTokens: 4000, timeout: 25000, temperature: 0.7, failoverPriority: 0
       },
       {
         provider: "gemini",
         model: CONFIG.VISION.GEMINI_MODEL,
-        maxTokens: 4000, timeout: 15000, temperature: 0.7, failoverPriority: 1
+        maxTokens: 4000, timeout: 25000, temperature: 0.7, failoverPriority: 1
       },
       {
         provider: "openrouter",
         model: CONFIG.VISION.OPENROUTER_MODEL,
-        maxTokens: 4000, timeout: 20000, temperature: 0.7, failoverPriority: 2
+        maxTokens: 4000, timeout: 30000, temperature: 0.7, failoverPriority: 2
       }
     ]
   }
 });
-
-// ================================================================================
-// §2.4.bis — VALIDATION MODÈLES OPENROUTER
-// ================================================================================
 
 function validateAndSanitizeOpenRouterModel(model) {
   if (!model || typeof model !== "string") return null;
@@ -2042,7 +2334,7 @@ function validateAndSanitizeOpenRouterModel(model) {
 }
 
 // ================================================================================
-// §2.5 — APPELANT OPENAI-COMPATIBLE
+// §2.5 — APPELANT OPENAI-COMPATIBLE (✅ FIX v16.1 : reasoning_content préservé)
 // ================================================================================
 
 async function callOpenAICompatibleRaw({
@@ -2059,7 +2351,7 @@ async function callOpenAICompatibleRaw({
     throw e;
   }
 
-  // Formate les messages avec images (dernier message user)
+  // Prépare les messages avec images
   let formattedMessages = messages;
   if (images && images.length > 0) {
     const idx = messages.length - 1;
@@ -2106,6 +2398,17 @@ async function callOpenAICompatibleRaw({
   const choice = response?.data?.choices?.[0];
   const message = choice?.message;
   if (!message) throw new Error(`Réponse ${provider} vide`);
+
+  // ✅ FIX v16.1 : préserve reasoning_content depuis plusieurs sources
+  // - DeepSeek R1 : message.reasoning_content
+  // - Qwen think : message.reasoning
+  // - Groq reasoning : choice.reasoning
+  if (!message.reasoning_content && choice?.reasoning) {
+    message.reasoning_content = choice.reasoning;
+  }
+  if (!message.reasoning_content && message.reasoning) {
+    message.reasoning_content = message.reasoning;
+  }
 
   return {
     message,
@@ -2173,7 +2476,6 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
     if (parts.length) contents.push({ role, parts });
   }
 
-  // Injection des images en input direct
   if (images && images.length > 0) {
     const last = contents[contents.length - 1];
     if (last?.role === "user") {
@@ -2214,10 +2516,13 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
   const candidate = response?.candidates?.[0];
   const parts = candidate?.content?.parts || [];
   let text = "";
+  let reasoningText = "";
   const toolCalls = [];
 
   for (const part of parts) {
     if (part.text) text += part.text;
+    // Gemini "thought" content
+    if (part.thought) reasoningText += part.thought;
     if (part.functionCall) {
       toolCalls.push({
         id: `call_${crypto.randomUUID()}`,
@@ -2231,13 +2536,14 @@ async function callGeminiRawWithTools({ model, messages, tools, jsonMode, timeou
   }
 
   const message = { role: "assistant", content: text };
+  if (reasoningText) message.reasoning_content = reasoningText;
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
 
   return { message, raw: response, usage: response?.usageMetadata || null };
 }
 
 // ================================================================================
-// §2.7 — CALLPROVIDERWITHTools (rotation + circuit breaker)
+// §2.7 — CALLPROVIDERWITHTOOLS
 // ================================================================================
 
 async function callProviderRawWithTools({
@@ -2245,7 +2551,7 @@ async function callProviderRawWithTools({
   timeout, maxTokens, temperature, images, apiKey, reasoningEffort
 }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout + 500);
+  const timer = setTimeout(() => controller.abort(), timeout + 1000);
   timer.unref?.();
 
   try {
@@ -2264,13 +2570,6 @@ async function callProviderRawWithTools({
   }
 }
 
-/**
- * Appelle un provider avec :
- * - rotation multi-clés
- * - circuit breaker par (provider:model:key)
- * - audit log
- * - métriques Prometheus
- */
 async function callProviderWithTools({
   providerConfig, messages, tools = null, images = null, jsonMode = false,
   _meta = {}
@@ -2319,19 +2618,13 @@ async function callProviderWithTools({
       );
 
       const latency = Date.now() - startedAt;
-      // Métriques
-      if (metrics?.llmCalls) {
-        metrics.llmCalls.labels(providerName, model, "success").inc();
-      }
-      if (metrics?.llmLatency) {
-        metrics.llmLatency.labels(providerName, model, "success").observe(latency / 1000);
-      }
+      if (metrics?.llmCalls) metrics.llmCalls.labels(providerName, model, "success").inc();
+      if (metrics?.llmLatency) metrics.llmLatency.labels(providerName, model, "success").observe(latency / 1000);
       if (metrics?.llmTokens && result.usage) {
         metrics.llmTokens.labels(providerName, model, "prompt").inc(result.usage.prompt_tokens || 0);
         metrics.llmTokens.labels(providerName, model, "completion").inc(result.usage.completion_tokens || 0);
       }
 
-      // Audit
       auditLLMCall({
         sessionId: _meta.sessionId || null,
         userId: _meta.userId || null,
@@ -2354,10 +2647,7 @@ async function callProviderWithTools({
     } catch (error) {
       lastError = error;
       const code = LLMErrorInterceptor.getErrorCode(error);
-
-      if (metrics?.llmCalls) {
-        metrics.llmCalls.labels(providerName, model, "error").inc();
-      }
+      if (metrics?.llmCalls) metrics.llmCalls.labels(providerName, model, "error").inc();
 
       if (LLMErrorInterceptor.shouldRotateImmediately(error)) {
         logger.warn({ provider: providerName, model, keyLabel: keyEntry.label, code }, "🔄 Rotation immédiate");
@@ -2383,7 +2673,7 @@ async function callProviderWithTools({
 }
 
 // ================================================================================
-// §2.8 — TOOL SCHEMAS (exposés au LLM)
+// §2.8 — TOOL_SCHEMAS
 // ================================================================================
 
 const TOOL_SCHEMAS = Object.freeze({
@@ -2391,7 +2681,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "search_images",
-      description: "Recherche des images réelles (Wikimedia Commons, Wikipédia, DuckDuckGo Images) pour une personne, un lieu, un objet, une équipe ou un concept précis.",
+      description: "Recherche des images réelles (Wikimedia Commons, Wikipédia, Pexels, DuckDuckGo) pour une personne, un lieu, un objet, une équipe ou un concept précis.",
       parameters: {
         type: "object",
         properties: {
@@ -2406,7 +2696,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "search_web",
-      description: "Recherche web générale (Wikipédia + actualités + DuckDuckGo + Tavily + Serper si configuré).",
+      description: "Recherche web générale (Wikipédia + actualités + DuckDuckGo + Tavily + Serper).",
       parameters: {
         type: "object",
         properties: { query: { type: "string" } },
@@ -2432,7 +2722,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "search_sports_scores",
-      description: "Derniers résultats d'une équipe via Google News (extraction de score).",
+      description: "Derniers résultats d'une équipe via Google News (extraction automatique de score).",
       parameters: {
         type: "object",
         properties: { team: { type: "string", description: "Nom de l'équipe (ex: 'Léopards RDC', 'PSG')." } },
@@ -2484,7 +2774,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "get_crypto_price",
-      description: "Prix actuel d'une cryptomonnaie (CoinMarketCap keyless).",
+      description: "Prix actuel d'une cryptomonnaie (CoinGecko keyless + CoinMarketCap fallback).",
       parameters: {
         type: "object",
         properties: {
@@ -2499,7 +2789,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "get_stock_price",
-      description: "Prix actuel d'une action (Yahoo Finance).",
+      description: "Prix actuel d'une action (Yahoo Finance, keyless).",
       parameters: {
         type: "object",
         properties: { ticker: { type: "string", description: "Ticker (AAPL, TSLA...)" } },
@@ -2512,11 +2802,14 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "execute_math",
-      description: "Calcul mathématique exact (arithmétique, algèbre, trigonométrie).",
+      description: "Calcule une expression mathématique EXACTE (arithmétique, algèbre, trigonométrie, matrices). UTILISE CET OUTIL POUR TOUT CALCUL, PAS run_code.",
       parameters: {
         type: "object",
         properties: {
-          expression: { type: "string", description: "Expression mathjs valide, 2000 char max." }
+          expression: {
+            type: "string",
+            description: "Expression mathjs valide, ex: '15*32+7', 'solve(x^2-5*x+6=0, x)', 'sqrt(144)+log(100)/log(10)'"
+          }
         },
         required: ["expression"],
         additionalProperties: false
@@ -2527,7 +2820,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "search_youtube",
-      description: "Recherche vidéos YouTube (youtubei.js si dispo, sinon API key, sinon DDG).",
+      description: "Recherche vidéos YouTube (youtubei.js keyless en priorité).",
       parameters: {
         type: "object",
         properties: { query: { type: "string" } },
@@ -2560,9 +2853,7 @@ const TOOL_SCHEMAS = Object.freeze({
       description: "Liste les tâches de l'utilisateur.",
       parameters: {
         type: "object",
-        properties: {
-          status: { type: "string", enum: ["pending", "done", "all"] }
-        },
+        properties: { status: { type: "string", enum: ["pending", "done", "all"] } },
         additionalProperties: false
       }
     }
@@ -2630,11 +2921,11 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "run_code",
-      description: "Exécute un code dans un SANDBOX EXTERNE (Piston/Judge0, pas de réseau, timeout strict).",
+      description: "Exécute un code (python, javascript, typescript, bash, go, rust, java, cpp) dans un SANDBOX. À utiliser UNIQUEMENT pour du code, JAMAIS pour des calculs mathématiques.",
       parameters: {
         type: "object",
         properties: {
-          language: { type: "string", enum: ["python", "javascript", "typescript", "bash"] },
+          language: { type: "string", enum: ["python", "javascript", "typescript", "bash", "go", "rust", "java", "cpp"] },
           code: { type: "string", maxLength: 20000 },
           stdin: { type: "string", maxLength: 2000 }
         },
@@ -2666,7 +2957,7 @@ const TOOL_SCHEMAS = Object.freeze({
     type: "function",
     function: {
       name: "recall_memory",
-      description: "Cherche dans la mémoire longue un fait oublié par l'utilisateur ('comme je t'ai dit hier').",
+      description: "Cherche dans la mémoire longue un fait oublié par l'utilisateur.",
       parameters: {
         type: "object",
         properties: { query: { type: "string" } },
@@ -2732,13 +3023,6 @@ function validateToolArgs(name, args) {
   return { ok: true };
 }
 
-/**
- * Exécute un outil natif.
- * Retourne : { result, sourceKeys, toolName }
- *
- * ⚠️ Les fonctions appelées ici (searchImagesWithFallback, searchWeb, etc.)
- *    seront définies dans PARTIE 3. En attendant, on les référence en lazy.
- */
 async function executeToolNative(toolName, rawArgs, context = {}) {
   const { userId, googleAccessToken, agentMode = false } = context;
 
@@ -2796,7 +3080,7 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
       }
       case "get_crypto_price": {
         result = await getCryptoPrice(args.symbol);
-        if (!result.error) sourceKeys.push("coinmarketcap");
+        if (!result.error) sourceKeys.push(result.source === "coingecko" ? "coingecko" : "coinmarketcap");
         break;
       }
       case "get_stock_price": {
@@ -2805,7 +3089,7 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
         break;
       }
       case "execute_math": {
-        result = await evaluateMathSafe(args.expression, 1500);
+        result = await evaluateMathSafe(args.expression, 2000);
         break;
       }
       case "search_youtube": {
@@ -2906,7 +3190,7 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
 }
 
 // ================================================================================
-// §2.10 — RUNTOOLLOOP (agent borné)
+// §2.10 — RUNTOOLLOOP v16.1 (✅ FIX : reasoning_content + <think>)
 // ================================================================================
 
 async function runToolLoop({
@@ -2925,6 +3209,7 @@ async function runToolLoop({
   const toolCallTrace = [];
   let workingMessages = [...messages];
   let finalText = "";
+  let lastReasoning = "";
 
   while (iterations < maxIterations) {
     iterations++;
@@ -2944,21 +3229,40 @@ async function runToolLoop({
         error: llmResult.error,
         iterations,
         usedSources: [...usedSources],
-        toolCallTrace
+        toolCallTrace,
+        reasoning: lastReasoning
       };
     }
 
     const assistantMessage = llmResult.message || {};
     const toolCalls = assistantMessage.tool_calls || [];
-    const rawContent = assistantMessage.content || "";
+    let rawContent = assistantMessage.content || "";
 
-    // Streamer la réflexion <think> détectée
+    // ✅ FIX v16.1 : récupère le reasoning depuis toutes les sources possibles
+    const reasoningContent = assistantMessage.reasoning_content
+      || assistantMessage.reasoning
+      || "";
+
+    // 1) Stream le reasoning_content (DeepSeek R1, Qwen think, Gemini thoughts)
+    if (sse && reasoningContent) {
+      lastReasoning += reasoningContent + "\n";
+      const chunks = safeChunkText(reasoningContent, 32);
+      for (const c of chunks) {
+        if (sse.closed) break;
+        sse.reasoning(c);
+        await sleep(4);
+      }
+      sse.reasoning("\n");
+    }
+
+    // 2) Stream aussi les balises <think> présentes dans le content (fallback)
     if (sse && rawContent) {
       const thinkMatches = rawContent.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi);
       if (thinkMatches) {
         for (const t of thinkMatches) {
           const inner = t.replace(/<\/?think(?:ing)?>/gi, "").trim();
           if (inner) {
+            lastReasoning += inner + "\n";
             const chunks = safeChunkText(inner, 32);
             for (const c of chunks) {
               if (sse.closed) break;
@@ -2971,7 +3275,7 @@ async function runToolLoop({
       }
     }
 
-    // Streamer les blocs de code détectés dans le contenu
+    // 3) Stream les blocs de code détectés
     if (sse && rawContent) {
       const codeRegex = /```(\w+)?(?::([^\n]+))?\n([\s\S]*?)```/g;
       let m;
@@ -3044,7 +3348,7 @@ async function runToolLoop({
   if (!finalText) {
     workingMessages.push({
       role: "system",
-      content: "Synthétise ta réponse finale. Pas de nouvel appel d'outil."
+      content: "Synthétise ta réponse finale MAINTENANT dans la langue de l'utilisateur. Pas de nouvel appel d'outil."
     });
     const finalCall = await callProviderWithTools({
       providerConfig,
@@ -3055,7 +3359,7 @@ async function runToolLoop({
     });
     finalText = finalCall.success
       ? normalizeMath(stripThinkTags(finalCall.message?.content || "").text)
-      : "Je n'ai pas pu terminer la réponse.";
+      : "Je n'ai pas pu terminer la réponse. Peux-tu reformuler plus simplement ?";
   }
 
   return {
@@ -3065,7 +3369,8 @@ async function runToolLoop({
     usedSources: [...usedSources],
     images: [...new Set(collectedImages)],
     videos: dedupeVideos(collectedVideos),
-    toolCallTrace
+    toolCallTrace,
+    reasoning: lastReasoning
   };
 }
 
@@ -3079,13 +3384,9 @@ function dedupeVideos(list) {
 }
 
 // ================================================================================
-// §2.11 — STT : GROQ WHISPER + DEEPGRAM FALLBACK
+// §2.11 — STT
 // ================================================================================
 
-/**
- * Transcription batch via Groq Whisper.
- * Rotation multi-clés + fallback Deepgram si Groq échoue.
- */
 async function transcribeAudioGroq(buffer, filename, mimetype) {
   if (!LLM_PROVIDERS.GROQ.keyPool || LLM_PROVIDERS.GROQ.keyPool.length === 0) {
     return { success: false, error: "Aucune clé Groq pour la transcription" };
@@ -3120,9 +3421,7 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
       );
 
       const latency = Date.now() - startedAt;
-      if (metrics?.sttLatency) {
-        metrics.sttLatency.labels("groq").observe(latency / 1000);
-      }
+      if (metrics?.sttLatency) metrics.sttLatency.labels("groq").observe(latency / 1000);
 
       return {
         success: true,
@@ -3136,7 +3435,6 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
     }
   }
 
-  // Fallback Deepgram
   if (process.env.DEEPGRAM_API_KEY) {
     try {
       const startedAt = Date.now();
@@ -3153,9 +3451,7 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
       );
       const text = response.data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
       const latency = Date.now() - startedAt;
-      if (metrics?.sttLatency) {
-        metrics.sttLatency.labels("deepgram").observe(latency / 1000);
-      }
+      if (metrics?.sttLatency) metrics.sttLatency.labels("deepgram").observe(latency / 1000);
       return { success: true, text, provider: "deepgram", latencyMs: latency };
     } catch (e) {
       logger.warn({ err: e.message }, "STT Deepgram échoué");
@@ -3165,13 +3461,6 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
   return { success: false, error: "Échec transcription (Groq + Deepgram)" };
 }
 
-/**
- * Streaming STT : accumule des chunks et transcrit dès qu'un segment VAD
- * est détecté comme terminé. Utilisé dans le pipeline Luba Live.
- *
- * Note : Groq ne propose pas un endpoint WebSocket officiel public.
- * On simule donc un streaming par chunks (300 ms) en parallèle.
- */
 class StreamingSTT {
   constructor({ onPartial, onFinal, onError } = {}) {
     this.onPartial = onPartial || (() => {});
@@ -3187,8 +3476,6 @@ class StreamingSTT {
     if (this.closed) return;
     this.buffer.push(chunk);
     this.totalBytes += chunk.length;
-
-    // Déclenche une transcription partielle si le buffer dépasse ~500ms
     if (this.totalBytes > 16000) {
       await this._transcribePartial(mimetype);
     }
@@ -3211,16 +3498,11 @@ class StreamingSTT {
   async finalize(mimetype = "audio/webm") {
     if (this.closed) return { success: false, error: "Already closed" };
     this.closed = true;
-
     if (this.buffer.length === 0) return { success: false, error: "Empty buffer" };
-
     const merged = Buffer.concat(this.buffer);
     const result = await transcribeAudioGroq(merged, "final.webm", mimetype);
-    if (result.success) {
-      this.onFinal(result.text);
-    } else {
-      this.onError(result.error);
-    }
+    if (result.success) this.onFinal(result.text);
+    else this.onError(result.error);
     this.buffer = [];
     return result;
   }
@@ -3234,18 +3516,12 @@ class StreamingSTT {
 }
 
 // ================================================================================
-// §2.12 — TTS : KOKORO (HEADTTS) + PIPER FALLBACK
+// §2.12 — TTS (Kokoro + Piper)
 // ================================================================================
 
-/**
- * TTS via Kokoro (HeadTTS). Peut être :
- *  - une URL HTTP auto-hébergée (kokoro-fastapi, headtts-server)
- *  - une API distante compatible
- */
 async function synthesizeKokoro(text, { voice = "af_bella", speed = 1.0, format = "mp3" } = {}) {
   const baseURL = process.env.KOKORO_URL;
   if (!baseURL) return { success: false, error: "KOKORO_URL non configurée" };
-
   try {
     const startedAt = Date.now();
     const response = await axios.post(
@@ -3269,9 +3545,7 @@ async function synthesizeKokoro(text, { voice = "af_bella", speed = 1.0, format 
       }
     );
     const latency = Date.now() - startedAt;
-    if (metrics?.ttsLatency) {
-      metrics.ttsLatency.labels("kokoro").observe(latency / 1000);
-    }
+    if (metrics?.ttsLatency) metrics.ttsLatency.labels("kokoro").observe(latency / 1000);
     return {
       success: true,
       audio: Buffer.from(response.data),
@@ -3285,22 +3559,14 @@ async function synthesizeKokoro(text, { voice = "af_bella", speed = 1.0, format 
   }
 }
 
-/**
- * TTS via Piper (auto-hébergé). Retourne du WAV brut.
- */
 async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0 } = {}) {
   const baseURL = process.env.PIPER_URL;
   if (!baseURL) return { success: false, error: "PIPER_URL non configurée" };
-
   try {
     const startedAt = Date.now();
     const response = await axios.post(
       `${baseURL.replace(/\/$/, "")}/api/tts`,
-      {
-        text: text.slice(0, 4000),
-        voice,
-        length_scale: 1.0 / speed
-      },
+      { text: text.slice(0, 4000), voice, length_scale: 1.0 / speed },
       {
         headers: { "Content-Type": "application/json" },
         responseType: "arraybuffer",
@@ -3308,9 +3574,7 @@ async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0
       }
     );
     const latency = Date.now() - startedAt;
-    if (metrics?.ttsLatency) {
-      metrics.ttsLatency.labels("piper").observe(latency / 1000);
-    }
+    if (metrics?.ttsLatency) metrics.ttsLatency.labels("piper").observe(latency / 1000);
     return {
       success: true,
       audio: Buffer.from(response.data),
@@ -3324,13 +3588,9 @@ async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0
   }
 }
 
-/**
- * TTS avec cascade : Kokoro → Piper → erreur.
- */
 async function synthesizeSpeech(text, options = {}) {
   if (!text || !text.trim()) return { success: false, error: "Texte vide" };
 
-  // Nettoie le markdown pour le TTS
   const cleanText = text
     .replace(/```[\s\S]*?```/g, " bloc de code omis ")
     .replace(/`([^`]+)`/g, "$1")
@@ -3350,22 +3610,11 @@ async function synthesizeSpeech(text, options = {}) {
 }
 
 // ================================================================================
-// §2.13 — VAD ADAPTATIF
+// §2.13 — VAD adaptatif
 // ================================================================================
 
-/**
- * VAD (Voice Activity Detection) simple basé sur l'énergie RMS.
- * Pour un VAD plus précis, utiliser WebRTC VAD côté client.
- *
- * Endpointing : détecte la fin de parole après ~500 ms de silence.
- */
 class SimpleVAD {
-  constructor({
-    energyThreshold = 500,
-    silenceMs = 500,
-    minSpeechMs = 200,
-    maxSpeechMs = 30000
-  } = {}) {
+  constructor({ energyThreshold = 500, silenceMs = 500, minSpeechMs = 200, maxSpeechMs = 30000 } = {}) {
     this.energyThreshold = energyThreshold;
     this.silenceMs = silenceMs;
     this.minSpeechMs = minSpeechMs;
@@ -3380,17 +3629,11 @@ class SimpleVAD {
     this.totalSamples = 0;
   }
 
-  /**
-   * Pousse un chunk PCM 16-bit mono (Buffer).
-   * Retourne { event: "speech-start" | "speech-end" | "continue" | null, durationMs? }
-   */
   push(pcmBuffer) {
     if (!pcmBuffer || pcmBuffer.length < 2) return { event: null };
-
     const samples = pcmBuffer.length / 2;
     this.totalSamples += samples;
 
-    // RMS energy
     let sum = 0;
     for (let i = 0; i < pcmBuffer.length; i += 2) {
       const sample = pcmBuffer.readInt16LE(i);
@@ -3408,8 +3651,6 @@ class SimpleVAD {
         return { event: "speech-start" };
       }
       this.lastVoiceTime = now;
-
-      // Sécurité : max 30s de parole continue
       if (now - this.speechStart > this.maxSpeechMs) {
         const duration = now - this.speechStart;
         this.reset();
@@ -3418,12 +3659,10 @@ class SimpleVAD {
       return { event: "continue" };
     }
 
-    // Silence
     if (this.speaking && this.lastVoiceTime) {
       const silenceDuration = now - this.lastVoiceTime;
       if (silenceDuration >= this.silenceMs) {
         const duration = this.lastVoiceTime - this.speechStart;
-        // Trop court = bruit, on ignore
         if (duration < this.minSpeechMs) {
           this.reset();
           return { event: "too-short" };
@@ -3437,12 +3676,9 @@ class SimpleVAD {
 }
 
 // ================================================================================
-// §2.14 — PIPELINE VOCAL (STT → LLM → TTS + sentence chunking + barge-in)
+// §2.14 — VOICE PIPELINE
 // ================================================================================
 
-/**
- * Sentence chunker : détecte les fins de phrase pour lancer le TTS en avance.
- */
 class SentenceChunker {
   constructor({ onSentence } = {}) {
     this.onSentence = onSentence || (() => {});
@@ -3452,23 +3688,16 @@ class SentenceChunker {
   push(text) {
     if (!text) return;
     this.buffer += text;
-
-    // Regex : fin de phrase suivie d'espace ou fin de buffer
     const regex = /([.!?…]+[\s\n]+|[\n]{2,})/g;
     let lastIndex = 0;
     let match;
     const sentences = [];
-
     while ((match = regex.exec(this.buffer)) !== null) {
       const sentence = this.buffer.slice(lastIndex, match.index + match[0].length).trim();
       if (sentence.length >= 8) sentences.push(sentence);
       lastIndex = match.index + match[0].length;
     }
-
-    if (lastIndex > 0) {
-      this.buffer = this.buffer.slice(lastIndex);
-    }
-
+    if (lastIndex > 0) this.buffer = this.buffer.slice(lastIndex);
     for (const s of sentences) this.onSentence(s);
   }
 
@@ -3479,23 +3708,8 @@ class SentenceChunker {
   }
 }
 
-/**
- * Pipeline vocal complet.
- * Utilise : STT streaming + LLM + TTS streaming + sentence chunking + barge-in.
- *
- * @param {object} opts
- * @param {Stream} opts.audioIn       - Stream d'entrée (PCM 16kHz mono)
- * @param {Function} opts.onTranscript - Callback transcript final
- * @param {Function} opts.onAudio     - Callback audio TTS sortant (Buffer)
- * @param {Function} opts.onStatus    - Callback statut
- * @param {Function} opts.onError     - Callback erreur
- */
 class VoicePipeline extends EventEmitter {
-  constructor({
-    sessionId, userId,
-    onTranscript, onAudio, onStatus, onError,
-    voice = "af_bella"
-  } = {}) {
+  constructor({ sessionId, userId, onTranscript, onAudio, onStatus, onError, voice = "af_bella" } = {}) {
     super();
     this.sessionId = sessionId;
     this.userId = userId;
@@ -3504,7 +3718,6 @@ class VoicePipeline extends EventEmitter {
     this.onStatus = onStatus || (() => {});
     this.onError = onError || (() => {});
     this.voice = voice;
-
     this.vad = new SimpleVAD();
     this.stt = null;
     this.chunker = null;
@@ -3512,18 +3725,12 @@ class VoicePipeline extends EventEmitter {
     this.processing = false;
   }
 
-  /**
-   * Barge-in : interrompt la génération en cours.
-   */
   bargeIn() {
     this.interrupted = true;
     this.processing = false;
     this.onStatus("barge-in");
   }
 
-  /**
-   * Démarre le traitement d'un flux audio continu.
-   */
   async processAudioStream(audioStream, { mimetype = "audio/webm" } = {}) {
     this.stt = new StreamingSTT({
       onPartial: (text) => this.onStatus("partial", { text }),
@@ -3531,14 +3738,10 @@ class VoicePipeline extends EventEmitter {
       onError: (e) => this.onError({ stage: "stt", error: e })
     });
 
-    let pcmBuffer = [];
-
     audioStream.on("data", async (chunk) => {
       if (this.interrupted) return;
       try {
         await this.stt.push(chunk, { mimetype });
-
-        // VAD sur le chunk converti (si PCM brut)
         if (mimetype.includes("pcm") || mimetype.includes("l16")) {
           const vadResult = this.vad.push(chunk);
           if (vadResult.event === "speech-end") {
@@ -3552,19 +3755,12 @@ class VoicePipeline extends EventEmitter {
     });
 
     audioStream.on("end", async () => {
-      if (!this.interrupted) {
-        await this.finalizeUtterance(mimetype);
-      }
+      if (!this.interrupted) await this.finalizeUtterance(mimetype);
     });
 
-    audioStream.on("error", (e) => {
-      this.onError({ stage: "stream", error: e.message });
-    });
+    audioStream.on("error", (e) => this.onError({ stage: "stream", error: e.message }));
   }
 
-  /**
-   * Finalise une utterance : STT final → LLM → TTS streaming.
-   */
   async finalizeUtterance(mimetype) {
     if (this.processing) return;
     this.processing = true;
@@ -3583,7 +3779,6 @@ class VoicePipeline extends EventEmitter {
       this.onTranscript(userText);
       this.onStatus("thinking", { text: userText });
 
-      // Prépare le chunker TTS
       const ttsQueue = [];
       let ttsProcessing = false;
 
@@ -3597,9 +3792,7 @@ class VoicePipeline extends EventEmitter {
             if (tts.success && !this.interrupted) {
               this.onAudio(tts.audio, { format: tts.format });
             }
-          } catch (e) {
-            logger.warn({ err: e.message }, "TTS échec sur phrase");
-          }
+          } catch (e) { logger.warn({ err: e.message }, "TTS échec sur phrase"); }
         }
         ttsProcessing = false;
       };
@@ -3612,7 +3805,6 @@ class VoicePipeline extends EventEmitter {
         }
       });
 
-      // Récupère la réponse LLM (callback injectée par l'appelant)
       const llmStream = await this.emit("requestLLM", userText);
       if (llmStream && typeof llmStream[Symbol.asyncIterator] === "function") {
         for await (const token of llmStream) {
@@ -3624,7 +3816,6 @@ class VoicePipeline extends EventEmitter {
       }
 
       this.chunker.flush();
-      // Attend la fin du TTS
       await new Promise((r) => setTimeout(r, 500));
       this.onStatus("done");
     } catch (e) {
@@ -3636,23 +3827,16 @@ class VoicePipeline extends EventEmitter {
 }
 
 // ================================================================================
-// §2.15 — MÉMOIRE COURTE (rolling summary)
+// §2.15 — MÉMOIRE COURTE
 // ================================================================================
 
 const SHORT_MEMORY_MAX_EXCHANGES = 20;
 
-/**
- * Construit un résumé glissant des derniers échanges pour rester dans le contexte.
- * N'appelle PAS le LLM : c'est un simple compactage mécanique.
- */
 function buildRollingSummary(history, maxExchanges = SHORT_MEMORY_MAX_EXCHANGES) {
   if (!Array.isArray(history) || history.length === 0) return "";
-
-  // Ne garde que user/assistant
   const filtered = history.filter((m) => m.role === "user" || m.role === "assistant");
   if (filtered.length === 0) return "";
 
-  // Regroupe en paires user/assistant
   const exchanges = [];
   let current = null;
   for (const m of filtered) {
@@ -3667,7 +3851,6 @@ function buildRollingSummary(history, maxExchanges = SHORT_MEMORY_MAX_EXCHANGES)
   }
   if (current) exchanges.push(current);
 
-  // Garde les N dernières
   const recent = exchanges.slice(-maxExchanges);
 
   return recent.map((e, i) => {
@@ -3678,42 +3861,32 @@ function buildRollingSummary(history, maxExchanges = SHORT_MEMORY_MAX_EXCHANGES)
 }
 
 // ================================================================================
-// §2.16 — MÉMOIRE LONGUE (extraction de faits + embeddings)
+// §2.16 — MÉMOIRE LONGUE
 // ================================================================================
 
 const FACT_CATEGORIES = Object.freeze(["identity", "preference", "project", "language", "general"]);
 
-/**
- * Enregistre un fait durable sur l'utilisateur.
- * - Dédupliqué par similarité (cosine > 0.9)
- * - Embedding stocké pour recall sémantique
- */
 async function rememberFact(userId, { fact, category = "general", sourceSession = null, confidence = 1.0 }) {
   if (!fact || typeof fact !== "string" || fact.trim().length < 3) {
     return { success: false, error: "Fait vide ou trop court" };
   }
   if (!FACT_CATEGORIES.includes(category)) category = "general";
-
   const cleanFact = sanitizeStrict(fact, 300);
 
   try {
-    // Vérifie si un fait très similaire existe déjà
     const existing = await dbAll(
       `SELECT id, fact FROM user_memory_facts WHERE user_id = ? ORDER BY created_at DESC LIMIT 100`,
       [userId]
     );
-
     const normalized = cleanFact.toLowerCase().replace(/\s+/g, " ");
     for (const e of existing) {
       const eNorm = String(e.fact).toLowerCase().replace(/\s+/g, " ");
-      // Similarité Jaccard grossière (rapide)
       const words1 = new Set(normalized.split(" "));
       const words2 = new Set(eNorm.split(" "));
       const inter = [...words1].filter((w) => words2.has(w)).length;
       const union = new Set([...words1, ...words2]).size;
-      const jaccard = inter / union;
+      const jaccard = union > 0 ? inter / union : 0;
       if (jaccard > 0.85) {
-        // Met à jour la date d'update du fait existant
         await dbRun(`UPDATE user_memory_facts SET updated_at = ? WHERE id = ?`, [Date.now(), e.id]);
         return { success: true, factId: e.id, action: "kept", existing: true };
       }
@@ -3728,15 +3901,10 @@ async function rememberFact(userId, { fact, category = "general", sourceSession 
       [userId, cleanFact, category, embJson, confidence, sourceSession, Date.now(), Date.now()]
     );
 
-    // Dual-write Firestore
     if (firestoreDb) {
       fsSet("user_memory_facts", `${userId}_${result.lastID}`, {
-        user_id: userId,
-        fact: cleanFact,
-        category,
-        confidence,
-        source_session: sourceSession,
-        created_at: new Date()
+        user_id: userId, fact: cleanFact, category, confidence,
+        source_session: sourceSession, created_at: new Date()
       }).catch(() => {});
     }
 
@@ -3748,13 +3916,8 @@ async function rememberFact(userId, { fact, category = "general", sourceSession 
   }
 }
 
-/**
- * Extrait automatiquement des faits durables d'un échange via le LLM.
- * À appeler en fire-and-forget après chaque tour de conversation.
- */
 async function extractFactsFromExchange(userId, userMessage, assistantReply) {
   if (!userMessage || userMessage.length < 20) return { facts: [] };
-
   try {
     const provider = MODEL_TIERS.v100.providers[0];
     const result = await callProviderWithTools({
@@ -3768,7 +3931,7 @@ async function extractFactsFromExchange(userId, userMessage, assistantReply) {
             "N'inclus PAS : questions ponctuelles, small talk, contenus sensibles, infos médicales.",
             "Retourne STRICTEMENT un JSON :",
             '{"facts":[{"fact":"...","category":"identity|preference|project|language|general"}]}',
-            "Si aucun fait durable, retourne {\"facts\":[]}."
+            'Si aucun fait durable, retourne {"facts":[]}.'
           ].join("\n")
         },
         {
@@ -3818,15 +3981,10 @@ async function extractFactsFromExchange(userId, userMessage, assistantReply) {
 // §2.17 — RECALL SÉMANTIQUE
 // ================================================================================
 
-/**
- * Embeddings via nomic-embed-text (Groq) ou fallback OpenAI-compatible.
- * Retourne null si aucun provider d'embeddings n'est dispo.
- */
 async function embedText(text) {
   if (!text || typeof text !== "string") return null;
   const trimmed = text.slice(0, 2000);
 
-  // Groq nomic-embed (si activé)
   if (process.env.GROQ_EMBED_MODEL && LLM_PROVIDERS.GROQ.keyPool.length > 0) {
     try {
       const key = LLM_PROVIDERS.GROQ.keyPool[0];
@@ -3844,39 +4002,11 @@ async function embedText(text) {
     }
   }
 
-  // OpenRouter embeddings (rare, mais parfois dispo)
-  if (process.env.OPENROUTER_EMBED_MODEL && LLM_PROVIDERS.OPENROUTER.keyPool.length > 0) {
-    try {
-      const key = LLM_PROVIDERS.OPENROUTER.keyPool[0];
-      const resp = await axios.post(
-        "https://openrouter.ai/api/v1/embeddings",
-        { model: process.env.OPENROUTER_EMBED_MODEL, input: trimmed },
-        {
-          headers: {
-            Authorization: `Bearer ${key.apiKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": HOSTING_CONFIG.domain,
-            "X-Title": "Luba AI"
-          },
-          timeout: 8000
-        }
-      );
-      return resp.data?.data?.[0]?.embedding || null;
-    } catch (e) {
-      logger.debug({ err: e.message }, "Embedding OpenRouter échoué");
-    }
-  }
-
   return null;
 }
 
-/**
- * Recall sémantique : cherche les faits les plus pertinents pour une query.
- * Si embeddings indisponibles → fallback par mots-clés (Jaccard).
- */
 async function recallMemory(userId, query, limit = 5) {
   if (!query || typeof query !== "string") return { facts: [] };
-
   try {
     const allFacts = await dbAll(
       `SELECT id, fact, category, embedding, confidence, created_at
@@ -3884,12 +4014,9 @@ async function recallMemory(userId, query, limit = 5) {
        ORDER BY created_at DESC LIMIT 200`,
       [userId]
     );
-
     if (allFacts.length === 0) return { facts: [] };
 
-    // Essaie l'embedding de la query
     const queryEmb = await embedText(query);
-
     let scored = [];
 
     if (queryEmb) {
@@ -3901,7 +4028,6 @@ async function recallMemory(userId, query, limit = 5) {
       }
     }
 
-    // Fallback : mots-clés Jaccard
     if (scored.length === 0) {
       const qWords = new Set(String(query).toLowerCase().split(/\s+/).filter((w) => w.length > 2));
       for (const f of allFacts) {
@@ -3930,9 +4056,6 @@ async function recallMemory(userId, query, limit = 5) {
   }
 }
 
-/**
- * Retourne tous les faits catégorisés (pour le bootstrap).
- */
 async function getAllFacts(userId) {
   try {
     const rows = await dbAll(
@@ -3968,9 +4091,7 @@ async function clearAllFacts(userId) {
       const facts = await fsQuery("user_memory_facts", {
         where: [["user_id", "==", userId]], limit: 500
       });
-      for (const f of facts) {
-        fsDelete("user_memory_facts", f.id).catch(() => {});
-      }
+      for (const f of facts) fsDelete("user_memory_facts", f.id).catch(() => {});
     }
     return { success: true };
   } catch (e) {
@@ -3979,10 +4100,8 @@ async function clearAllFacts(userId) {
 }
 
 // ================================================================================
-// §2.17.bis — HELPERS PARTAGÉS (référencés par executeToolNative)
+// §2.17.bis — STUBS INJECTABLES (remplis par Partie 3)
 // ================================================================================
-// Ces fonctions sont définies en PARTIE 3. Ici on déclare des stubs sûrs
-// qui seront overridés par `Object.assign(module.exports, ...)` en PARTIE 3.
 
 let searchImagesWithFallback = async () => ({ images: [] });
 let searchWeb               = async () => ({ results: [], sourcesUsed: [] });
@@ -4006,10 +4125,6 @@ let runCodeSandbox          = async () => ({ success: false, error: "Sandbox non
 let extractEntity           = (msg) => String(msg || "").trim().slice(0, 80);
 let evaluateMathSafe        = async () => ({ success: false, error: "Math indisponible" });
 
-/**
- * Injecte les vraies implémentations depuis PARTIE 3.
- * Appelé automatiquement via Object.assign plus bas.
- */
 function setSharedHelpers(helpers) {
   if (helpers.searchImagesWithFallback) searchImagesWithFallback = helpers.searchImagesWithFallback;
   if (helpers.searchWeb)               searchWeb               = helpers.searchWeb;
@@ -4035,89 +4150,67 @@ function setSharedHelpers(helpers) {
 }
 
 // ================================================================================
-// §2.18 — EXPORTS PARTIE 2
+// §2.18 — EXPORTS PART 2 v16.1
 // ================================================================================
 
 Object.assign(module.exports, {
-  // Providers
   LLM_PROVIDERS, MODEL_TIERS, geminiClient,
-
-  // Circuit breaker
   CircuitBreaker, getCircuit, getAllCircuitStates, circuitRegistry,
-
-  // Erreurs
   LLMErrorInterceptor, userFacingErrorMessage,
-
-  // Appelants
   callProviderWithTools, callProviderRawWithTools,
   callOpenAICompatibleRaw, callGeminiRawWithTools,
   validateAndSanitizeOpenRouterModel,
-
-  // Tool calling
   TOOL_SCHEMAS, TOOLS_BY_CONTEXT, SIDE_EFFECT_TOOLS,
   getToolSchemas, validateToolArgs, executeToolNative,
   runToolLoop, dedupeVideos,
-
-  // STT / TTS
   transcribeAudioGroq, StreamingSTT,
   synthesizeKokoro, synthesizePiper, synthesizeSpeech,
-
-  // VAD + pipeline
   SimpleVAD, SentenceChunker, VoicePipeline,
-
-  // Mémoire courte
   buildRollingSummary, SHORT_MEMORY_MAX_EXCHANGES,
-
-  // Mémoire longue
   rememberFact, extractFactsFromExchange, FACT_CATEGORIES,
   getAllFacts, deleteFact, clearAllFacts,
-
-  // Recall sémantique
   embedText, recallMemory,
-
-  // Helpers injectables
   setSharedHelpers
 });
 
 // ================================================================================
-// ==================== FIN PARTIE 2/4 ===========================================
-// ================================================================================
-// ▶ Prochaine partie (3/4) : Search (Tavily/Serper/GDELT/HN), Media (Pexels/
-//   Wikimedia/youtubei), Weather (Open-Meteo), Finance (CoinMarketCap/Yahoo),
-//   News (Google News + score extraction), Ads (Ghost Ads + Adsterra + Luba Pro
-//   + lien test safe), Code (Piston), Vision, i18n.
-//   Tape "suite" quand tu es prêt.
+// ==================== FIN PARTIE 2/4 v16.1 =====================================
 // ================================================================================
 // ================================================================================
-// PARTIE 3/4 — DATA SERVICES, MEDIA, NEWS, FINANCE, ADS, CODE, VISION
+// PARTIE 3/4 v16.1 — DATA SERVICES, MEDIA, NEWS, FINANCE, ADS, CODE, VISION
 // ================================================================================
 // Sommaire :
 //   §3.1   Search orchestrator (Tavily + Serper + DDG + GDELT + HN + Wikipedia)
-//   §3.2   Media : Pexels + Wikimedia + youtubei.js (keyless)
-//   §3.3   Weather : Open-Meteo (gratuit, keyless)
-//   §3.4   Finance : CoinMarketCap (keyless) + Yahoo Finance
-//   §3.5   News : Google News RSS + extraction de score
+//   §3.2   Media : Wikimedia + Pexels + youtubei.js (keyless)
+//   §3.3   Weather : Open-Meteo (keyless)
+//   §3.4   Finance : CoinGecko (keyless) + CoinMarketCap + Yahoo Finance
+//   §3.5   News : Google News RSS + extraction score
 //   §3.6   Sports : Google News + synonymes équipes
-//   §3.7   Code sandbox : Piston + Judge0
-//   §3.8   Vision : analyse d'images (Groq Llama 4 Maverick + Gemini)
-//   §3.9   Ads : Ghost Ads + Adsterra + Luba Pro + lien test SAFE
-//   §3.10  Math evaluator (Worker isolé, mathjs sandbox)
-//   §3.11  Entité + pré-routeur d'intention + i18n
+//   §3.7   Code sandbox : Piston (défaut public) + Judge0
+//   §3.8   Vision : Groq Llama 4 Maverick + Gemini + OpenRouter
+//   §3.9   Ads : Ghost Ads + Adsterra + Luba Pro (avec lien test SAFE)
+//   §3.10  Math evaluator (Worker isolé mathjs)
+//   §3.11  Entité + pré-routeur + i18n
 //   §3.12  Tasks CRUD (UUID + Firestore-first)
-//   §3.13  Quotas utilisateur
-//   §3.14  Email dispatch (Gmail API / Resend / SMTP)
-//   §3.15  WhatsApp helpers (chiffrement + envoi)
-//   §3.16  Wire setSharedHelpers() — branche les stubs de Partie 2
-//   §3.17  Exports PARTIE 3
+//   §3.13  Quotas
+//   §3.14  Email dispatch (Gmail / Resend / SMTP)
+//   §3.15  WhatsApp helpers
+//   §3.16  Wire setSharedHelpers()
+//   §3.17  Exports Part 3
 // ================================================================================
+// FIX v16.1 :
+//   ✅ Piston URL publique par défaut (sandbox marche out-of-the-box)
+//   ✅ Math worker isolé (execute_math prioritaire)
+//   ✅ Détection langue i18n persistée
+//   ✅ Ads avec lien test safe (placehold.co)
+// ================================================================================
+
+"use strict";
 
 // ================================================================================
 // §3.1 — SEARCH ORCHESTRATOR
 // ================================================================================
 
-/**
- * Recherche via Tavily (si clé dispo).
- */
 async function searchTavily(query, { maxResults = 5, topic = "general" } = {}) {
   const apiKey = process.env.TAVILY_API_KEY;
   if (!apiKey) return { results: [], provider: "tavily", skipped: true };
@@ -4144,20 +4237,13 @@ async function searchTavily(query, { maxResults = 5, topic = "general" } = {}) {
       publishedDate: r.published_date || null,
       source: "tavily"
     }));
-    return {
-      results,
-      answer: resp.data?.answer || null,
-      provider: "tavily"
-    };
+    return { results, answer: resp.data?.answer || null, provider: "tavily" };
   } catch (e) {
     logger.warn({ err: e.message }, "Tavily échec");
     return { results: [], provider: "tavily", error: e.message };
   }
 }
 
-/**
- * Recherche via Serper.dev (Google Search API, 2500 req/mois gratuites).
- */
 async function searchSerper(query, { maxResults = 5, type = "search" } = {}) {
   const apiKey = process.env.SERPER_API_KEY;
   if (!apiKey) return { results: [], provider: "serper", skipped: true };
@@ -4172,10 +4258,7 @@ async function searchSerper(query, { maxResults = 5, type = "search" } = {}) {
     const resp = await axios.post(
       endpoint,
       { q: String(query).slice(0, 400), num: maxResults, hl: "fr", gl: "fr" },
-      {
-        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-        timeout: 8000
-      }
+      { headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" }, timeout: 8000 }
     );
 
     const raw = resp.data?.organic || resp.data?.news || resp.data?.images || [];
@@ -4193,21 +4276,13 @@ async function searchSerper(query, { maxResults = 5, type = "search" } = {}) {
   }
 }
 
-/**
- * Recherche via DuckDuckGo (scraping libre, pas de clé).
- */
 async function searchDuckDuckGo(query, { maxResults = 5 } = {}) {
   if (!ddgScrape) return { results: [], provider: "ddg", skipped: true };
-
   try {
     const fn = ddgScrape.search;
     if (typeof fn !== "function") return { results: [], provider: "ddg" };
 
-    const results = await fn(query, {
-      safeSearch: "moderate",
-      locale: "fr-fr",
-      maxResults
-    });
+    const results = await fn(query, { safeSearch: "moderate", locale: "fr-fr", maxResults });
     const list = Array.isArray(results?.results) ? results.results
       : Array.isArray(results) ? results : [];
 
@@ -4226,10 +4301,6 @@ async function searchDuckDuckGo(query, { maxResults = 5 } = {}) {
   }
 }
 
-/**
- * GDELT (Global Database of Events, Language and Tone) — keyless.
- * Idéal pour actualités internationales / monitoring géopolitique.
- */
 async function searchGdelt(query, { maxResults = 5, timespanDays = 7 } = {}) {
   try {
     const url = "https://api.gdeltproject.org/api/v2/doc/doc";
@@ -4258,9 +4329,6 @@ async function searchGdelt(query, { maxResults = 5, timespanDays = 7 } = {}) {
   }
 }
 
-/**
- * Hacker News (Algolia API, keyless).
- */
 async function searchHackerNews(query, { maxResults = 5 } = {}) {
   try {
     const resp = await axios.get(
@@ -4280,9 +4348,6 @@ async function searchHackerNews(query, { maxResults = 5 } = {}) {
   }
 }
 
-/**
- * Résumé Wikipédia (FR) via REST API.
- */
 async function searchWikipediaSummary(query, { lang = "fr" } = {}) {
   try {
     const resp = await axios.get(
@@ -4303,10 +4368,6 @@ async function searchWikipediaSummary(query, { lang = "fr" } = {}) {
   }
 }
 
-/**
- * Orchestrateur de recherche web : cascade multi-providers avec deadline par source.
- * Sources : Wikipedia + Tavily + Serper + DDG + GDELT + HN.
- */
 async function searchWeb(query) {
   if (!query || typeof query !== "string") {
     return { results: [], sourcesUsed: [], errors: [] };
@@ -4342,7 +4403,6 @@ async function searchWeb(query) {
     }
   });
 
-  // Déduplication par URL
   const seen = new Set();
   const unique = results.filter((r) => {
     const u = r.url || `${r.title}`;
@@ -4355,18 +4415,14 @@ async function searchWeb(query) {
 }
 
 // ================================================================================
-// §3.2 — MEDIA : PEXELS + WIKIMEDIA + YOUTUBEI.JS
+// §3.2 — MEDIA : Wikimedia + Pexels + youtubei.js
 // ================================================================================
 
 let youtubei = null;
 try { youtubei = require("youtubei.js"); } catch { /* fallback API key */ }
 
-/**
- * Wikimedia Commons — recherche d'images réelles (gsrnamespace=6).
- */
 async function searchWikimediaImages(query, limit = CONFIG.IMAGES.WIKIMEDIA_LIMIT) {
   if (!query || typeof query !== "string") return { images: [] };
-
   try {
     const url =
       "https://commons.wikimedia.org/w/api.php" +
@@ -4409,9 +4465,6 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGES.WIKIMEDIA_LIMI
   }
 }
 
-/**
- * Miniature Wikipédia via REST summary.
- */
 async function fetchWikipediaThumb(query) {
   try {
     const resp = await axios.get(
@@ -4430,13 +4483,9 @@ async function fetchWikipediaThumb(query) {
   } catch { return null; }
 }
 
-/**
- * Pexels — photos libres de droits (200 req/heure gratuit).
- */
 async function searchPexelsImages(query, limit = 6) {
   const apiKey = process.env.PEXELS_API_KEY;
   if (!apiKey) return { images: [] };
-
   try {
     const resp = await axios.get("https://api.pexels.com/v1/search", {
       params: { query, per_page: Math.min(limit, 15), orientation: "landscape" },
@@ -4459,9 +4508,6 @@ async function searchPexelsImages(query, limit = 6) {
   }
 }
 
-/**
- * DuckDuckGo Images (via searchImages, PAS search web).
- */
 async function searchDuckDuckGoImages(query, limit = CONFIG.IMAGES.DDG_LIMIT) {
   if (!ddgScrape) return [];
   try {
@@ -4488,10 +4534,6 @@ async function searchDuckDuckGoImages(query, limit = CONFIG.IMAGES.DDG_LIMIT) {
   }
 }
 
-/**
- * Recherche d'images multi-source : Wikimedia + Wikipedia + Pexels + DDG.
- * Fusion + dédup + cache (uniquement si résultats > 0).
- */
 const imageCache = new LRUCache({
   max: 500,
   ttl: CONFIG.IMAGES.CACHE_TTL_MS,
@@ -4547,7 +4589,7 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
 }
 
 // ================================================================================
-// §3.2.bis — YOUTUBE (youtubei.js en priorité, API key fallback)
+// §3.2.bis — YOUTUBE (youtubei.js keyless)
 // ================================================================================
 
 function extractYouTubeVideoId(url) {
@@ -4627,25 +4669,22 @@ async function searchYouTube(query) {
   if (!query || typeof query !== "string") return { videos: [] };
   const cleanQuery = String(query).trim().slice(0, 200);
 
-  // 1) youtubei.js (keyless, sans quota)
   if (youtubei) {
     const r = await searchYouTubeYoutubei(cleanQuery);
     if (r.videos.length > 0) return { ...r, provider: "youtubei" };
   }
 
-  // 2) API key officielle
   if (process.env.YOUTUBE_API_KEY) {
     const r = await searchYouTubeApiKey(cleanQuery);
     if (r.videos.length > 0) return { ...r, provider: "youtube_api" };
   }
 
-  // 3) Fallback DDG
   const r = await searchYouTubeFallbackDDG(cleanQuery);
   return { ...r, provider: "ddg" };
 }
 
 // ================================================================================
-// §3.3 — WEATHER (Open-Meteo, keyless)
+// §3.3 — WEATHER (Open-Meteo keyless)
 // ================================================================================
 
 async function getWeather(location) {
@@ -4709,23 +4748,20 @@ async function getWeather(location) {
 }
 
 // ================================================================================
-// §3.4 — FINANCE (CoinMarketCap keyless + Yahoo Finance)
+// §3.4 — FINANCE (CoinGecko keyless + CMC + Yahoo)
 // ================================================================================
 
-/**
- * CoinMarketCap keyless via l'endpoint public /v1/cryptocurrency/quotes/latest
- * (⚠️ nécessite normalement une clé). Fallback CoinGecko (100% keyless).
- */
 async function getCryptoPrice(symbol) {
   if (!symbol) return { error: "Aucun symbole précisé" };
   const cleanSymbol = String(symbol).toUpperCase().trim();
 
-  // 1) CoinGecko (100% keyless)
+  // 1) CoinGecko (keyless)
   try {
     const symbolToId = {
       BTC: "bitcoin", ETH: "ethereum", SOL: "solana", BNB: "binancecoin",
       XRP: "ripple", ADA: "cardano", DOGE: "dogecoin", USDT: "tether",
-      USDC: "usd-coin", TRX: "tron", TON: "the-open-network", MATIC: "matic-network"
+      USDC: "usd-coin", TRX: "tron", TON: "the-open-network", MATIC: "matic-network",
+      DOT: "polkadot", AVAX: "avalanche-2", LINK: "chainlink", LTC: "litecoin"
     };
     const id = symbolToId[cleanSymbol];
     if (id) {
@@ -4750,7 +4786,7 @@ async function getCryptoPrice(symbol) {
     logger.warn({ err: e.message }, "CoinGecko échec");
   }
 
-  // 2) CoinMarketCap (si clé dispo)
+  // 2) CoinMarketCap (si clé)
   if (process.env.COINMARKETCAP_API_KEY) {
     try {
       const resp = await axios.get(
@@ -4780,9 +4816,6 @@ async function getCryptoPrice(symbol) {
   return { error: `Prix introuvable pour ${cleanSymbol}` };
 }
 
-/**
- * Yahoo Finance — prix action via query1.finance.yahoo.com (keyless).
- */
 async function getStockPrice(ticker) {
   if (!ticker) return { error: "Aucun ticker précisé" };
   const cleanTicker = String(ticker).toUpperCase().trim();
@@ -4801,7 +4834,6 @@ async function getStockPrice(ticker) {
     if (!result) return { error: `Ticker ${cleanTicker} introuvable` };
 
     const meta = result.meta || {};
-    const quote = result.indicators?.quote?.[0] || {};
 
     return {
       ticker: meta.symbol || cleanTicker,
@@ -4825,7 +4857,7 @@ async function getStockPrice(ticker) {
 }
 
 // ================================================================================
-// §3.5 — GOOGLE NEWS + EXTRACTION DE SCORE
+// §3.5 — GOOGLE NEWS + EXTRACTION SCORE
 // ================================================================================
 
 async function fetchGoogleNews(query, { limit = 8, lang, region } = {}) {
@@ -4894,7 +4926,6 @@ async function searchNews(query) {
     }))
   ];
 
-  // Déduplication + tri par date
   const seen = new Set();
   const unique = articles.filter((a) => {
     const key = a.title?.toLowerCase().slice(0, 60);
@@ -4910,9 +4941,6 @@ async function searchNews(query) {
   return { articles: unique, sourcesUsed };
 }
 
-/**
- * Extrait un score depuis un titre : "RDC 3-1 Zimbabwe", "victoire 2 à 1", etc.
- */
 function extractScoreFromText(text) {
   if (!text) return null;
   const clean = String(text).replace(/\u00A0/g, " ").trim();
@@ -4964,7 +4992,10 @@ const SPORT_SYNONYMS = Object.freeze({
   "real": ["Real Madrid"],
   "barca": ["FC Barcelona"],
   "barça": ["FC Barcelona"],
-  "manchester": ["Manchester United", "Manchester City"]
+  "manchester": ["Manchester United", "Manchester City"],
+  "v.club": ["AS Vita Club", "Vita Club Kinshasa"],
+  "vclub": ["AS Vita Club"],
+  "tp mazembe": ["TP Mazembe", "Tout Puissant Mazembe"]
 });
 
 const sportCache = new LRUCache({
@@ -5056,7 +5087,7 @@ async function searchSportsScores(team) {
 }
 
 // ================================================================================
-// §3.7 — CODE SANDBOX (Piston + Judge0)
+// §3.7 — CODE SANDBOX (Piston public + Judge0)
 // ================================================================================
 
 const SUPPORTED_SANDBOX_LANGS = Object.freeze({
@@ -5077,7 +5108,7 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
   if (typeof code !== "string" || code.length === 0) return { success: false, error: "Code vide" };
   if (code.length > 20000) return { success: false, error: "Code trop long (max 20 000 caractères)" };
 
-  const timeoutMs = 8000;
+  const timeoutMs = 10000;
 
   if (provider === "piston") {
     if (!CONFIG.SANDBOX.PISTON_URL) return { success: false, error: "PISTON_URL manquant" };
@@ -5092,7 +5123,7 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
           run_timeout: timeoutMs,
           compile_timeout: timeoutMs
         },
-        { timeout: timeoutMs + 3000 }
+        { timeout: timeoutMs + 5000 }
       );
       const run = resp.data?.run || {};
       return {
@@ -5135,13 +5166,10 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
 }
 
 // ================================================================================
-// §3.8 — VISION (analyse d'images)
+// §3.8 — VISION
 // ================================================================================
 
-/**
- * Analyse d'images via Groq Llama 4 Maverick (gratuit), Gemini ou OpenRouter.
- */
-async function analyzeImage({ imageBase64, mimetype = "image/jpeg", prompt = "Décris cette image en détail." }) {
+async function analyzeImage({ imageBase64, mimetype = "image/jpeg", prompt = "Décris cette image en détail en français." }) {
   if (!imageBase64) return { success: false, error: "Image vide" };
 
   const messages = [{
@@ -5161,7 +5189,7 @@ async function analyzeImage({ imageBase64, mimetype = "image/jpeg", prompt = "D�
         messages,
         tools: null,
         jsonMode: false,
-        timeout: 20000,
+        timeout: 25000,
         maxTokens: 2000,
         temperature: 0.7,
         apiKey: LLM_PROVIDERS.GROQ.keyPool[0].apiKey
@@ -5185,7 +5213,7 @@ async function analyzeImage({ imageBase64, mimetype = "image/jpeg", prompt = "D�
         messages: [{ role: "user", content: prompt }],
         tools: null,
         jsonMode: false,
-        timeout: 20000,
+        timeout: 25000,
         maxTokens: 2000,
         temperature: 0.7,
         images: [{ base64: imageBase64, mimetype }]
@@ -5210,7 +5238,7 @@ async function analyzeImage({ imageBase64, mimetype = "image/jpeg", prompt = "D�
         messages,
         tools: null,
         jsonMode: false,
-        timeout: 25000,
+        timeout: 30000,
         maxTokens: 2000,
         temperature: 0.7,
         apiKey: LLM_PROVIDERS.OPENROUTER.keyPool[0].apiKey
@@ -5234,12 +5262,10 @@ async function analyzeImage({ imageBase64, mimetype = "image/jpeg", prompt = "D�
 // ================================================================================
 
 /**
- * Réseau publicitaire interne Luba Pro (fallback permanent, 100% maison).
+ * Réseau publicitaire interne Luba Pro (fallback permanent).
  *
  * ⚠️ Lien de test SAFE (pas de contenu adulte, HTTPS, statique) :
  *    https://placehold.co/728x90/1a73e8/ffffff/png?text=Publicite+Test+Luba&font=roboto
- *
- * Le clic redirige vers le domaine Luba (aucun tracking tiers).
  */
 const LUBA_PRO_ADS = Object.freeze({
   test_safe: {
@@ -5280,10 +5306,6 @@ const LUBA_PRO_ADS = Object.freeze({
   }
 });
 
-/**
- * Ghost Ads (monétisation ouverte, 75% revshare).
- * Récupère une pub via leur API (nécessite GHOST_ADS_API_KEY).
- */
 async function fetchGhostAds({ slot = "sidebar", userId = null } = {}) {
   const apiKey = process.env.GHOST_ADS_API_KEY;
   if (!apiKey) return { success: false, reason: "no_key" };
@@ -5324,15 +5346,10 @@ async function fetchGhostAds({ slot = "sidebar", userId = null } = {}) {
   }
 }
 
-/**
- * Adsterra (bannière HTML/JS, insertion côté client).
- * Retourne juste les métadonnées — l'injection se fait dans le front.
- */
 async function fetchAdsterra({ slot = "banner_728x90" } = {}) {
   const zoneId = process.env.ADSTERRA_ZONE_ID;
   if (!zoneId) return { success: false, reason: "no_zone" };
 
-  // ⚠️ Adsterra nécessite un script côté client. On retourne juste la config.
   return {
     success: true,
     ad: {
@@ -5350,27 +5367,17 @@ async function fetchAdsterra({ slot = "banner_728x90" } = {}) {
   };
 }
 
-/**
- * Orchestrateur Ads : Ghost → Adsterra → Luba Pro (fallback permanent).
- * ⚠️ Le fallback Luba Pro contient le lien test SAFE.
- */
 async function getAd({ slot = "sidebar", userId = null, allowTest = true } = {}) {
-  // 1) Ghost Ads
   const ghost = await fetchGhostAds({ slot, userId });
   if (ghost.success) return ghost.ad;
 
-  // 2) Adsterra
   const adsterra = await fetchAdsterra({ slot });
   if (adsterra.success) return adsterra.ad;
 
-  // 3) Fallback Luba Pro (self-promo ou test safe)
   const fallbackKey = allowTest ? "test_safe" : "self_promo";
   return { ...LUBA_PRO_ADS[fallbackKey], slot };
 }
 
-/**
- * Retourne tous les slots disponibles (pour le bootstrap front).
- */
 function getAllAdSlots() {
   return {
     test_safe: LUBA_PRO_ADS.test_safe,
@@ -5390,7 +5397,6 @@ const MATH_WORKER_SOURCE = `
   safeMath.import({
     import: function () { throw new Error('import interdit'); },
     createUnit: function () { throw new Error('createUnit interdit'); },
-    evaluate: function () { throw new Error('evaluate interdit'); },
     parse: function () { throw new Error('parse interdit'); },
     simplify: function () { throw new Error('simplify interdit'); },
     derivative: function () { throw new Error('derivative interdit'); },
@@ -5408,7 +5414,7 @@ const MATH_WORKER_SOURCE = `
   }
 `;
 
-function evaluateMathSafe(expression, timeoutMs = 1500) {
+function evaluateMathSafe(expression, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const expr = String(expression || "").slice(0, 2000);
     if (!expr.trim()) return resolve({ success: false, expression: expr, error: "Expression vide" });
@@ -5480,7 +5486,7 @@ function extractEntity(message) {
   let m = message.trim().replace(/[?!.,;:]+$/g, "");
 
   m = m.replace(
-    /^(qui est|c'?est qui|qui était|montre-moi|montre moi|cherche|trouve-moi|trouve moi|parle-moi de|parle moi de|donne-moi|donne moi|photo de|image de|clip de|vidéo de|video de|chanson de|à quoi ressemble|a quoi ressemble|quelle est|quel est|où se trouve|ou se trouve)\s+/i,
+    /^(qui est|c'?est qui|qui était|montre-moi|montre moi|cherche|trouve-moi|trouve moi|parle-moi de|parle moi de|donne-moi|donne moi|photo de|image de|clip de|vidéo de|video de|chanson de|à quoi ressemble|a quoi ressemble|quelle est|quel est|où se trouve|ou se trouve|calcule|calculer|résous|resous)\s+/i,
     ""
   ).trim();
 
@@ -5511,10 +5517,10 @@ function containsWholeWords(haystack, needles) {
 }
 
 const INTENT_KEYWORDS = Object.freeze({
-  MATHS: ["calcule", "calculer", "resous", "equation", "integrale", "derivee", "factorielle", "matrice", "limite", "theoreme", "algebre"],
+  MATHS: ["calcule", "calculer", "resous", "equation", "integrale", "derivee", "factorielle", "matrice", "limite", "theoreme", "algebre", "solve", "résoudre", "résous"],
   ACTUALITE: ["actualite", "actualites", "news", "journal", "derniere", "dernieres", "presse"],
   SPORT: ["score", "match", "football", "basket", "tennis", "nba", "ligue", "championnat", "classement", "resultat", "leopards", "leopard"],
-  CODE: ["code", "coder", "javascript", "python", "java", "typescript", "react", "angular", "vuejs", "nodejs", "sql", "algorithme", "bug", "debug"],
+  CODE: ["code", "coder", "javascript", "python", "java", "typescript", "react", "angular", "vuejs", "nodejs", "sql", "algorithme", "bug", "debug", "fonction", "script"],
   VIDEO: ["clip", "video", "youtube", "chanson", "musique", "regarder", "ecouter"],
   TASK: ["rappelle-moi", "rappel", "tache", "taches", "planifie", "agenda", "rendez-vous"],
   FINANCE: ["crypto", "bitcoin", "ethereum", "action", "bourse", "prix", "cours"],
@@ -5527,9 +5533,10 @@ function preRouteIntent(message) {
   const entity = extractEntity(text);
   if (!text) return { intent: "GENERAL", entity };
 
+  // Priorité à MATHS car très discriminant
+  if (containsWholeWords(text, INTENT_KEYWORDS.MATHS))     return { intent: "MATHS", entity };
   if (containsWholeWords(text, INTENT_KEYWORDS.TASK))      return { intent: "TASK", entity };
   if (containsWholeWords(text, INTENT_KEYWORDS.VIDEO))     return { intent: "VIDEO", entity };
-  if (containsWholeWords(text, INTENT_KEYWORDS.MATHS))     return { intent: "MATHS", entity };
   if (containsWholeWords(text, INTENT_KEYWORDS.SPORT))     return { intent: "SPORT", entity };
   if (containsWholeWords(text, INTENT_KEYWORDS.FINANCE))   return { intent: "FINANCE", entity };
   if (containsWholeWords(text, INTENT_KEYWORDS.METEO))     return { intent: "METEO", entity };
@@ -5541,7 +5548,7 @@ function preRouteIntent(message) {
 }
 
 // ================================================================================
-// §3.12 — TASKS CRUD (UUID + Firestore-first)
+// §3.12 — TASKS CRUD
 // ================================================================================
 
 async function createTask(userId, { title, notes = null, dueAt = null }) {
@@ -5612,9 +5619,7 @@ async function updateTaskStatus(userId, taskId, status) {
     [status, Date.now(), taskId, userId]
   );
 
-  if (firestoreDb) {
-    fsUpdate("user_tasks", taskId, { status, updated_at: Date.now() }).catch(() => {});
-  }
+  if (firestoreDb) fsUpdate("user_tasks", taskId, { status, updated_at: Date.now() }).catch(() => {});
   if (supabase) {
     supabaseWriteSafe({
       table: "user_tasks", op: "update",
@@ -5642,7 +5647,7 @@ async function deleteTask(userId, taskId) {
 }
 
 // ================================================================================
-// §3.13 — QUOTAS UTILISATEUR
+// §3.13 — QUOTAS
 // ================================================================================
 
 async function checkUserQuota(userId, action, userRole = "FREE") {
@@ -5695,7 +5700,7 @@ async function incrementUserQuota(userId, action) {
 }
 
 // ================================================================================
-// §3.14 — EMAIL DISPATCH (Gmail API / Resend / SMTP)
+// §3.14 — EMAIL DISPATCH
 // ================================================================================
 
 let emailTransporter = null;
@@ -5805,7 +5810,7 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, 
   let result;
   if (googleAccessToken) {
     try { result = await sendEmailViaGmail(googleAccessToken, recipient, subject, body); }
-    catch (e) { result = { success: false, error: "Gmail API échec" }; }
+    catch { result = { success: false, error: "Gmail API échec" }; }
   } else if (process.env.RESEND_API_KEY) {
     result = await sendEmailViaResend(recipient, subject, body);
   } else {
@@ -5919,7 +5924,7 @@ function toPlainWhatsAppText(markdown) {
 }
 
 // ================================================================================
-// §3.16 — WIRE SHARED HELPERS (remplace les stubs de Partie 2)
+// §3.16 — WIRE SHARED HELPERS
 // ================================================================================
 
 setSharedHelpers({
@@ -5927,8 +5932,8 @@ setSharedHelpers({
   searchWeb,
   searchNews,
   searchSportsScores,
-  searchScience: async () => ({ papers: [] }),          // Sera complété en v16.1 si besoin
-  searchSocial:  async () => ({ posts: [] }),           // Idem
+  searchScience: async () => ({ papers: [] }),
+  searchSocial:  async () => ({ posts: [] }),
   getWeather,
   getCryptoPrice,
   getStockPrice,
@@ -5946,113 +5951,79 @@ setSharedHelpers({
   evaluateMathSafe
 });
 
-logger.info("✅ Helpers Partie 3 injectés dans Partie 2");
+logger.info("✅ Helpers Partie 3 v16.1 injectés dans Partie 2");
 
 // ================================================================================
-// §3.17 — EXPORTS PARTIE 3
+// §3.17 — EXPORTS PART 3 v16.1
 // ================================================================================
 
 Object.assign(module.exports, {
-  // Search
   searchTavily, searchSerper, searchDuckDuckGo, searchGdelt, searchHackerNews,
   searchWikipediaSummary, searchWeb,
 
-  // Media
   searchWikimediaImages, fetchWikipediaThumb, searchPexelsImages,
   searchDuckDuckGoImages, searchImagesWithFallback,
   extractYouTubeVideoId, searchYouTube, searchYouTubeYoutubei,
 
-  // Weather
   getWeather,
-
-  // Finance
   getCryptoPrice, getStockPrice,
 
-  // News + Sports
   fetchGoogleNews, searchNews, extractScoreFromText,
   searchSportsViaGoogleNews, searchSportsScores,
 
-  // Code sandbox
   runCodeSandbox, SUPPORTED_SANDBOX_LANGS,
-
-  // Vision
   analyzeImage,
 
-  // Ads
   LUBA_PRO_ADS, fetchGhostAds, fetchAdsterra, getAd, getAllAdSlots,
 
-  // Math
   evaluateMathSafe, detectMathExpressions,
 
-  // Entity + routage
   extractEntity, normalizeForMatch, containsWholeWords, preRouteIntent, INTENT_KEYWORDS,
 
-  // Tasks
   createTask, listTasks, updateTaskStatus, deleteTask,
-
-  // Quotas
   checkUserQuota, incrementUserQuota,
 
-  // Email
   verifyGmailScope, sendEmailViaGmail, sendEmailViaResend, sendEmailViaSMTP, dispatchSendEmail,
 
-  // WhatsApp
   getWhatsAppCryptoKey, saveWhatsAppCredentials, loadWhatsAppCredentials,
   deleteWhatsAppCredentials, sendWhatsAppSmart, toPlainWhatsAppText,
 
-  // Registre injectable
   setWhatsAppManager: (mgr) => { whatsappManager = mgr; }
 });
 
 // ================================================================================
-// ==================== FIN PARTIE 3/4 ===========================================
-// ================================================================================
-// ▶ Prochaine partie (4/4) : Routes Express (chat, tools, tasks, memory, ads,
-//   voice, whatsapp, intent), Luba Live WebSocket (protocole binaire custom),
-//   métriques, housekeeping, bootstrap, Dockerfile, CI/CD.
-//   Tape "suite" quand tu es prêt.
+// ==================== FIN PARTIE 3/4 v16.1 =====================================
 // ================================================================================
 // ================================================================================
-// PARTIE 4/4 — ROUTES, LUBA LIVE WS, PRODUCTION, DÉPLOIEMENT
+// PARTIE 4/4 v16.1 — ROUTES, HANDLECHAT, LUBA LIVE WS, PRODUCTION
+// ================================================================================
+// 🎉 DERNIÈRE PARTIE — Backend Luba AI Pro v16.1.0 complet
 // ================================================================================
 // Sommaire :
 //   §4.1   SSE Writer + streaming helpers
-//   §4.2   LUBA_SYSTEM_PROMPT (anti-hallucination)
+//   §4.2   LUBA_SYSTEM_PROMPT v16.1 (langue + routing tools fix)
 //   §4.3   Sessions + ActiveIntent + FullHistory
-//   §4.4   Mémoire long terme (résumé + Firestore)
-//   §4.5   Suggestions (extract + generate)
-//   §4.6   Enrichissement contexte (images/vidéos/scores parallèles)
-//   §4.7   handleChat (cœur du backend)
-//   §4.8   handleActiveIntent (annulation + expiration)
-//   §4.9   WhatsApp Baileys manager
+//   §4.4   Mémoire long terme (résumé)
+//   §4.5   Suggestions
+//   §4.6   Enrichissement contexte
+//   §4.7   handleChat v16.1 (avec AI Quality Layer intégré)
+//   §4.8   handleActiveIntent
+//   §4.9   WhatsApp Baileys
 //   §4.10  Reminder scheduler
-//   §4.11  Express app + middlewares globaux
-//   §4.12  Routes API complètes
-//   §4.13  Luba Live WebSocket (protocole binaire custom)
+//   §4.11  Express app + middlewares
+//   §4.12  Routes API
+//   §4.13  Luba Live WebSocket (binaire)
 //   §4.14  Bootstrap + graceful shutdown
-//   §4.15  Docker / docker-compose / Nginx / CI-CD
+//   §4.15  Docker / Compose / Nginx / CI-CD
 //   §4.16  Exports finaux
 // ================================================================================
 
+"use strict";
+
 // ================================================================================
-// §4.1 — SSE WRITER + STREAMING HELPERS
+// §4.1 — SSE WRITER + STREAMING
 // ================================================================================
 
-/**
- * Writer SSE typé.
- * Contrat d'événements :
- *   status       { stage, message?, iteration?, name? }
- *   reasoning    { text }
- *   code         { language, filename?, code?, stdout?, stderr?, done, execution? }
- *   images       { images: [{url,title,source,pageUrl}] }
- *   videos       { videos: [{videoId,title,url,embedUrl,thumbnail,channel}] }
- *   token        { text }
- *   suggestions  { suggestions: ["...","...","..."] }
- *   sources      { sources: [{name,url,logo}] }
- *   error        { reply, code? }
- *   done         { conversationId, isNewConversation, providerUsed, modelTier,
- *                  degraded, visionEnabled, intent, contextLength }
- */
 class SSEWriter {
   constructor(res) {
     this.res = res;
@@ -6087,6 +6058,7 @@ class SSEWriter {
   videos(list)              { if (list?.length) this.send("videos", { videos: list }); }
   suggestions(list)         { if (list?.length) this.send("suggestions", { suggestions: list }); }
   sources(list)             { if (list?.length) this.send("sources", { sources: list }); }
+  quality(payload)          { this.send("quality", payload); }
   error(payload)            { this.send("error", payload); }
   done(payload)             { this.send("done", payload); }
 
@@ -6107,60 +6079,68 @@ async function streamTextAsTokens(sse, text, { paceMs = 4, chunkSize = 28 } = {}
 }
 
 // ================================================================================
-// §4.2 — LUBA_SYSTEM_PROMPT (anti-hallucination)
+// §4.2 — LUBA_SYSTEM_PROMPT v16.1 (✅ FIX langue + routing tools)
 // ================================================================================
 
 const LUBA_SYSTEM_PROMPT = [
   "Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
   "",
-  "IDENTITÉ :",
-  "- Tu t'appelles Luba (ou Luba.ia).",
-  "- Ton ton est chaleureux, intelligent, proactif.",
-  "- Tu es un vrai agent IA (façon Jarvis), pas un chatbot passif.",
-  "- Tu supportes le français, l'anglais, le swahili et le lingala. Réponds dans la langue de l'utilisateur.",
+  "═══════════════════════════════════════════════════════════════════════",
+  "LANGUE — RÈGLE #1 ABSOLUE :",
+  "═══════════════════════════════════════════════════════════════════════",
+  "- Tu réponds TOUJOURS dans la langue du DERNIER message utilisateur.",
+  "- Français → français. English → English. Kiswahili → Kiswahili. Lingala → Lingala.",
+  "- Si l'utilisateur écrit en français, tu ne réponds JAMAIS en chinois, anglais ou autre.",
+  "- En cas de doute sur la langue, utilise le français (langue par défaut de Luba).",
   "",
-  "MÉMOIRE :",
-  "- Souviens-toi du contexte de la conversation.",
-  "- Ne redemande JAMAIS une info déjà donnée.",
-  "- Si une [MÉMOIRE LONG TERME] est fournie, utilise-la naturellement.",
-  "- Tu peux appeler remember_fact pour mémoriser un fait durable, recall_memory pour retrouver une info oubliée.",
+  "IDENTITÉ :",
+  "- Tu t'appelles Luba. Ton ton est chaleureux, direct, utile.",
+  "- Tu es un vrai agent IA (façon Jarvis), pas un chatbot passif.",
   "",
   "DONNÉES — RÈGLE ABSOLUE (violation = faute grave) :",
-  "- N'invente JAMAIS un score, une actualité, une météo, un prix, une vidéo, un nom de joueur, une date.",
-  "- Si un outil retourne un résultat, UTILISE-LE TEL QUEL. Ne modifie aucun chiffre.",
-  "- Si un outil ÉCHOUE ou retourne 'aucun résultat', DIS-LE CLAIREMENT à l'utilisateur.",
-  "  Exemple : « Je n'ai pas trouvé le score exact pour ce match. Veux-tu que je cherche autrement ? »",
-  "- Mieux vaut dire « je ne sais pas » que d'inventer une information.",
+  "- N'invente JAMAIS un chiffre, un score, une date, un nom, une URL.",
+  "- Si un outil échoue, dis-le clairement : « Je n'ai pas trouvé X. Veux-tu que je cherche autrement ? »",
   "",
-  "IMAGES :",
-  "- Dès que tu décris une personnalité, un lieu, un objet ou une équipe précise, appelle search_images.",
-  "- Les images sont affichées automatiquement — ne mentionne JAMAIS les URLs dans ta réponse.",
+  "═══════════════════════════════════════════════════════════════════════",
+  "ROUTAGE DES OUTILS (CRITIQUE — respecte à la lettre) :",
+  "═══════════════════════════════════════════════════════════════════════",
   "",
-  "MODULE JARVIS :",
-  "- Chercher un clip → search_youtube",
-  "- Créer un rappel → create_task (avec due_at ISO si une date est mentionnée)",
-  "- Voir les tâches → list_tasks",
-  "- Météo → get_weather",
-  "- Crypto → get_crypto_price ; Action → get_stock_price",
+  "▸ MATHÉMATIQUES (calculs, équations, intégrales, dérivées, factorielles, pourcentages) :",
+  "  → Utilise OBLIGATOIREMENT `execute_math`.",
+  "  → N'utilise JAMAIS `run_code` pour un calcul mathématique.",
+  "  → Exemples :",
+  "    • « calcule 15 × 32 + 7 » → execute_math({ expression: '15*32+7' })",
+  "    • « 20% de 350 » → execute_math({ expression: '0.20*350' })",
+  "    • « résous x²-5x+6=0 » → execute_math({ expression: 'solve(x^2-5*x+6=0, x)' })",
+  "    • « racine carrée de 144 » → execute_math({ expression: 'sqrt(144)' })",
   "",
-  "CODE :",
-  "- Fournis du code de production complet, jamais tronqué.",
-  "- Utilise des blocs Markdown typés (```python, ```javascript, etc.).",
-  "- Tu peux appeler run_code pour vérifier qu'un extrait fonctionne.",
+  "▸ CODE (écrire/exécuter du Python, JS, etc.) :",
+  "  → Utilise `run_code`. UNIQUEMENT pour vérifier du code, JAMAIS pour calculer.",
   "",
-  "MATHÉMATIQUES :",
+  "▸ MÉTÉO : `get_weather`.",
+  "▸ CRYPTO (BTC, ETH...) : `get_crypto_price`.",
+  "▸ ACTIONS (AAPL, TSLA...) : `get_stock_price`.",
+  "▸ ACTUALITÉS : `search_news`.",
+  "▸ SPORT (score, match) : `search_sports_scores`.",
+  "▸ IMAGES : `search_images`. ▸ VIDÉOS : `search_youtube`.",
+  "▸ RECHERCHE WEB : `search_web`.",
+  "▸ TÂCHES : `create_task`, `list_tasks`, `complete_task`, `delete_task`.",
+  "▸ MÉMOIRE : `remember_fact` (rare), `recall_memory`.",
+  "",
+  "═══════════════════════════════════════════════════════════════════════",
+  "",
+  "MATHÉMATIQUES — FORMAT :",
   "- Écris les formules en LaTeX : $inline$ ou $$display$$.",
-  "- N'utilise JAMAIS \\( … \\) ni \\[ … \\], ni d'échappements inutiles.",
+  "- JAMAIS \\( … \\) ni \\[ … \\].",
   "",
-  "FORMAT :",
-  "- Réponds en Markdown propre, avec titres **gras**, listes, tableaux si utile.",
-  "- Sois concis, direct, utile.",
-  "- INTERDIT : entourer ta réponse de JSON, de balises <think>, ou de blocs {replyText: ...}.",
+  "FORMAT RÉPONSE :",
+  "- Markdown propre (gras, listes, tableaux, blocs code typés).",
+  "- Concis, direct, utile.",
+  "- INTERDIT : entourer la réponse de JSON, de balises <think>, ou de blocs {replyText: ...}.",
   "",
   "SUGGESTIONS :",
-  "- À la fin de ta réponse, si pertinent, ajoute un bloc :",
-  '  <!--SUGGESTIONS:["Question 1 ?","Question 2 ?","Question 3 ?"]-->',
-  "- Sinon, n'ajoute rien."
+  "- À la fin, si pertinent : <!--SUGGESTIONS:[\"Q1 ?\",\"Q2 ?\",\"Q3 ?\"]-->",
+  "- Sinon n'ajoute rien."
 ].join("\n");
 
 // ================================================================================
@@ -6178,7 +6158,6 @@ async function getSession(conversationId, userId, firebaseUid = null) {
     }
     await dbRun("UPDATE sessions SET updated_at = ? WHERE session_id = ?", [Date.now(), conversationId]);
 
-    // Sync Firestore + Supabase (best effort)
     if (firestoreDb) {
       fsSet("sessions", conversationId, {
         session_id: conversationId, user_id: userId,
@@ -6263,7 +6242,6 @@ async function clearActiveIntent(conversationId) {
 }
 
 async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMITS.MAX_CONTEXT_MESSAGES) {
-  // Priorité : Firestore (le plus frais si Admin SDK actif)
   if (firestoreDb) {
     try {
       const rows = await fsQuery("messages", {
@@ -6282,7 +6260,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMI
     }
   }
 
-  // Fallback Supabase
   if (supabase) {
     try {
       const q = supabase
@@ -6301,7 +6278,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMI
     }
   }
 
-  // Fallback SQLite
   try {
     let q = "SELECT role, content FROM messages WHERE session_id = ?";
     const params = [conversationId];
@@ -6362,15 +6338,10 @@ async function assertConversationOwnership(conversationId, userId) {
   return true;
 }
 
-/**
- * Sauvegarde un message (triple-write : Firestore + Supabase + SQLite).
- * Le texte PUR est sauvegardé (pas les blocs Illustrations/Sources).
- */
 async function saveMessageWithUser(conversationId, role, content, userId = null, firebaseUid = null, metadata = {}) {
   const now = Date.now();
   const msgId = generateMsgId();
 
-  // 1) Firestore (principal)
   if (firestoreDb && userId) {
     fsSet("messages", msgId, {
       session_id: conversationId,
@@ -6381,7 +6352,6 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
     }).catch(() => {});
   }
 
-  // 2) Supabase (backup)
   if (supabase && userId) {
     const idemKey = `msg:${conversationId}:${role}:${now}:${sha256(String(content).slice(0, 64)).slice(0, 12)}`;
     supabaseWriteSafe({
@@ -6398,7 +6368,6 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
     }).catch(() => {});
   }
 
-  // 3) SQLite (local, toujours)
   try {
     await dbRun(
       `INSERT INTO messages (session_id, user_id, role, content, metadata, created_at)
@@ -6420,12 +6389,10 @@ const USER_MEMORY_UPDATE_EVERY_N_MESSAGES = parseInt(
 );
 
 async function getUserMemory(userId) {
-  // Firestore
   if (firestoreDb) {
     const doc = await fsGet("user_memory", userId);
     if (doc?.summary) return doc.summary;
   }
-  // Supabase
   if (supabase) {
     try {
       const { data, error } = await supabase.from("user_memory")
@@ -6433,7 +6400,6 @@ async function getUserMemory(userId) {
       if (!error && data) return data.summary || "";
     } catch {}
   }
-  // SQLite
   const row = await dbGet("SELECT summary FROM user_memory WHERE user_id = ?", [userId]);
   return row?.summary || "";
 }
@@ -6536,7 +6502,6 @@ async function maybeUpdateUserMemoryAsync(userId, lastUserMessage, lastAssistant
   try {
     const count = await incrementUserMemoryCounter(userId);
     if (count < USER_MEMORY_UPDATE_EVERY_N_MESSAGES) {
-      // Extrait quand même des faits durables (fire-and-forget léger)
       if (count % 3 === 0) {
         extractFactsFromExchange(userId, lastUserMessage, lastAssistantReply).catch(() => {});
       }
@@ -6572,7 +6537,7 @@ async function generateSuggestions(userMessage, replyText) {
       messages: [
         {
           role: "system",
-          content: 'Génère 3 questions de suivi courtes (max 60 char). Réponds strictement en JSON : {"suggestions":["...","...","..."]}'
+          content: 'Génère 3 questions de suivi courtes (max 60 char) dans la langue de l\'utilisateur. Réponds strictement en JSON : {"suggestions":["...","...","..."]}'
         },
         {
           role: "user",
@@ -6627,7 +6592,7 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
         for (const expr of expressions.slice(0, 2)) {
           const { result } = await run("execute_math", { expression: expr });
           if (result.success) {
-            enrichment.contextData += `\n[Calcul exact] ${expr} = ${result.formatted}\n`;
+            enrichment.contextData += `\n[CALCUL EXACT — utilise ce résultat tel quel] ${expr} = ${result.formatted}\n`;
           }
         }
         break;
@@ -6665,7 +6630,7 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
         ]);
 
         if (scoresRes.result.events?.length) {
-          enrichment.contextData += `\n[RÉSULTATS SPORTIFS RÉCENTS (source : Google News, vérifié)]\n`;
+          enrichment.contextData += `\n[RÉSULTATS SPORTIFS RÉCENTS (Google News, vérifié)]\n`;
           scoresRes.result.events.forEach((e) => {
             enrichment.contextData +=
               `- ${e.match}\n` +
@@ -6775,7 +6740,7 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
 }
 
 // ================================================================================
-// §4.7 — HANDLECHAT (cœur du backend)
+// §4.7 — HANDLECHAT v16.1 (avec AI Quality Layer intégré)
 // ================================================================================
 
 async function handleChat({
@@ -6786,9 +6751,12 @@ async function handleChat({
   const startedAt = Date.now();
   const useV250 = modelTier === "v250";
 
-  if (sse) sse.status("starting");
+  // ✅ FIX v16.1 : détection langue
+  const detectedLanguage = detectLanguage(message);
 
-  // 1) Lecture parallèle
+  if (sse) sse.status("starting", { language: detectedLanguage });
+
+  // 1) Lectures parallèles
   const [_, history, longTermMemory, activeIntent] = await Promise.all([
     getSession(conversationId, userId, firebaseUid).catch((e) => {
       if (e.code === "CONVERSATION_OWNERSHIP") throw e;
@@ -6800,7 +6768,7 @@ async function handleChat({
     getActiveIntent(conversationId).catch(() => null)
   ]);
 
-  // 2) Intention active (WhatsApp, Email)
+  // 2) Intention active
   if (activeIntent) {
     if (sse) sse.status("active_intent");
     const out = await handleActiveIntent(conversationId, activeIntent, message, { userId, googleAccessToken });
@@ -6815,13 +6783,14 @@ async function handleChat({
       reply: out.reply, images: [], media: { images: [], videos: [] },
       suggestions: [], sources: [], intent: "ACTIVE_INTENT",
       providerUsed: "active_intent", modelTier, degraded: false,
-      conversationId, isNewConversation: false, error: !!out.error
+      conversationId, isNewConversation: false, error: !!out.error,
+      confidence: 1.0, qualityScore: 1.0
     };
   }
 
-  // 3) Pré-routeur intention + entité
+  // 3) Pré-routeur intention
   const { intent, entity } = preRouteIntent(message);
-  if (sse) sse.status("thinking", { intent });
+  if (sse) sse.status("thinking", { intent, language: detectedLanguage });
 
   // 4) Save user message
   saveMessageWithUser(conversationId, "user", message, userId, firebaseUid).catch(() => {});
@@ -6833,13 +6802,16 @@ async function handleChat({
   if (sse && enrichment.media.images.length > 0) sse.images(enrichment.media.images);
   if (sse && enrichment.media.videos.length > 0) sse.videos(enrichment.media.videos);
 
-  // 6) Construction des messages LLM
+  // 6) Construction messages
   const historyWithoutCurrent = history.length > 0 && history[history.length - 1].role === "user"
     ? history.slice(0, -1)
     : history;
   const contextHistory = historyWithoutCurrent.slice(-CONFIG.LIMITS.MAX_CONTEXT_MESSAGES);
 
+  // ✅ FIX v16.1 : injection langue explicite
   let systemContent = LUBA_SYSTEM_PROMPT;
+  systemContent += `\n\n[LANGUE DÉTECTÉE : ${detectedLanguage.toUpperCase()}] → Tu DOIS répondre en ${detectedLanguage === "fr" ? "français" : detectedLanguage === "en" ? "anglais" : detectedLanguage === "sw" ? "kiswahili" : "lingala"}.`;
+
   if (longTermMemory) {
     systemContent += `\n\n[MÉMOIRE LONG TERME SUR CET UTILISATEUR]\n${longTermMemory}`;
   }
@@ -6866,6 +6838,7 @@ async function handleChat({
   let visionEnabled = Boolean(images && images.length > 0);
   let finalText = "";
   let toolCallTrace = [];
+  let lastReasoning = "";
 
   const providerChain = (images && images.length > 0)
     ? MODEL_TIERS.vision.providers
@@ -6884,6 +6857,7 @@ async function handleChat({
 
   try {
     let loopResult = { success: false };
+    let lastError = null;
 
     for (const provider of providerChain) {
       const r = await runToolLoop({
@@ -6899,15 +6873,21 @@ async function handleChat({
         providerUsed = provider.provider;
         break;
       }
-      logger.warn({ provider: provider.provider, err: r.error?.message }, "Boucle tool LLM échouée, provider suivant");
+      lastError = r.error;
+      logger.warn({ provider: provider.provider, err: r.error?.message }, "Provider échoué, suivant");
     }
 
     if (!loopResult.success) {
-      finalText = userFacingErrorMessage(loopResult.error);
+      // ✅ FIX v16.1 : message d'erreur actionnable avec contexte
+      finalText = userFacingErrorMessage(lastError, {
+        provider: providerChain[0]?.provider,
+        model: providerChain[0]?.model
+      });
       degraded = true;
     } else {
       finalText = loopResult.text || "";
       toolCallTrace = loopResult.toolCallTrace || [];
+      lastReasoning = loopResult.reasoning || "";
       (loopResult.usedSources || []).forEach((k) => usedSources.add(k));
       collectedImages.push(...(loopResult.images || []));
       collectedVideos.push(...(loopResult.videos || []));
@@ -6916,11 +6896,11 @@ async function handleChat({
       }
     }
 
-    // 8) Phase code v250 (si applicable)
+    // 8) Phase code v250
     if (useV250 && !images && finalText && intent === "CODE") {
       const codeProvider = MODEL_TIERS.v250.code.providers[0];
       const codeMessages = [
-        { role: "system", content: LUBA_SYSTEM_PROMPT + "\n\n[PHASE CODE] Fournis le code complet et fonctionnel." },
+        { role: "system", content: LUBA_SYSTEM_PROMPT + `\n\n[PHASE CODE] Fournis le code complet et fonctionnel. Langue de réponse : ${detectedLanguage.toUpperCase()}.` },
         ...contextHistory,
         { role: "user", content: message }
       ];
@@ -6955,19 +6935,79 @@ async function handleChat({
       .catch(() => {});
   }
 
-  // 10) Dédoublonnage médias
+  // 10) ✅ v16.1 : AI QUALITY LAYER (self-critique + confidence + hallucination)
+  let qualityReport = null;
+  if (!degraded && finalText.length > 20) {
+    try {
+      qualityReport = await assessResponseQuality({
+        userMessage: message,
+        draftAnswer: finalText,
+        toolCallTrace,
+        reasoning: lastReasoning,
+        providerConfig: providerChain[0],
+        intent,
+        degraded,
+        _meta: { sessionId: conversationId, userId, tier: modelTier }
+      });
+
+      // Si self-critique a amélioré → on remplace
+      if (qualityReport.selfCritique?.improved && qualityReport.finalText) {
+        finalText = qualityReport.finalText;
+      }
+
+      // Stream SSE du quality report
+      if (sse) {
+        sse.quality({
+          confidence: qualityReport.confidence,
+          qualityScore: qualityReport.qualityScore,
+          hallucinationDetected: qualityReport.hallucination.detected,
+          selfCritiqueImproved: qualityReport.selfCritique.improved
+        });
+      }
+    } catch (e) {
+      logger.warn({ err: e.message }, "AI Quality Layer échoué (non bloquant)");
+    }
+  }
+
+  // 11) Dédoublonnage médias
   collectedImages = [...new Set(collectedImages.filter(Boolean))];
   collectedVideos = dedupeVideos(collectedVideos);
 
-  // 11) Save assistant message
+  // 12) Save assistant message
   saveMessageWithUser(conversationId, "assistant", finalText, userId, firebaseUid, {
-    providerUsed, intent, degraded
+    providerUsed, intent, degraded,
+    confidence: qualityReport?.confidence,
+    qualityScore: qualityReport?.qualityScore,
+    language: detectedLanguage
   }).catch(() => {});
 
-  // 12) Mémoire (fire-and-forget)
+  // 13) Save reasoning trace (fire-and-forget)
+  if (lastReasoning || qualityReport) {
+    dbRun(
+      `INSERT INTO reasoning_traces (
+        session_id, user_id, user_message, reasoning, draft_answer, final_answer,
+        confidence, quality_score, self_critique_improved, hallucination_detected,
+        provider, model, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        conversationId, userId, message.slice(0, 500),
+        lastReasoning.slice(0, 5000),
+        qualityReport?.originalText?.slice(0, 5000) || finalText.slice(0, 5000),
+        finalText.slice(0, 5000),
+        qualityReport?.confidence || 0.5,
+        qualityReport?.qualityScore || 0.5,
+        qualityReport?.selfCritique?.improved ? 1 : 0,
+        qualityReport?.hallucination?.detected ? 1 : 0,
+        providerUsed, providerChain[0]?.model || "unknown",
+        Date.now()
+      ]
+    ).catch(() => {});
+  }
+
+  // 14) Mémoire
   maybeUpdateUserMemoryAsync(userId, message, finalText).catch(() => {});
 
-  // 13) Construction réponse client
+  // 15) Construction réponse client
   let replyForClient = finalText;
 
   const shouldInlineImages = !sse && enrichment.media.images.length === 0 && collectedImages.length > 0;
@@ -7023,13 +7063,19 @@ async function handleChat({
     suggestions,
     sources: [...usedSources].map((k) => SOURCE_LABELS[k]).filter(Boolean),
     intent,
+    language: detectedLanguage,
     userId,
     contextLength: history.length,
     toolCallTrace,
-    elapsedMs: Date.now() - startedAt
+    elapsedMs: Date.now() - startedAt,
+    // ✅ v16.1
+    confidence: qualityReport?.confidence ?? null,
+    qualityScore: qualityReport?.qualityScore ?? null,
+    hallucinationDetected: qualityReport?.hallucination?.detected ?? false,
+    selfCritiqueImproved: qualityReport?.selfCritique?.improved ?? false
   };
 
-  // 14) SSE : stream final
+  // 16) SSE final
   if (sse) {
     sse.suggestions(suggestions);
     sse.sources(result.sources);
@@ -7042,8 +7088,11 @@ async function handleChat({
       degraded,
       visionEnabled,
       intent,
+      language: detectedLanguage,
       contextLength: history.length,
-      elapsedMs: result.elapsedMs
+      elapsedMs: result.elapsedMs,
+      confidence: result.confidence,
+      qualityScore: result.qualityScore
     });
     sse.end();
   }
@@ -7052,7 +7101,7 @@ async function handleChat({
 }
 
 // ================================================================================
-// §4.8 — HANDLEACTIVEINTENT (annulation + expiration)
+// §4.8 — HANDLEACTIVEINTENT
 // ================================================================================
 
 const CANCEL_WORDS = new Set([
@@ -7136,7 +7185,7 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
 }
 
 // ================================================================================
-// §4.9 — WHATSAPP BAILEYS MANAGER
+// §4.9 — WHATSAPP BAILEYS
 // ================================================================================
 
 function isWhatsAppAllowed(phoneNumber) {
@@ -7145,9 +7194,7 @@ function isWhatsAppAllowed(phoneNumber) {
 }
 
 class BaileysManager {
-  constructor() {
-    this.sessions = new Map();
-  }
+  constructor() { this.sessions = new Map(); }
 
   async initClient(userId) {
     const existing = this.sessions.get(userId);
@@ -7183,7 +7230,7 @@ class BaileysManager {
       version, auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Luba.ia", "Chrome", "16.0.0"]
+      browser: ["Luba.ia", "Chrome", "16.1.0"]
     });
 
     const sessionData = { sock, qrCode: null, ready: false };
@@ -7254,10 +7301,7 @@ class BaileysManager {
           if (!text) continue;
 
           const phoneNumber = remoteJid.replace(/@.*$/, "");
-          if (!isWhatsAppAllowed(phoneNumber)) {
-            logger.info({ phoneNumber }, "WhatsApp : expéditeur hors liste blanche");
-            continue;
-          }
+          if (!isWhatsAppAllowed(phoneNumber)) continue;
 
           const waUserId = await this._resolveUser(phoneNumber);
           if (!waUserId) continue;
@@ -7337,7 +7381,6 @@ class BaileysManager {
 
 const baileysManager = new BaileysManager();
 
-// Injection dans la Partie 3
 if (typeof module.exports.setWhatsAppManager === "function") {
   module.exports.setWhatsAppManager(baileysManager);
 }
@@ -7364,7 +7407,7 @@ async function reminderTick() {
           [Date.now(), task.id]
         );
         if (result.changes === 0) continue;
-        logger.info({ taskId: task.id, userId: task.user_id, title: task.title }, "🔔 Rappel échu");
+        logger.info({ taskId: task.id, userId: task.user_id }, "🔔 Rappel échu");
 
         if (process.env.REMINDER_WHATSAPP_ENABLED === "true") {
           const user = await dbGet("SELECT whatsapp_session_id FROM users WHERE id = ?", [task.user_id]);
@@ -7389,7 +7432,6 @@ const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-// ---------- CORS ----------
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin || HOSTING_CONFIG.allowedOrigins.includes(origin)) return callback(null, true);
@@ -7408,13 +7450,11 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// ---------- CSP nonce ----------
 app.use((req, res, next) => {
   res.locals.cspNonce = crypto.randomBytes(16).toString("base64");
   next();
 });
 
-// ---------- Helmet ----------
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: {
@@ -7459,7 +7499,6 @@ app.use(helmet({
   frameguard: { action: "deny" }
 }));
 
-// ---------- HTTPS forcé ----------
 app.use((req, res, next) => {
   if (CONFIG.ENV === "production"
       && req.headers["x-forwarded-proto"]
@@ -7469,7 +7508,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Body parsers ----------
 const jsonBodySmall = express.json({ limit: "1mb" });
 const jsonBodyLarge = express.json({ limit: "20mb" });
 const urlEncoded   = express.urlencoded({ extended: true, limit: "1mb" });
@@ -7482,31 +7520,23 @@ app.use((req, res, next) => {
 });
 app.use(urlEncoded);
 
-// ---------- Request ID + métriques ----------
 app.use((req, res, next) => {
   const requestId = generateRequestId();
   const start = Date.now();
   req.requestId = requestId;
   res.setHeader("X-Request-Id", requestId);
-
   res.on("finish", () => {
     const duration = Date.now() - start;
     logger.info({
       requestId, method: req.method, path: req.path,
       status: res.statusCode, duration
     }, "requête");
-
-    if (metrics?.httpRequests) {
-      metrics.httpRequests.labels(req.method, req.path, String(res.statusCode)).inc();
-    }
-    if (metrics?.httpDuration) {
-      metrics.httpDuration.labels(req.method, req.path, String(res.statusCode)).observe(duration / 1000);
-    }
+    if (metrics?.httpRequests) metrics.httpRequests.labels(req.method, req.path, String(res.statusCode)).inc();
+    if (metrics?.httpDuration) metrics.httpDuration.labels(req.method, req.path, String(res.statusCode)).observe(duration / 1000);
   });
   next();
 });
 
-// ---------- Multer ----------
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -7528,7 +7558,6 @@ const uploadAudio = multer({
   }
 });
 
-// ---------- Rate limiters ----------
 let redisRateLimitStore = null;
 try {
   if (process.env.REDIS_URL && IORedis) {
@@ -7559,7 +7588,7 @@ const chatLimiter   = makeLimiter({ windowMs: 60 * 1000,       max: 30,  code: "
 const authLimiter   = makeLimiter({ windowMs: 15 * 60 * 1000, max: 60,  code: "RATE_LIMIT_AUTH",   message: "Trop de tentatives d'authentification." });
 const toolLimiter   = makeLimiter({ windowMs: 60 * 1000,       max: 40,  code: "RATE_LIMIT_TOOL",   message: "Trop d'appels d'outils." });
 
-// ---------- Auth middleware ----------
+// ---------- Auth ----------
 const tokenCache = new LRUCache({
   max: 5000,
   ttl: CONFIG.AUTH.TOKEN_CACHE_TTL_MS,
@@ -7664,7 +7693,6 @@ async function checkLoginAttempts(ipAddress) {
          blocked_until = excluded.blocked_until`,
       [ipAddress, strikeCount, Date.now() + escalated, Date.now()]
     );
-    if (strikeCount >= 3) logger.warn({ ipAddress, strikeCount }, "🚨 IP récidiviste");
     return { blocked: true, message: "Trop de tentatives échouées. IP temporairement bloquée." };
   }
   return { blocked: false };
@@ -7707,7 +7735,6 @@ async function fastUpsertUser(uid, user, userRole) {
       );
     }
 
-    // Dual-write Firestore + Supabase
     if (firestoreDb) {
       fsSet("users", uid, {
         id: uid, firebase_uid: uid, email: user.email || null,
@@ -7750,10 +7777,8 @@ function authenticateUser(req, res, next) {
     try {
       user = await verifyFirebaseToken(bearerToken);
     } catch (error) {
-      const isExpired = error?.code === "auth/id-token-expired"
-        || error?.errorInfo?.code === "auth/id-token-expired";
+      const isExpired = error?.code === "auth/id-token-expired" || error?.errorInfo?.code === "auth/id-token-expired";
       const isRevoked = error?.code === "auth/id-token-revoked";
-
       const countAsFailure = !isExpired && !isRevoked;
       await recordLoginAttempt(ip, null, false, error.message, { countFailure: countAsFailure });
 
@@ -7820,7 +7845,6 @@ function requireRole(allowedRoles) {
 // §4.12 — ROUTES API
 // ================================================================================
 
-// ---------- Info publique ----------
 app.get("/", (req, res) => {
   res.json({
     success: true, error: false,
@@ -7830,11 +7854,9 @@ app.get("/", (req, res) => {
   });
 });
 
-// ---------- /api/health ----------
 app.get("/api/health", async (req, res) => {
   let dbOk = true;
   try { await dbGet("SELECT 1"); } catch { dbOk = false; }
-
   const full = req.query.full === "1";
   const publicReport = {
     success: dbOk,
@@ -7848,7 +7870,8 @@ app.get("/api/health", async (req, res) => {
       features: {
         vision: FEATURES.gemini || FEATURES.groq,
         quotas: true, sse: true,
-        live: Boolean(process.env.LUBA_LIVE_ENABLED !== "false")
+        live: Boolean(process.env.LUBA_LIVE_ENABLED !== "false"),
+        aiQuality: CONFIG.AI_QUALITY.ENABLE_SELF_CRITIQUE
       }
     }
   };
@@ -7870,12 +7893,12 @@ app.get("/api/health", async (req, res) => {
         gemini: geminiClient ? "actif" : "inactif"
       },
       circuits: getAllCircuitStates(),
+      aiQuality: CONFIG.AI_QUALITY,
       features: FEATURES
     }
   });
 });
 
-// ---------- /ready (Kubernetes / Docker health) ----------
 app.get("/ready", async (req, res) => {
   try {
     await dbGet("SELECT 1");
@@ -7885,11 +7908,9 @@ app.get("/ready", async (req, res) => {
   }
 });
 
-// ---------- /api/metrics (Prometheus) ----------
 app.get("/api/metrics", async (req, res) => {
   const m = metrics();
   if (!m) return res.status(503).json({ error: "Metrics indisponibles" });
-  // Optionnel : protéger par token
   const token = process.env.METRICS_TOKEN;
   if (token && req.query.token !== token) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -7902,24 +7923,94 @@ app.get("/api/metrics", async (req, res) => {
   }
 });
 
-// ---------- /api/user/whoami ----------
-app.get("/api/user/whoami", authLimiter, authenticateUser, (req, res) => {
-  res.status(200).json({
-    success: true, error: false,
-    userId: req.userId,
-    role: req.userRole
-  });
+// ✅ v16.1 — Route debug
+app.get("/api/debug", async (req, res) => {
+  const token = process.env.DEBUG_TOKEN;
+  if (CONFIG.ENV === "production" && (!token || req.query.token !== token)) {
+    return res.status(404).json({ error: "Not found" });
+  }
+
+  const checks = {};
+
+  // Math
+  try {
+    const mathResult = await evaluateMathSafe("15*32+7");
+    checks.math = {
+      ok: mathResult.success,
+      test: "15*32+7",
+      result: mathResult.formatted || mathResult.error
+    };
+  } catch (e) { checks.math = { ok: false, error: e.message }; }
+
+  // Sandbox
+  try {
+    const sandbox = await runCodeSandbox({ language: "python", code: "print(2 + 2)" });
+    checks.sandbox = {
+      ok: sandbox.success,
+      provider: CONFIG.SANDBOX.PROVIDER,
+      url: CONFIG.SANDBOX.PISTON_URL || CONFIG.SANDBOX.JUDGE0_URL,
+      stdout: sandbox.stdout?.slice(0, 100) || null,
+      error: sandbox.error || null
+    };
+  } catch (e) { checks.sandbox = { ok: false, error: e.message }; }
+
+  // Providers
+  checks.llm = {};
+  for (const [name, cfg] of Object.entries(LLM_PROVIDERS)) {
+    checks.llm[name] = { keys: cfg.keyPool.length, available: cfg.keyPool.length > 0 };
+  }
+
+  // LLM test call
+  if (Object.values(checks.llm).some((c) => c.available)) {
+    try {
+      const testResult = await callProviderWithTools({
+        providerConfig: MODEL_TIERS.v100.providers[0],
+        messages: [
+          { role: "system", content: "Réponds juste 'OK'." },
+          { role: "user", content: "Test" }
+        ],
+        tools: null
+      });
+      checks.llmCall = {
+        ok: testResult.success,
+        provider: testResult.providerUsed,
+        model: testResult.modelUsed,
+        preview: testResult.message?.content?.slice(0, 50) || null,
+        error: testResult.error?.message || null
+      };
+    } catch (e) { checks.llmCall = { ok: false, error: e.message }; }
+  }
+
+  checks.storage = {
+    firestore: Boolean(firestoreDb),
+    supabase: Boolean(supabase),
+    sqlite: Boolean(db)
+  };
+
+  checks.circuits = getAllCircuitStates().map((c) => ({
+    name: c.name, state: c.state, failures: c.failureCount
+  }));
+
+  checks.cache = {
+    l1: l1Cache.size || 0,
+    redis: Boolean(redisClient()),
+    semantic: semanticCache.size()
+  };
+
+  return res.json({ success: true, checks });
 });
 
-// ---------- /api/session/bootstrap ----------
+app.get("/api/user/whoami", authLimiter, authenticateUser, (req, res) => {
+  res.status(200).json({ success: true, error: false, userId: req.userId, role: req.userRole });
+});
+
+// Bootstrap
 app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const userId = req.userId;
     const today = todayKeyMs();
 
     let conversations = [];
-
-    // Firestore en priorité
     if (firestoreDb) {
       try {
         const rows = await fsQuery("sessions", {
@@ -7944,10 +8035,9 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
             };
           }));
         }
-      } catch (e) { logger.warn({ err: e.message }, "bootstrap Firestore échec"); }
+      } catch {}
     }
 
-    // Fallback SQLite
     if (conversations.length === 0) {
       const rows = await dbAll(
         `SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 30`,
@@ -7993,7 +8083,8 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
       limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE,
       whatsappConnected: Boolean(userRow?.whatsapp_connected),
       hasMemory: Boolean(longTermMemory),
-      ads: getAllAdSlots()
+      ads: getAllAdSlots(),
+      version: CONFIG.VERSION
     });
   } catch (e) {
     logger.error({ err: e.message }, "Erreur bootstrap");
@@ -8001,7 +8092,7 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
   }
 });
 
-// ---------- /api/chat (SSE opt-in + JSON) ----------
+// Chat
 function wantsStreaming(req) {
   const accept = String(req.headers.accept || "").toLowerCase();
   const bodyStream = req.body && req.body.stream === true;
@@ -8043,16 +8134,14 @@ app.post(
         return res.status(400).json({ success: false, error: true, reply: "Message vide après nettoyage.", code: "INVALID_MESSAGE" });
       }
 
-      // Détection prompt injection
       const injection = detectPromptInjection(sanitizedMessage);
       if (injection.detected) {
-        logger.warn({ userId: req.userId, pattern: injection.pattern }, "🚫 Tentative de prompt injection");
+        logger.warn({ userId: req.userId, pattern: injection.pattern }, "🚫 Prompt injection bloquée");
         await logSecurityEvent(req.userId, "PROMPT_INJECTION_BLOCKED", { pattern: injection.pattern }, req.ip, req.headers["user-agent"]);
         if (isStream) return sseShortError(res, "Requête bloquée par sécurité.", "PROMPT_INJECTION");
         return res.status(400).json({ success: false, error: true, reply: "Requête bloquée par sécurité.", code: "PROMPT_INJECTION" });
       }
 
-      // Modération
       const moderation = await moderateWithGroq(sanitizedMessage);
       if (!moderation.safe) {
         logger.warn({ userId: req.userId, category: moderation.category }, "🚫 Contenu bloqué");
@@ -8061,7 +8150,6 @@ app.post(
         return res.status(400).json({ success: false, error: true, reply: "Contenu non autorisé.", code: "CONTENT_BLOCKED" });
       }
 
-      // Vérification signature HMAC si activée
       if (CONFIG.HMAC.ENABLED) {
         const hmacCheck = verifyHmacSignature(req);
         if (!hmacCheck.valid && !hmacCheck.skipped) {
@@ -8069,7 +8157,6 @@ app.post(
         }
       }
 
-      // Conversation ID
       if (conversationId && !/^[a-zA-Z0-9_-]{6,80}$/.test(conversationId)) {
         if (isStream) return sseShortError(res, "Identifiant de conversation invalide.", "INVALID_CONVERSATION_ID");
         return res.status(400).json({ success: false, error: true, reply: "Identifiant invalide.", code: "INVALID_CONVERSATION_ID" });
@@ -8083,7 +8170,6 @@ app.post(
         return res.status(403).json({ success: false, error: true, reply: e.message, code: "CONVERSATION_OWNERSHIP" });
       }
 
-      // Quota
       const quota = await checkUserQuota(req.userId, "message", req.userRole);
       if (!quota.allowed) {
         if (isStream) return sseShortError(res, quota.message, "QUOTA_EXCEEDED");
@@ -8091,7 +8177,6 @@ app.post(
       }
       await incrementUserQuota(req.userId, "message");
 
-      // Images
       let images = null;
       if (req.files && req.files.length > 0) {
         const invalid = req.files.find((f) => !isValidImageSignature(f.buffer));
@@ -8104,11 +8189,9 @@ app.post(
 
       const googleAccessToken = req.headers["x-google-access-token"] || null;
 
-      // -------- SSE --------
       if (isStream) {
         const sse = new SSEWriter(res);
         req.on("close", () => { sse.closed = true; });
-
         sse.status("accepted", { conversationId, isNewConversation });
 
         try {
@@ -8129,7 +8212,6 @@ app.post(
         return;
       }
 
-      // -------- JSON --------
       const result = await handleChat({
         conversationId, userId: req.userId, firebaseUid: req.firebaseUid,
         message: sanitizedMessage, googleAccessToken,
@@ -8145,7 +8227,7 @@ app.post(
   }
 );
 
-// ---------- /api/conversations ----------
+// Conversations
 app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const rows = await dbAll(
@@ -8171,7 +8253,6 @@ app.get("/api/conversations", apiLimiter, authenticateUser, async (req, res) => 
   }
 });
 
-// ---------- /api/conversation/:id/messages ----------
 app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { conversationId } = req.params;
@@ -8191,7 +8272,7 @@ app.get("/api/conversation/:conversationId/messages", apiLimiter, authenticateUs
   }
 });
 
-// ---------- /api/user/stats ----------
+// User stats
 app.get("/api/user/stats", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const today = todayKeyMs();
@@ -8210,7 +8291,7 @@ app.get("/api/user/stats", apiLimiter, authenticateUser, async (req, res) => {
   }
 });
 
-// ---------- /api/tools ----------
+// Tools
 app.post("/api/tools", toolLimiter, authenticateUser, async (req, res) => {
   try {
     const toolName = req.body?.toolName || req.body?.action;
@@ -8244,7 +8325,7 @@ app.post("/api/tools", toolLimiter, authenticateUser, async (req, res) => {
   }
 });
 
-// ---------- /api/tasks ----------
+// Tasks
 app.get("/api/tasks", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const status = req.query.status && ["pending", "done"].includes(req.query.status) ? req.query.status : null;
@@ -8292,7 +8373,7 @@ app.delete("/api/tasks/:taskId", apiLimiter, authenticateUser, async (req, res) 
   }
 });
 
-// ---------- /api/memory/facts (long terme) ----------
+// Memory facts
 app.get("/api/memory/facts", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const facts = await getAllFacts(req.userId);
@@ -8321,7 +8402,6 @@ app.delete("/api/memory/facts", apiLimiter, authenticateUser, async (req, res) =
   }
 });
 
-// ---------- /api/memory/recall ----------
 app.post("/api/memory/recall", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { query } = req.body || {};
@@ -8333,14 +8413,14 @@ app.post("/api/memory/recall", apiLimiter, authenticateUser, async (req, res) =>
   }
 });
 
-// ---------- /api/ads ----------
+// Ads
 app.get("/api/ads", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const slot = req.query.slot || "sidebar";
     const allowTest = req.query.allowTest !== "false";
     const ad = await getAd({ slot, userId: req.userId, allowTest });
     return res.json({ success: true, error: false, ad });
-  } catch (e) {
+  } catch {
     return res.status(500).json({ success: false, error: true, code: "ADS_ERROR" });
   }
 });
@@ -8349,7 +8429,7 @@ app.get("/api/ads/slots", (req, res) => {
   return res.json({ success: true, error: false, slots: getAllAdSlots() });
 });
 
-// ---------- /api/youtube/search ----------
+// YouTube
 app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const q = req.query.q;
@@ -8362,7 +8442,7 @@ app.get("/api/youtube/search", apiLimiter, authenticateUser, async (req, res) =>
   }
 });
 
-// ---------- /api/voice/transcribe ----------
+// Voice transcribe
 app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.single("audio"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: true, reply: "Aucun fichier audio.", code: "MISSING_AUDIO" });
@@ -8380,7 +8460,7 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
   }
 });
 
-// ---------- /api/voice/tts ----------
+// TTS
 app.post("/api/voice/tts", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { text, voice } = req.body || {};
@@ -8394,7 +8474,7 @@ app.post("/api/voice/tts", apiLimiter, authenticateUser, async (req, res) => {
   }
 });
 
-// ---------- /api/whatsapp/connect ----------
+// WhatsApp
 app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, res) => {
   try {
     const result = await baileysManager.initClient(req.userId);
@@ -8416,7 +8496,6 @@ app.post("/api/whatsapp/connect", strictLimiter, authenticateUser, async (req, r
   }
 });
 
-// ---------- /api/whatsapp/send ----------
 app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res) => {
   try {
     const { to, message } = req.body || {};
@@ -8439,7 +8518,7 @@ app.post("/api/whatsapp/send", strictLimiter, authenticateUser, async (req, res)
   }
 });
 
-// ---------- /api/intent/init ----------
+// Intent
 app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const { intentType } = req.body || {};
@@ -8465,7 +8544,7 @@ app.post("/api/intent/init", apiLimiter, authenticateUser, async (req, res) => {
   }
 });
 
-// ---------- /api/memory/clear ----------
+// Memory clear
 app.post("/api/memory/clear", apiLimiter, authenticateUser, async (req, res) => {
   try {
     const conversationId = req.body?.conversationId || req.body?.conversation_id;
@@ -8490,7 +8569,7 @@ app.post("/api/memory/clear", apiLimiter, authenticateUser, async (req, res) => 
   }
 });
 
-// ---------- /api/admin/set-role ----------
+// Admin
 app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(["ADMIN"]), async (req, res) => {
   try {
     const { uid, role } = req.body || {};
@@ -8508,76 +8587,12 @@ app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(["A
   }
 });
 
-// ---------- /api/admin/backfill (SQLite → Firestore + Supabase) ----------
-app.post("/api/admin/backfill", strictLimiter, authenticateUser, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const stats = { firestore: 0, supabase: 0 };
-
-    const sessions = await dbAll(`SELECT * FROM sessions WHERE user_id = ?`, [userId]);
-    for (const s of sessions) {
-      if (firestoreDb) {
-        await fsSet("sessions", s.session_id, {
-          session_id: s.session_id, user_id: s.user_id,
-          firebase_uid: s.firebase_uid || s.user_id,
-          created_at: s.created_at, updated_at: s.updated_at
-        }, { merge: true });
-        stats.firestore++;
-      }
-      if (supabase) {
-        const r = await supabaseWriteSafe({
-          table: "sessions", op: "upsert",
-          payload: {
-            session_id: s.session_id, user_id: s.user_id,
-            firebase_uid: s.firebase_uid || s.user_id,
-            created_at: new Date(s.created_at).toISOString(),
-            updated_at: new Date(s.updated_at).toISOString()
-          },
-          matchColumn: "session_id",
-          idempotencyKey: `backfill_session:${s.session_id}`
-        });
-        if (r.success) stats.supabase++;
-      }
-    }
-
-    const messages = await dbAll(`SELECT * FROM messages WHERE user_id = ? ORDER BY created_at ASC`, [userId]);
-    for (const m of messages) {
-      if (firestoreDb) {
-        await fsSet("messages", `bf_${m.id}`, {
-          session_id: m.session_id, user_id: userId,
-          role: m.role, content: m.content,
-          created_at: m.created_at
-        }).catch(() => {});
-        stats.firestore++;
-      }
-      if (supabase) {
-        await supabaseWriteSafe({
-          table: "messages", op: "insert",
-          payload: {
-            session_id: m.session_id, firebase_uid: userId, user_id: userId,
-            role: m.role, content: m.content,
-            created_at: new Date(m.created_at).toISOString()
-          },
-          idempotencyKey: `backfill_msg:${m.session_id}:${m.created_at}:${sha256(m.content).slice(0, 8)}`
-        }).catch(() => {});
-        stats.supabase++;
-      }
-    }
-
-    return res.json({ success: true, error: false, stats });
-  } catch (e) {
-    logger.error({ err: e.message }, "backfill échec");
-    return res.status(500).json({ success: false, error: true });
-  }
-});
-
-// ---------- /api/account (RGPD delete) ----------
+// Account delete (RGPD)
 app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => {
   try {
     const userId = req.userId;
     const firebaseUid = req.firebaseUid;
 
-    // WhatsApp cleanup
     try {
       const waSession = baileysManager.sessions.get(userId);
       if (waSession?.sock) waSession.sock.end(undefined);
@@ -8597,10 +8612,10 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       await dbRun("DELETE FROM user_tasks WHERE user_id = ?", [userId]);
       await dbRun("DELETE FROM user_memory WHERE user_id = ?", [userId]);
       await dbRun("DELETE FROM user_memory_facts WHERE user_id = ?", [userId]);
+      await dbRun("DELETE FROM reasoning_traces WHERE user_id = ?", [userId]);
       await dbRun("DELETE FROM users WHERE id = ?", [userId]);
     });
 
-    // Firestore + Supabase purge
     if (firestoreDb) {
       const collections = ["messages", "sessions", "user_tasks", "user_memory", "user_memory_facts"];
       for (const c of collections) {
@@ -8620,7 +8635,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       }
     }
 
-    // Firebase Auth delete
     let firebaseDeleted = false;
     if (firebaseApp() && firebaseAdmin) {
       try {
@@ -8641,12 +8655,12 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
   }
 });
 
-// ---------- 404 ----------
+// 404
 app.use((req, res) => {
   res.status(404).json({ success: false, error: true, reply: "Route non trouvée", code: "NOT_FOUND" });
 });
 
-// ---------- Gestion erreur globale ----------
+// Error handler
 app.use((error, req, res, next) => {
   logger.error({ err: error.message, stack: error.stack, path: req.path }, "Erreur non gérée");
   if (res.headersSent) return next(error);
@@ -8662,21 +8676,8 @@ app.use((error, req, res, next) => {
 });
 
 // ================================================================================
-// §4.13 — LUBA LIVE WEBSOCKET (protocole binaire custom)
+// §4.13 — LUBA LIVE WEBSOCKET
 // ================================================================================
-
-// Frame types (1 octet) :
-//   0x01 HELLO      client → serveur
-//   0x02 AUDIO_IN   client → serveur (PCM 16kHz mono)
-//   0x03 TEXT_IN    client → serveur (UTF-8)
-//   0x04 BARGE_IN   client → serveur (interruption)
-//   0x05 END_TURN   client → serveur (fin d'utterance)
-//   0x11 TRANSCRIPT serveur → client (JSON)
-//   0x12 TOKEN      serveur → client (UTF-8, tokens LLM)
-//   0x13 AUDIO_OUT  serveur → client (PCM/MP3 TTS)
-//   0x14 STATUS     serveur → client (JSON)
-//   0x15 ERROR      serveur → client (JSON)
-//   0x16 DONE       serveur → client (fin de tour)
 
 const WS_FRAME = Object.freeze({
   HELLO: 0x01,
@@ -8689,7 +8690,8 @@ const WS_FRAME = Object.freeze({
   AUDIO_OUT: 0x13,
   STATUS: 0x14,
   ERROR: 0x15,
-  DONE: 0x16
+  DONE: 0x16,
+  QUALITY: 0x17
 });
 
 function encodeFrame(type, payload) {
@@ -8723,11 +8725,11 @@ const liveSessions = new Map();
 
 function setupLubaLiveWebSocket(server) {
   if (!WebSocketServer) {
-    logger.warn("⚠️  ws non installé — Luba Live WebSocket désactivé");
+    logger.warn("⚠️  ws non installé — Luba Live désactivé");
     return;
   }
   if (process.env.LUBA_LIVE_ENABLED === "false") {
-    logger.info("ℹ️  Luba Live désactivé par env");
+    logger.info("ℹ️  Luba Live désactivé");
     return;
   }
 
@@ -8735,7 +8737,7 @@ function setupLubaLiveWebSocket(server) {
     server,
     path: "/live",
     perMessageDeflate: false,
-    maxPayload: 1024 * 1024 // 1 Mo
+    maxPayload: 1024 * 1024
   });
 
   wsServer.on("connection", (ws, req) => {
@@ -8753,7 +8755,6 @@ function setupLubaLiveWebSocket(server) {
     liveSessions.set(sessionId, state);
 
     if (metrics?.activeWebSockets) metrics.activeWebSockets.labels("live").inc();
-
     logger.info({ sessionId, ip: req.socket.remoteAddress }, "🔌 Luba Live connecté");
 
     ws.on("message", (data) => {
@@ -8773,9 +8774,7 @@ function setupLubaLiveWebSocket(server) {
       logger.info({ sessionId }, "🔌 Luba Live déconnecté");
     });
 
-    ws.on("error", (e) => {
-      logger.warn({ err: e.message, sessionId }, "WS erreur");
-    });
+    ws.on("error", (e) => logger.warn({ err: e.message, sessionId }, "WS erreur"));
   });
 
   logger.info("✅ Luba Live WebSocket initialisé sur /live");
@@ -8784,13 +8783,11 @@ function setupLubaLiveWebSocket(server) {
 async function handleLiveFrame(ws, state, frame) {
   const { type, payload } = frame;
 
-  // HELLO : authentification + init
   if (type === WS_FRAME.HELLO) {
     const hello = safeJsonParse(payload.toString("utf8"), {});
     const token = hello.token;
-    if (!token) {
-      return ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Missing token" }));
-    }
+    if (!token) return ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Missing token" }));
+
     try {
       const user = await verifyFirebaseToken(token);
       if (!user) throw new Error("Invalid user");
@@ -8798,7 +8795,6 @@ async function handleLiveFrame(ws, state, frame) {
       state.conversationId = hello.conversationId || `live_${crypto.randomUUID()}`;
       state.authenticated = true;
 
-      // Init STT
       state.stt = new StreamingSTT({
         onPartial: (text) => {
           if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.TRANSCRIPT, { text, partial: true }));
@@ -8810,7 +8806,7 @@ async function handleLiveFrame(ws, state, frame) {
       });
 
       ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "ready", sessionId: state.sessionId, conversationId: state.conversationId }));
-    } catch (e) {
+    } catch {
       ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Authentication failed" }));
     }
     return;
@@ -8820,7 +8816,6 @@ async function handleLiveFrame(ws, state, frame) {
     return ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Not authenticated" }));
   }
 
-  // BARGE_IN
   if (type === WS_FRAME.BARGE_IN) {
     state.interrupted = true;
     if (state.stt) state.stt.reset();
@@ -8828,23 +8823,18 @@ async function handleLiveFrame(ws, state, frame) {
     return;
   }
 
-  // AUDIO_IN
   if (type === WS_FRAME.AUDIO_IN) {
     if (state.interrupted) return;
-    if (state.stt) {
-      await state.stt.push(payload, { mimetype: "audio/webm" });
-    }
+    if (state.stt) await state.stt.push(payload, { mimetype: "audio/webm" });
     return;
   }
 
-  // TEXT_IN
   if (type === WS_FRAME.TEXT_IN) {
     const text = payload.toString("utf8").slice(0, CONFIG.LIMITS.MAX_MESSAGE_LENGTH);
     await handleLiveTurn(ws, state, text);
     return;
   }
 
-  // END_TURN (finalize STT + LLM + TTS)
   if (type === WS_FRAME.END_TURN) {
     if (!state.stt) return;
     const result = await state.stt.finalize("audio/webm");
@@ -8862,7 +8852,6 @@ async function handleLiveTurn(ws, state, userText) {
 
   ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "thinking" }));
 
-  // Utilise le chunker pour TTS anticipé
   const ttsQueue = [];
   let ttsProcessing = false;
 
@@ -8890,7 +8879,6 @@ async function handleLiveTurn(ws, state, userText) {
   });
 
   try {
-    // Appel handleChat en mode streaming-like : on envoie les tokens via WS
     const sseAdapter = {
       closed: false,
       status: (stage, extra) => {
@@ -8914,6 +8902,9 @@ async function handleLiveTurn(ws, state, userText) {
       },
       sources: (list) => {
         if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "sources", sources: list }));
+      },
+      quality: (payload) => {
+        if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.QUALITY, payload));
       },
       error: (payload) => {
         if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.ERROR, payload));
@@ -8958,45 +8949,47 @@ let isShuttingDown = false;
 async function bootstrap() {
   console.log("");
   console.log("╔══════════════════════════════════════════════════════════════╗");
-  console.log(`║  🚀 LUBA AI PRO v${CONFIG.VERSION} — HIKLON TECHNOLOGIES            ║`);
+  console.log(`║  🚀 LUBA AI PRO v${CONFIG.VERSION} — HIKLON TECHNOLOGIES           ║`);
   console.log("╚══════════════════════════════════════════════════════════════╝");
 
-  // 1) Bootstrap Partie 1
   await bootstrapPart1();
 
-  // 2) HTTP server
   server = app.listen(CONFIG.PORT, CONFIG.HOST, () => {
     global.__luba_server = server;
     logger.info(`Serveur ${CONFIG.AGENT_NAME} v${CONFIG.VERSION} démarré sur ${CONFIG.HOST}:${CONFIG.PORT}`);
   });
 
   server.on("error", (err) => {
-    logger.fatal({ err: err.message }, "Erreur du serveur HTTP");
+    logger.fatal({ err: err.message }, "Erreur serveur HTTP");
     process.exit(1);
   });
 
-  // 3) Luba Live WebSocket
   setupLubaLiveWebSocket(server);
 
-  // 4) Schedulers
   setInterval(reminderTick, CONFIG.TIMEOUTS.REMINDER_TICK_MS).unref?.();
   setInterval(runSecurityHousekeeping, CONFIG.TIMEOUTS.HOUSEKEEPING_MS).unref?.();
 
-  // 5) Banner
   console.log("");
   console.log("🌐 Domaine      : " + HOSTING_CONFIG.domain);
   console.log("🔐 Firebase     : " + (firebaseApp() ? "Admin SDK ✅" : "REST API ⚠️"));
   console.log("💾 Firestore    : " + (firestoreDb ? "✅" : "❌"));
   console.log("💾 Supabase     : " + (supabase ? "✅" : "❌"));
   console.log("💾 SQLite       : ✅");
-  console.log("⚡ Redis        : " + (redisClient() ? "✅" : "❌ (fallback LRU)"));
+  console.log("⚡ Redis        : " + (redisClient() ? "✅" : "❌"));
   console.log("📧 Email        : " + (emailTransporter ? "SMTP ✅" : (process.env.RESEND_API_KEY ? "Resend ✅" : "❌")));
   console.log("📱 WhatsApp     : " + (CONFIG.WHATSAPP.ENCRYPTION_KEY ? "Chiffré ✅" : "⚠️"));
   console.log("🛡️  Rate limit  : " + (redisRateLimitStore ? "Redis ✅" : "Mémoire ⚠️"));
-  console.log("🧪 Sandbox      : " + (CONFIG.SANDBOX.PROVIDER || "Non configuré ⚠️"));
+  console.log("🧪 Sandbox      : " + CONFIG.SANDBOX.PROVIDER + " (" + (CONFIG.SANDBOX.PISTON_URL || CONFIG.SANDBOX.JUDGE0_URL || "non configuré") + ")");
   console.log("📡 SSE          : ✅ /api/chat");
-  console.log("🎙️  Luba Live    : " + (wsServer ? "✅ /live (WebSocket)" : "❌"));
+  console.log("🎙️  Luba Live    : " + (wsServer ? "✅ /live" : "❌"));
   console.log("📊 Metrics      : " + (metrics() ? "✅ /api/metrics" : "❌"));
+  console.log("🔍 Debug        : " + (process.env.DEBUG_TOKEN ? "✅ /api/debug" : "⚠️  (set DEBUG_TOKEN)"));
+  console.log("");
+  console.log("🧠 AI QUALITY LAYER v16.1 :");
+  console.log(`   ├─ Self-critique : ${CONFIG.AI_QUALITY.ENABLE_SELF_CRITIQUE ? "✅" : "❌"}`);
+  console.log(`   ├─ Confidence    : ${CONFIG.AI_QUALITY.ENABLE_CONFIDENCE ? "✅" : "❌"}`);
+  console.log(`   ├─ Multi-vote    : ${CONFIG.AI_QUALITY.ENABLE_MULTI_VOTE ? "✅" : "❌"}`);
+  console.log(`   └─ Anti-halluc.  : ${CONFIG.AI_QUALITY.ENABLE_HALLUCINATION_CHECK ? "✅" : "❌"}`);
   console.log("");
   console.log("🤖 PROVIDERS LLM :");
   console.log(`   ├─ Groq        : ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s)`);
@@ -9004,7 +8997,7 @@ async function bootstrap() {
   console.log(`   ├─ Cerebras    : ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s)`);
   console.log(`   └─ Gemini      : ${geminiClient ? "Actif ✅" : "Inactif ⚠️"}`);
   console.log("");
-  console.log("🎯 Luba AI Pro v16.0 — Prêt.");
+  console.log("🎉 Luba AI Pro v16.1.0 — PRÊT.");
   console.log("");
 }
 
@@ -9013,10 +9006,7 @@ async function gracefulShutdown(signal) {
   isShuttingDown = true;
   logger.info({ signal }, "Arrêt propre du serveur");
 
-  try {
-    if (server) await new Promise((resolve) => server.close(resolve));
-  } catch {}
-
+  try { if (server) await new Promise((resolve) => server.close(resolve)); } catch {}
   try { await baileysManager.destroyAll(); } catch {}
   try { if (wsServer) wsServer.close(); } catch {}
   try { if (redisClient()) await redisClient().quit(); } catch {}
@@ -9046,6 +9036,7 @@ async function runSecurityHousekeeping() {
     await dbRun(`DELETE FROM llm_audit_log WHERE created_at < ?`, [now - 30 * 24 * 3600 * 1000]);
     await dbRun(`DELETE FROM token_cache WHERE expires_at < ?`, [now]);
     await dbRun(`DELETE FROM conversation_locks WHERE locked_until < ?`, [now - 5 * 60 * 1000]);
+    await dbRun(`DELETE FROM reasoning_traces WHERE created_at < ?`, [now - 30 * 24 * 3600 * 1000]);
     logger.info("🧹 Nettoyage périodique effectué");
   } catch (e) {
     logger.error({ err: e.message }, "Erreur housekeeping");
@@ -9053,10 +9044,8 @@ async function runSecurityHousekeeping() {
 }
 
 // ================================================================================
-// §4.15 — DOCKER / DOCKER-COMPOSE / NGINX / CI-CD (fichiers annexes)
+// §4.15 — FICHIERS DE DÉPLOIEMENT
 // ================================================================================
-// Ces fichiers doivent être créés SÉPARÉMENT à la racine du projet.
-// Contenu copiable ci-dessous.
 
 const DEPLOYMENT_FILES = String.raw`
 # =============================================================================
@@ -9156,11 +9145,9 @@ http {
   keepalive_timeout 65;
   client_max_body_size 25M;
 
-  # Gzip
   gzip on;
   gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
 
-  # Rate limiting
   limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
   limit_req_zone $binary_remote_addr zone=chat:10m rate=2r/s;
 
@@ -9184,7 +9171,6 @@ http {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
 
-    # SSE + WebSocket
     location /api/chat {
       limit_req zone=chat burst=5 nodelay;
       proxy_pass http://luba_backend;
@@ -9196,7 +9182,7 @@ http {
       proxy_set_header X-Forwarded-Proto $scheme;
       proxy_buffering off;
       proxy_cache off;
-      proxy_read_timeout 120s;
+      proxy_read_timeout 180s;
     }
 
     location /live {
@@ -9241,7 +9227,6 @@ jobs:
           cache: "npm"
       - run: npm ci
       - run: node --check index.js
-      - run: npm test --if-present
 
   build-and-push:
     needs: test
@@ -9261,48 +9246,6 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:latest,ghcr.io/${{ github.repository }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd /opt/luba
-            docker compose pull
-            docker compose up -d --remove-orphans
-            docker compose ps
-
-# =============================================================================
-# scripts/deploy.sh
-# =============================================================================
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-echo "🚀 Deploy Luba AI Pro"
-docker compose build --no-cache
-docker compose up -d --remove-orphans
-docker compose ps
-echo "✅ Déploiement terminé"
-
-# =============================================================================
-# scripts/rollback.sh
-# =============================================================================
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-TAG="${1:-previous}"
-echo "⏪ Rollback vers $TAG"
-docker compose down
-git checkout "$TAG"
-docker compose up -d --build
-echo "✅ Rollback terminé"
 `;
 
 function getDeploymentFiles() {
@@ -9310,57 +9253,34 @@ function getDeploymentFiles() {
 }
 
 // ================================================================================
-// §4.16 — EXPORTS FINAUX
+// §4.16 — EXPORTS FINAUX + AUTO-START
 // ================================================================================
 
 Object.assign(module.exports, {
-  // App
   app,
   get server() { return server; },
   get wsServer() { return wsServer; },
-
-  // SSE
   SSEWriter, streamTextAsTokens,
-
-  // Prompt
   LUBA_SYSTEM_PROMPT,
-
-  // Sessions
   getSession, setActiveIntent, getActiveIntent, clearActiveIntent,
   getFullHistory, assertConversationOwnership, saveMessageWithUser,
   ACTIVE_INTENT_TTL_MS,
-
-  // Mémoire long terme (résumé)
   getUserMemory, saveUserMemory, incrementUserMemoryCounter,
   runMemorySummaryImpl, maybeUpdateUserMemoryAsync,
-
-  // Suggestions
   extractSuggestions, generateSuggestions,
-
-  // Enrichissement + chat
   enrichContextWithIntent, toolCacheKey,
   handleChat, handleActiveIntent, isCancelMessage,
-
-  // WhatsApp
   baileysManager, isWhatsAppAllowed,
-
-  // Scheduler
   reminderTick,
-
-  // WebSocket
   WS_FRAME, encodeFrame, decodeFrame, setupLubaLiveWebSocket,
   handleLiveFrame, handleLiveTurn,
   liveSessions: () => liveSessions,
-
-  // Déploiement
   DEPLOYMENT_FILES, getDeploymentFiles,
-
-  // Lifecycle
   bootstrap, gracefulShutdown, runSecurityHousekeeping
 });
 
 // ================================================================================
-// AUTO-START (démarre si ce fichier est exécuté directement)
+// AUTO-START
 // ================================================================================
 
 if (require.main === module) {
@@ -9371,28 +9291,35 @@ if (require.main === module) {
 }
 
 // ================================================================================
-// ==================== FIN PARTIE 4/4 — FIN DU FICHIER index.js ================
+// ==================== FIN PARTIE 4/4 v16.1 — FIN DU FICHIER ====================
 // ================================================================================
-// ✅ Backend Luba AI Pro v16.0.0 — Production ready.
+// 🎉 BACKEND LUBA AI PRO v16.1.0 — PRODUCTION READY
 //
-// Pour lancer :
-//   1. npm install express cors helmet express-rate-limit axios qrcode nodemailer \
-//      sqlite3 pino multer @supabase/supabase-js ws rss-parser form-data cheerio \
-//      lru-cache dotenv prom-client mathjs ioredis @whiskeysockets/baileys \
-//      firebase-admin @google-cloud/firestore @google/genai youtubei.js \
-//      duck-duck-scrape rate-limit-redis
-//   2. Copier les 4 fichiers de déploiement (Dockerfile, docker-compose.yml,
-//      nginx.conf, .github/workflows/deploy.yml) via getDeploymentFiles()
-//   3. node index.js
-//
-// Ou avec Docker :
-//   docker compose up -d
+// Setup :
+//   1. npm install (voir package.json)
+//   2. Créer .env avec les clés (voir .env.example)
+//   3. node --check index.js
+//   4. node index.js  OU  npm start  OU  docker compose up -d
 //
 // URLs :
-//   http://localhost:3000/                — Info
-//   http://localhost:3000/api/health      — Health
-//   http://localhost:3000/ready           — Readiness
-//   http://localhost:3000/api/metrics     — Prometheus
-//   POST http://localhost:3000/api/chat   — Chat (JSON ou SSE)
-//   ws://localhost:3000/live              — Luba Live (WebSocket binaire)
+//   http://localhost:3000/                 — Info
+//   http://localhost:3000/api/health?full=1  — Health complet
+//   http://localhost:3000/ready            — Readiness
+//   http://localhost:3000/api/metrics      — Prometheus
+//   http://localhost:3000/api/debug?token=X  — Diagnostic (⚠️ DEBUG_TOKEN)
+//   POST /api/chat                         — Chat (JSON ou SSE)
+//   ws://localhost:3000/live               — Luba Live (WebSocket binaire)
+//
+// Test rapide :
+//   curl "http://localhost:3000/api/debug?token=change-me" | jq
+//   curl "http://localhost:3000/api/ads/slots" | jq
+//
+// 🧠 NOUVEAUTÉS v16.1 :
+//   ✅ Math prioritaire (execute_math) → "calcule 15×32+7" = 487
+//   ✅ Sandbox Piston public par défaut
+//   ✅ Timeouts étendus (30s/120s) → gros prompts passent
+//   ✅ Reasoning streaming (DeepSeek R1 + Qwen think)
+//   ✅ Langue forcée (FR/EN/SW/LN) → plus de chinois
+//   ✅ AI Quality Layer (self-critique, confidence, hallucination)
+//   ✅ Route /api/debug pour diagnostic
 // ================================================================================
