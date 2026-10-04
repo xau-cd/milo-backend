@@ -10772,7 +10772,7 @@ async function bootstrap() {
   console.log("🧪 Sandbox      : " + CONFIG.SANDBOX.PROVIDER + " (" + (CONFIG.SANDBOX.PISTON_URL || "?") + ")");
   console.log("📡 SSE          : ✅ /api/chat");
   console.log("🎙️  Luba Live    : " + (wsServer ? "✅ /live" : "❌"));
-  console.log("📊 Metrics      : " + (metrics() ? "✅ /api/metrics" : "❌"));
+  console.log("📊 Metrics      : " + (metrics ? "✅ /api/metrics" : "❌"));
   console.log("🔍 Debug        : " + (process.env.DEBUG_TOKEN ? "✅ /api/debug" : "⚠️  (set DEBUG_TOKEN)"));
   console.log("");
   console.log("🧠 AI QUALITY LAYER :");
