@@ -9218,9 +9218,9 @@ async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH.CHECK_REV
   if (cached) return cached;
 
   // Méthode 1 : Firebase Admin SDK
-  if (firebaseApp() && firebaseAdmin) {
+  if (firebaseApp && firebaseAdmin) {
     try {
-      const decoded = await firebaseAdmin.auth(firebaseApp()).verifyIdToken(token, checkRevoked);
+      const decoded = await firebaseAdmin.auth(firebaseApp).verifyIdToken(token, checkRevoked);
       const user = {
         uid: decoded.uid,
         email: decoded.email || null,
@@ -9463,7 +9463,7 @@ function authenticateUser(req, res, next) {
  */
 function requireRole(roles) {
   return (req, res, next) => {
-    if (!firebaseApp() && roles.includes("ADMIN")) {
+    if (!firebaseApp && roles.includes("ADMIN")) {
       return res.status(503).json({
         success: false, error: true,
         reply: "Admin indisponible (Admin SDK requis).",
@@ -9530,8 +9530,8 @@ app.get("/api/health", async (req, res) => {
       memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
       firestore: Boolean(firestoreDb),
       supabase: Boolean(supabase),
-      redis: Boolean(redisClient()),
-      firebaseAuth: firebaseApp() ? "admin_sdk" : "api_rest",
+      redis: Boolean(redisClient),
+      firebaseAuth: firebaseApp ? "admin_sdk" : "api_rest",
       providers: {
         groq: LLM_PROVIDERS.GROQ.keyPool.length,
         openrouter: LLM_PROVIDERS.OPENROUTER.keyPool.length,
@@ -9557,7 +9557,7 @@ app.get("/ready", async (req, res) => {
 
 // ---------- /api/metrics (Prometheus) ----------
 app.get("/api/metrics", async (req, res) => {
-  const m = metrics();
+  const m = metrics;
   if (!m) return res.status(503).json({ error: "Metrics indisponibles" });
 
   const token = process.env.METRICS_TOKEN;
@@ -9567,7 +9567,7 @@ app.get("/api/metrics", async (req, res) => {
 
   try {
     res.setHeader("Content-Type", m.register.contentType);
-    res.end(await m.register.metrics());
+    res.end(await m.register.metrics);
   } catch {
     res.status(500).end();
   }
@@ -9648,7 +9648,7 @@ app.get("/api/debug", async (req, res) => {
   // Cache
   checks.cache = {
     l1: l1Cache.size || 0,
-    redis: Boolean(redisClient()),
+    redis: Boolean(redisClient),
     semantic: semanticCache.size()
   };
 
@@ -10309,8 +10309,8 @@ app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(["A
     if (!uid || !["FREE", "PREMIUM", "ADMIN"].includes(role)) {
       return res.status(400).json({ success: false, error: true, code: "INVALID_PARAMS" });
     }
-    if (firebaseApp() && firebaseAdmin) {
-      await firebaseAdmin.auth(firebaseApp()).setCustomUserClaims(uid, { role });
+    if (firebaseApp && firebaseAdmin) {
+      await firebaseAdmin.auth(firebaseApp).setCustomUserClaims(uid, { role });
     }
     await dbRun(
       `UPDATE users SET role = ?, updated_at = ? WHERE firebase_uid = ? OR id = ?`,
@@ -10377,9 +10377,9 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
 
     // Suppression compte Firebase Auth
     let fbDel = false;
-    if (firebaseApp() && firebaseAdmin) {
+    if (firebaseApp && firebaseAdmin) {
       try {
-        await firebaseAdmin.auth(firebaseApp()).deleteUser(fbUid);
+        await firebaseAdmin.auth(firebaseApp).deleteUser(fbUid);
         fbDel = true;
       } catch {}
     }
@@ -10796,7 +10796,7 @@ async function gracefulShutdown(signal) {
   try { if (server) await new Promise((r) => server.close(r)); } catch {}
   try { await baileysManager.destroyAll(); } catch {}
   try { if (wsServer) wsServer.close(); } catch {}
-  try { if (redisClient()) await redisClient().quit(); } catch {}
+  try { if (redisClient) await redisClient.quit(); } catch {}
   try { await new Promise((r) => db ? db.close(() => r()) : r()); } catch {}
 
   console.log("✅ Arrêt propre terminé");
