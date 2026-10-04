@@ -10765,7 +10765,7 @@ async function bootstrap() {
   console.log("⚡ Redis        : " + (redisClient ? "✅" : "❌ (LRU fallback)"));
   console.log("📊 Metrics      : " + (metrics ? "✅ /api/metrics" : "❌"));
   console.log("💾 SQLite       : ✅");
-  console.log("⚡ Redis        : " + (redisClient() ? "✅" : "❌ (LRU fallback)"));
+  console.log("⚡ Redis        : " +  redisClient ? "✅" : "❌ (LRU fallback)"));
   console.log("📧 Email        : " + (emailTransporter ? "SMTP ✅" : (process.env.RESEND_API_KEY ? "Resend ✅" : "❌")));
   console.log("📱 WhatsApp     : " + (CONFIG.WHATSAPP.ENCRYPTION_KEY ? "Chiffré ✅" : "⚠️"));
   console.log("🛡️  Rate limit  : " + (redisRateLimitStore ? "Redis ✅" : "Mémoire ⚠️"));
