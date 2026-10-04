@@ -10761,9 +10761,9 @@ async function bootstrap() {
   // Bannière
   console.log("");
   console.log("🌐 Domaine      : " + HOSTING_CONFIG.domain);
-  console.log("🔐 Firebase     : " + (firebaseApp() ? "Admin SDK ✅" : "REST API ⚠️"));
-  console.log("💾 Firestore    : " + (firestoreDb ? "✅" : "❌"));
-  console.log("💾 Supabase     : " + (supabase ? "✅" : "❌"));
+  console.log("🔐 Firebase     : " + (firebaseApp ? "Admin SDK ✅" : "REST API ⚠️"));
+  console.log("⚡ Redis        : " + (redisClient ? "✅" : "❌ (LRU fallback)"));
+  console.log("📊 Metrics      : " + (metrics ? "✅ /api/metrics" : "❌"));
   console.log("💾 SQLite       : ✅");
   console.log("⚡ Redis        : " + (redisClient() ? "✅" : "❌ (LRU fallback)"));
   console.log("📧 Email        : " + (emailTransporter ? "SMTP ✅" : (process.env.RESEND_API_KEY ? "Resend ✅" : "❌")));
