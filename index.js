@@ -8787,7 +8787,7 @@ app.get("/api/metrics", async (req, res) => {
 
   try {
     res.setHeader("Content-Type", metrics.register.contentType);
-    res.end(await metrics.register.metrics());
+    res.end(await metrics.register.metrics);
   } catch {
     res.status(500).end();
   }
