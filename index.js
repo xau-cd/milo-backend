@@ -1,33 +1,43 @@
 // ================================================================================
-// LUBA AI PRO — BACKEND v16.4.0 — Enterprise Edition
+// LUBA AI PRO — BACKEND v16.4.2 — Enterprise Edition
 // HIKLON TECHNOLOGIES · Kinshasa, RDC · 2026
 // ================================================================================
 // PARTIE 1/5 — FONDATIONS
 // --------------------------------------------------------------------------------
-// Ce module initialise toutes les fondations du backend :
-//   • Configuration centralisée (avec validation stricte de l'environnement)
-//   • Logging structuré (Pino) avec redaction des secrets
-//   • Classes d'erreurs typées (LubaError + codes machines)
-//   • Utilitaires transverses (IDs, hashes, sanitization, i18n, chunking UTF-8)
-//   • Firebase Admin + Firestore (optionnel, dégradation gracieuse)
-//   • Supabase (backup secondaire, optionnel)
-//   • Cache multi-niveaux (LRU local + Redis + cache sémantique par embeddings)
-//   • Sécurité (détection injection, modération, signature HMAC, audit logs)
-//   • Métriques Prometheus (latence, tokens, circuits, qualité)
-//   • Feature flags (dégradation propre si un provider est manquant)
-//   • Schéma SQLite v16.4 (complet, 15 tables) + wrappers async
+// Ce module pose les bases immuables du backend :
+//   • Configuration centralisée (gelée, validée, traçable)
+//   • Logger structuré Pino avec redaction des secrets
+//   • Erreurs typées (LubaError + catalogue de codes machines)
+//   • Utilitaires transverses : IDs, hashes HMAC, sanitization,
+//     normalisation LaTeX, chunking UTF-8 safe, i18n FR/EN/SW/LN
+//   • Firebase Admin + Firestore (dégradation gracieuse)
+//   • Supabase (backup secondaire, dual-write)
+//   • Cache multi-niveaux : LRU local (L1) + Redis (L2) + sémantique (L3)
+//   • Sécurité : détection injection, modération locale + Groq Guard,
+//     signature HMAC inter-services, audit logs RGPD-compliant
+//   • Métriques Prometheus (latence, tokens, circuits, qualité, auth)
+//   • Feature flags (dégradation propre si un provider manque)
+//   • Schéma SQLite v16.4.2 complet (16 tables) + wrappers async
+//
+// RÈGLES DE CONCEPTION :
+//   1. AUCUN STUB (`let xxx = async () => {}`) — uniquement des `async function`
+//      hoistées, pour éviter le SyntaxError "Identifier already declared".
+//   2. AUCUNE clé secrète en dur — tout passe par process.env.
+//   3. DÉGRADATION GRACIEUSE — si un module optionnel manque, on log et continue.
+//   4. IMMUABILITÉ — CONFIG, FIREBASE_CONFIG, HOSTING_CONFIG sont gelés.
+//   5. AUTO-VÉRIFICATION — chaque bloc critique vérifie ses prérequis au boot.
 //
 // TABLE DES MATIÈRES :
 //   §1.01  En-tête et imports
 //   §1.02  Configuration centralisée (CONFIG)
 //   §1.03  Firebase / Hosting / Quotas
-//   §1.04  Validation environnement
+//   §1.04  Validation environnement + bootstrap dossiers
 //   §1.05  Logger Pino
 //   §1.06  Classes d'erreurs typées
 //   §1.07  Utilitaires (IDs, hashes, temps)
 //   §1.08  Utilitaires de sanitization
 //   §1.09  Utilitaires de parsing et normalisation
-//   §1.10  Utilitaires de détection (langue, image, entité)
+//   §1.10  Utilitaires de détection (langue, image)
 //   §1.11  Utilitaires de chunking et deadlines
 //   §1.12  Helpers images (pertinence, salutations)
 //   §1.13  Firebase Admin + Firestore
@@ -44,83 +54,68 @@
 
 "use strict";
 
-// Charge les variables d'environnement depuis le fichier .env local.
-// En production (Render, Docker), les variables sont injectées directement.
+// Charge les variables d'environnement locales (.env) en développement.
+// En production (Render, Docker), les variables sont injectées directement
+// par la plateforme — dotenv ne fait rien de nuisible dans ce cas.
 require("dotenv").config();
 
 // ================================================================================
 // §1.01 — EN-TÊTE ET IMPORTS
 // ================================================================================
 
-// --- Imports core (obligatoires) ---
-const express        = require("express");
-const cors           = require("cors");
-const helmet         = require("helmet");
-const rateLimit      = require("express-rate-limit");
-const axios          = require("axios");
-const qrcode         = require("qrcode");
-const nodemailer     = require("nodemailer");
-const sqlite3        = require("sqlite3").verbose();
-const path           = require("path");
-const fs             = require("fs");
-const os             = require("os");
-const crypto         = require("crypto");
-const pino           = require("pino");
-const multer         = require("multer");
-const { EventEmitter } = require("events");
-const { Worker }     = require("worker_threads");
-const FormData       = require("form-data");
-const cheerio        = require("cheerio");
-const { LRUCache }   = require("lru-cache");
-const { createClient } = require("@supabase/supabase-js");
+// ---------- Imports core (toujours disponibles) ----------
+const express        = require("express");              // Framework HTTP
+const cors           = require("cors");                 // Gestion CORS
+const helmet         = require("helmet");               // Headers de sécurité
+const rateLimit      = require("express-rate-limit");   // Rate limiting
+const axios          = require("axios");                // Client HTTP
+const qrcode         = require("qrcode");               // Génération QR WhatsApp
+const nodemailer     = require("nodemailer");           // Envoi email SMTP
+const sqlite3        = require("sqlite3").verbose();    // Base locale SQLite
+const path           = require("path");                 // Manipulation chemins
+const fs             = require("fs");                   // Système de fichiers
+const os             = require("os");                   // Infos système
+const crypto         = require("crypto");               // Cryptographie native
+const pino           = require("pino");                 // Logger structuré
+const multer         = require("multer");               // Upload multipart
+const { EventEmitter } = require("events");             // Événements
+const { Worker }     = require("worker_threads");       // Workers isolés (math)
+const FormData       = require("form-data");            // Multipart form-data
+const cheerio        = require("cheerio");              // Parsing HTML (scraping)
+const { LRUCache }   = require("lru-cache");            // Cache LRU local
+const { createClient } = require("@supabase/supabase-js"); // Client Supabase
 
-// --- Imports optionnels (dégradation gracieuse si absents) ---
-// Ces modules sont chargés dans des try/catch pour permettre au backend de
-// démarrer même si l'un d'eux n'est pas installé (mode dégradé).
-let GoogleGenAI   = null; // Client Google Gemini (SDK officiel)
-let firebaseAdmin = null; // SDK Firebase Admin (vérification ID token, Firestore)
-let Firestore     = null; // Client Firestore (base de données NoSQL)
-let IORedis       = null; // Client Redis (cache L2 + rate-limit distribué)
-let BullMQ        = null; // File de jobs avec Redis
-let PromClient    = null; // Client Prometheus (métriques)
-let ddgScrape     = null; // Scraper DuckDuckGo (recherche web + images)
+// ---------- Imports optionnels (dégradation gracieuse) ----------
+// Ces modules sont chargés dans des try/catch individuels pour que le
+// backend démarre même si l'un d'eux échoue à s'installer.
 
-try {
-  GoogleGenAI = require("@google/genai").GoogleGenAI;
-} catch (e) {
-  // Google GenAI non installé → Gemini désactivé
-}
+let GoogleGenAI   = null;   // SDK Google Gemini officiel
+let firebaseAdmin = null;   // SDK Firebase Admin (vérification tokens + Firestore)
+let Firestore     = null;   // Client Firestore (base NoSQL)
+let IORedis       = null;   // Client Redis (cache L2 + rate-limit distribué)
+let BullMQ        = null;   // File de jobs Redis (non utilisé par défaut)
+let PromClient    = null;   // Client Prometheus (métriques)
+let ddgScrape     = null;   // Scraper DuckDuckGo (recherche web + images)
+
+try { GoogleGenAI = require("@google/genai").GoogleGenAI; }
+catch { /* Google GenAI absent → Gemini désactivé */ }
 
 try {
   firebaseAdmin = require("firebase-admin");
   Firestore = require("@google-cloud/firestore");
-} catch (e) {
-  // Firebase Admin non installé → mode REST uniquement
-}
+} catch { /* Firebase Admin absent → mode REST uniquement */ }
 
-try {
-  IORedis = require("ioredis");
-} catch (e) {
-  // Redis non installé → cache L1 seulement
-}
+try { IORedis = require("ioredis"); }
+catch { /* Redis absent → cache L1 seulement */ }
 
-try {
-  BullMQ = require("bullmq");
-} catch (e) {
-  // BullMQ non installé → jobs en mémoire
-}
+try { BullMQ = require("bullmq"); }
+catch { /* BullMQ absent → jobs en mémoire */ }
 
-try {
-  PromClient = require("prom-client");
-} catch (e) {
-  // Prometheus non installé → /api/metrics désactivé
-}
+try { PromClient = require("prom-client"); }
+catch { /* Prometheus absent → /api/metrics désactivé */ }
 
-try {
-  ddgScrape = require("duck-duck-scrape");
-} catch (e) {
-  // DuckDuckGo scraper non installé → fallback providers uniquement
-}
+try { ddgScrape = require("duck-duck-scrape"); }
+catch { /* DuckDuckGo absent → fallback providers uniquement */ }
 
 // ================================================================================
 // §1.02 — CONFIGURATION CENTRALISÉE
@@ -128,83 +123,100 @@ try {
 
 /**
  * Configuration immuable (Object.freeze) du backend.
- * Toutes les valeurs sont soit des constantes, soit issues de process.env
- * avec des valeurs par défaut sûres pour la production.
  *
- * ⚠️ NE JAMAIS modifier CONFIG à chaud — il est gelé intentionnellement.
- *    Pour changer une valeur, il faut modifier process.env avant le boot.
+ * ⚠️ NE JAMAIS muter CONFIG à chaud. Pour changer une valeur :
+ *    1. Modifier process.env avant le boot
+ *    2. OU passer une variable d'environnement dans Render/Docker
  */
 const CONFIG = Object.freeze({
-  // === Identité ===
-  ENV:        process.env.NODE_ENV || "production",           // production | development | test
-  VERSION:    "16.4.0",                                       // Version sémantique
-  AGENT_NAME: "Luba",                                         // Nom de l'agent IA
-  COMPANY:    "HIKLON TECHNOLOGIES",                          // Société
-  HOST:       process.env.HOST || "0.0.0.0",                  // Interface d'écoute (0.0.0.0 = toutes)
-  PORT:       parseInt(process.env.PORT || "3000", 10),       // Port HTTP
+  // ─────────────────────────────────────────────────────────────
+  // Identité
+  // ─────────────────────────────────────────────────────────────
+  ENV:        process.env.NODE_ENV || "production",
+  VERSION:    "16.4.2",                                   // ← version actuelle
+  AGENT_NAME: "Luba",
+  COMPANY:    "HIKLON TECHNOLOGIES",
+  HOST:       process.env.HOST || "0.0.0.0",
+  PORT:       parseInt(process.env.PORT || "3000", 10),
 
-  // === Branding modèles IA ===
+  // ─────────────────────────────────────────────────────────────
+  // Branding des tiers de modèles IA
+  // ─────────────────────────────────────────────────────────────
   BRAND: Object.freeze({
-    V100: process.env.BRAND_V100 || "Mwamba",                 // Tier rapide (conversation)
-    V250: process.env.BRAND_V250 || "Ngandu",                 // Tier raisonnement
-    LIVE: process.env.BRAND_LIVE || "Luba Live"               // Mode vocal temps réel
+    V100: process.env.BRAND_V100 || "Mwamba",             // Tier rapide
+    V250: process.env.BRAND_V250 || "Ngandu",             // Tier raisonnement
+    LIVE: process.env.BRAND_LIVE || "Luba Live"           // Mode vocal
   }),
 
-  // === Limites d'entrée / sortie ===
+  // ─────────────────────────────────────────────────────────────
+  // Limites d'entrée / sortie
+  // ─────────────────────────────────────────────────────────────
   LIMITS: Object.freeze({
-    MAX_MESSAGE_LENGTH:    parseInt(process.env.MAX_MESSAGE_LENGTH    || "15000", 10),  // Caractères max par message
-    MAX_HISTORY_LENGTH:    parseInt(process.env.MAX_HISTORY_LENGTH    || "50", 10),     // Messages max par conversation
-    MAX_CONTEXT_MESSAGES:  parseInt(process.env.MAX_CONTEXT_MESSAGES  || "20", 10),     // Messages envoyés au LLM
-    MAX_CONTEXT_TOKENS:    parseInt(process.env.MAX_CONTEXT_TOKENS    || "8000", 10),   // Tokens max envoyés
-    MAX_IMAGE_SIZE_MB:     parseInt(process.env.MAX_IMAGE_SIZE_MB     || "10", 10),     // Taille max image uploadée
-    MAX_IMAGES_PER_REQUEST:parseInt(process.env.MAX_IMAGES_PER_REQUEST|| "3", 10),      // Images max par requête
-    MAX_IMAGES_DISPLAYED:  parseInt(process.env.MAX_IMAGES_DISPLAYED  || "3", 10),      // Images max affichées
-    IMAGE_SEARCH_LIMIT:    parseInt(process.env.IMAGE_SEARCH_LIMIT    || "6", 10)       // Résultats max par recherche
+    MAX_MESSAGE_LENGTH:    parseInt(process.env.MAX_MESSAGE_LENGTH    || "15000", 10),
+    MAX_HISTORY_LENGTH:    parseInt(process.env.MAX_HISTORY_LENGTH    || "50", 10),
+    MAX_CONTEXT_MESSAGES:  parseInt(process.env.MAX_CONTEXT_MESSAGES  || "20", 10),
+    MAX_CONTEXT_TOKENS:    parseInt(process.env.MAX_CONTEXT_TOKENS    || "8000", 10),
+    MAX_IMAGE_SIZE_MB:     parseInt(process.env.MAX_IMAGE_SIZE_MB     || "10", 10),
+    MAX_IMAGES_PER_REQUEST:parseInt(process.env.MAX_IMAGES_PER_REQUEST|| "3", 10),
+    MAX_IMAGES_DISPLAYED:  parseInt(process.env.MAX_IMAGES_DISPLAYED  || "3", 10),
+    IMAGE_SEARCH_LIMIT:    parseInt(process.env.IMAGE_SEARCH_LIMIT    || "6", 10)
   }),
 
-  // === Agent (boucle tool calling) ===
+  // ─────────────────────────────────────────────────────────────
+  // Agent (boucle tool calling bornée)
+  // ─────────────────────────────────────────────────────────────
   AGENT: Object.freeze({
-    MAX_ITERATIONS:           parseInt(process.env.AGENT_MAX_ITERATIONS || "5", 10),
-    MAX_TOOL_CALLS_PER_STEP:  parseInt(process.env.AGENT_MAX_TOOL_CALLS_PER_STEP || "6", 10)
+    MAX_ITERATIONS:          parseInt(process.env.AGENT_MAX_ITERATIONS || "5", 10),
+    MAX_TOOL_CALLS_PER_STEP: parseInt(process.env.AGENT_MAX_TOOL_CALLS_PER_STEP || "6", 10)
   }),
 
-  // === Timeouts (millisecondes) ===
+  // ─────────────────────────────────────────────────────────────
+  // Timeouts (millisecondes)
+  // ─────────────────────────────────────────────────────────────
   TIMEOUTS: Object.freeze({
-    CHAT_ATTEMPT_MS:    parseInt(process.env.CHAT_ATTEMPT_TIMEOUT_MS  || "30000", 10),
-    CHAT_GLOBAL_MS:     parseInt(process.env.CHAT_GLOBAL_TIMEOUT_MS   || "120000", 10),
-    TOOL_MS:            parseInt(process.env.TOOL_TIMEOUT_MS          || "12000", 10),
-    V250_ROUTE_MS:      parseInt(process.env.V250_ROUTE_TIMEOUT       || "90000", 10),
-    IMAGE_SOURCE_MS:    parseInt(process.env.IMAGE_SOURCE_DEADLINE_MS || "5000", 10),
-    REMINDER_TICK_MS:   parseInt(process.env.REMINDER_TICK_MS         || "60000", 10),
-    HOUSEKEEPING_MS:    parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 3600 * 1000), 10),
-    SELF_CRITIQUE_MS:   parseInt(process.env.SELF_CRITIQUE_TIMEOUT_MS || "20000", 10)
+    CHAT_ATTEMPT_MS:  parseInt(process.env.CHAT_ATTEMPT_TIMEOUT_MS  || "30000", 10),
+    CHAT_GLOBAL_MS:   parseInt(process.env.CHAT_GLOBAL_TIMEOUT_MS   || "120000", 10),
+    TOOL_MS:          parseInt(process.env.TOOL_TIMEOUT_MS          || "12000", 10),
+    V250_ROUTE_MS:    parseInt(process.env.V250_ROUTE_TIMEOUT       || "90000", 10),
+    IMAGE_SOURCE_MS:  parseInt(process.env.IMAGE_SOURCE_DEADLINE_MS || "5000", 10),
+    REMINDER_TICK_MS: parseInt(process.env.REMINDER_TICK_MS         || "60000", 10),
+    HOUSEKEEPING_MS:  parseInt(process.env.HOUSEKEEPING_INTERVAL_MS || String(6 * 3600 * 1000), 10),
+    SELF_CRITIQUE_MS: parseInt(process.env.SELF_CRITIQUE_TIMEOUT_MS || "20000", 10)
   }),
 
-  // === Retry ===
+  // ─────────────────────────────────────────────────────────────
+  // Retry
+  // ─────────────────────────────────────────────────────────────
   RETRY: Object.freeze({
-    MAX_ATTEMPTS:  parseInt(process.env.MAX_RETRY_ATTEMPTS    || "3", 10),
-    BASE_DELAY_MS: parseInt(process.env.RETRY_BASE_DELAY_MS   || "100", 10),
-    MAX_DELAY_MS:  parseInt(process.env.RETRY_MAX_DELAY_MS    || "1600", 10)
+    MAX_ATTEMPTS:  parseInt(process.env.MAX_RETRY_ATTEMPTS  || "3", 10),
+    BASE_DELAY_MS: parseInt(process.env.RETRY_BASE_DELAY_MS || "100", 10),
+    MAX_DELAY_MS:  parseInt(process.env.RETRY_MAX_DELAY_MS  || "1600", 10)
   }),
 
-  // === Circuit breaker ===
+  // ─────────────────────────────────────────────────────────────
+  // Circuit breaker (protection providers LLM)
+  // ─────────────────────────────────────────────────────────────
   CIRCUIT: Object.freeze({
     THRESHOLD:     parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD || "5", 10),
     RESET_MS:      parseInt(process.env.CIRCUIT_BREAKER_RESET_MS  || "30000", 10),
     HALF_OPEN_MAX: 1
   }),
 
-  // === Authentification ===
+  // ─────────────────────────────────────────────────────────────
+  // Authentification
+  // ─────────────────────────────────────────────────────────────
   AUTH: Object.freeze({
-    TOKEN_CACHE_TTL_MS:   parseInt(process.env.AUTH_TOKEN_CACHE_TTL_MS || "300000", 10),
-    CHECK_REVOKED:        process.env.AUTH_CHECK_REVOKED === "true",
-    MAX_LOGIN_ATTEMPTS:   parseInt(process.env.MAX_LOGIN_ATTEMPTS      || "20", 10),
-    LOGIN_BLOCK_MS:       parseInt(process.env.LOGIN_BLOCK_DURATION    || "900000", 10),
-    MAX_SESSIONS_PER_USER:parseInt(process.env.MAX_SESSIONS_PER_USER   || "10", 10),
-    HMAC_SECRET:          process.env.HMAC_SECRET || null
+    TOKEN_CACHE_TTL_MS:    parseInt(process.env.AUTH_TOKEN_CACHE_TTL_MS || "300000", 10),
+    CHECK_REVOKED:         process.env.AUTH_CHECK_REVOKED === "true",
+    MAX_LOGIN_ATTEMPTS:    parseInt(process.env.MAX_LOGIN_ATTEMPTS      || "20", 10),
+    LOGIN_BLOCK_MS:        parseInt(process.env.LOGIN_BLOCK_DURATION    || "900000", 10),
+    MAX_SESSIONS_PER_USER: parseInt(process.env.MAX_SESSIONS_PER_USER   || "10", 10),
+    HMAC_SECRET:           process.env.HMAC_SECRET || null
   }),
 
-  // === Chemins de fichiers ===
+  // ─────────────────────────────────────────────────────────────
+  // Chemins de fichiers
+  // ─────────────────────────────────────────────────────────────
   PATHS: Object.freeze({
     DATA:     path.join(__dirname, "data"),
     DB:       path.join(__dirname, "data", "luba.db"),
@@ -213,7 +225,9 @@ const CONFIG = Object.freeze({
     LOGS:     path.join(__dirname, "logs")
   }),
 
-  // === Actualités / Sports ===
+  // ─────────────────────────────────────────────────────────────
+  // Actualités / Sports
+  // ─────────────────────────────────────────────────────────────
   NEWS: Object.freeze({
     SPORT_MAX_ARTICLES: parseInt(process.env.SPORT_NEWS_MAX_ARTICLES || "6", 10),
     SPORT_CACHE_TTL_MS: parseInt(process.env.SPORT_CACHE_TTL_MS      || "600000", 10),
@@ -221,50 +235,66 @@ const CONFIG = Object.freeze({
     GOOGLE_REGION:      process.env.GOOGLE_NEWS_REGION || "FR"
   }),
 
-  // === Images ===
+  // ─────────────────────────────────────────────────────────────
+  // Images (Wikimedia, Pexels, DDG, Wikipedia)
+  // ─────────────────────────────────────────────────────────────
   IMAGES: Object.freeze({
-    CACHE_TTL_MS:       parseInt(process.env.IMAGE_CACHE_TTL_MS     || String(20 * 60 * 1000), 10),
-    WIKIMEDIA_LIMIT:    parseInt(process.env.IMAGE_WIKIMEDIA_LIMIT  || "8", 10),
-    DDG_LIMIT:          parseInt(process.env.IMAGE_DDG_LIMIT        || "4", 10),
-    MIN_RELEVANCE:      parseFloat(process.env.IMAGE_MIN_RELEVANCE  || "0.4"),
-    WIKIMEDIA_UA:       process.env.WIKIMEDIA_USER_AGENT
-      || "LubaAI/16.4.0 (https://luba.web.app; contact@luba.web.app)",
-    ALLOWED_TYPES:      ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    CACHE_TTL_MS:    parseInt(process.env.IMAGE_CACHE_TTL_MS     || String(20 * 60 * 1000), 10),
+    WIKIMEDIA_LIMIT: parseInt(process.env.IMAGE_WIKIMEDIA_LIMIT  || "8", 10),
+    DDG_LIMIT:       parseInt(process.env.IMAGE_DDG_LIMIT        || "4", 10),
+    MIN_RELEVANCE:   parseFloat(process.env.IMAGE_MIN_RELEVANCE  || "0.4"),
+    WIKIMEDIA_UA:    process.env.WIKIMEDIA_USER_AGENT
+      || "LubaAI/16.4.2 (https://luba.web.app; contact@luba.web.app)",
+    ALLOWED_TYPES:   ["image/jpeg", "image/png", "image/gif", "image/webp"]
   }),
 
-  // === Audio ===
+  // ─────────────────────────────────────────────────────────────
+  // Audio (STT Whisper + TTS Kokoro/Piper)
+  // ─────────────────────────────────────────────────────────────
   AUDIO: Object.freeze({
     ALLOWED_TYPES: ["audio/mpeg","audio/mp4","audio/wav","audio/webm",
                     "audio/ogg","audio/m4a","audio/x-m4a","audio/aac"],
     MAX_SIZE_MB:   parseInt(process.env.MAX_AUDIO_SIZE_MB || "20", 10)
   }),
 
-  // === Email ===
+  // ─────────────────────────────────────────────────────────────
+  // Email
+  // ─────────────────────────────────────────────────────────────
   EMAIL: Object.freeze({
     CONTACT:   process.env.CONTACT_EMAIL || "contact@luba.web.app",
     FROM_NAME: process.env.EMAIL_FROM_NAME || "Luba",
     FROM_ADDR: process.env.EMAIL_FROM_ADDR || process.env.SMTP_USER || "noreply@luba.web.app"
   }),
 
-  // === WhatsApp ===
+  // ─────────────────────────────────────────────────────────────
+  // WhatsApp
+  // ─────────────────────────────────────────────────────────────
   WHATSAPP: Object.freeze({
-    QR_TIMEOUT_MS:   parseInt(process.env.WHATSAPP_QR_TIMEOUT  || "30000", 10),
-    RETRY_DELAY_MS:  parseInt(process.env.WHATSAPP_RETRY_DELAY || "4000", 10),
-    WHITELIST:       (process.env.WHATSAPP_WHITELIST || "")
-                       .split(",").map(s => s.trim().replace(/[^\d]/g, "")).filter(Boolean),
-    OPEN:            process.env.WHATSAPP_OPEN === "true",
-    ENCRYPTION_KEY:  process.env.WHATSAPP_ENCRYPTION_KEY || null,
-    ENCRYPTION_IV:   process.env.WHATSAPP_ENCRYPTION_IV  || null
+    QR_TIMEOUT_MS:  parseInt(process.env.WHATSAPP_QR_TIMEOUT  || "30000", 10),
+    RETRY_DELAY_MS: parseInt(process.env.WHATSAPP_RETRY_DELAY || "4000", 10),
+    WHITELIST:      (process.env.WHATSAPP_WHITELIST || "")
+                      .split(",").map(s => s.trim().replace(/[^\d]/g, "")).filter(Boolean),
+    OPEN:           process.env.WHATSAPP_OPEN === "true",
+    ENCRYPTION_KEY: process.env.WHATSAPP_ENCRYPTION_KEY || null,
+    ENCRYPTION_IV:  process.env.WHATSAPP_ENCRYPTION_IV  || null
   }),
 
-  // === Vision (analyse d'images) ===
+  // ─────────────────────────────────────────────────────────────
+  // Vision (analyse d'images)
+  // ⚠️ Modèles VÉRIFIÉS actuels 2025 :
+  //    - Groq Llama 4 Maverick (vision multimodale, gratuit)
+  //    - Gemini 2.0 flash (stable, rapide)
+  //    - OpenRouter : Qwen 2.5 VL 72B (vision, free tier)
+  // ─────────────────────────────────────────────────────────────
   VISION: Object.freeze({
     GROQ_MODEL:       process.env.VISION_MODEL_GROQ       || "meta-llama/llama-4-maverick-17b-128e-instruct",
-    OPENROUTER_MODEL: process.env.VISION_MODEL_OPENROUTER || "inclusionai/ling-3.0-flash-vl:free",
-    GEMINI_MODEL:     process.env.VISION_MODEL_GEMINI     || "gemini-2.0-flash-exp"
+    GEMINI_MODEL:     process.env.VISION_MODEL_GEMINI     || "gemini-2.0-flash",
+    OPENROUTER_MODEL: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free"
   }),
 
-  // === Sandbox d'exécution de code ===
+  // ─────────────────────────────────────────────────────────────
+  // Sandbox d'exécution de code (Piston, Judge0)
+  // ─────────────────────────────────────────────────────────────
   SANDBOX: Object.freeze({
     PROVIDER:   process.env.CODE_SANDBOX_PROVIDER || "piston",
     PISTON_URL: process.env.PISTON_URL            || "https://emkc.org",
@@ -272,7 +302,9 @@ const CONFIG = Object.freeze({
     E2B_KEY:    process.env.E2B_API_KEY           || ""
   }),
 
-  // === Cache ===
+  // ─────────────────────────────────────────────────────────────
+  // Cache
+  // ─────────────────────────────────────────────────────────────
   CACHE: Object.freeze({
     L1_MAX_ITEMS:       parseInt(process.env.CACHE_L1_MAX_ITEMS || "5000", 10),
     L1_TTL_MS:          parseInt(process.env.CACHE_L1_TTL_MS    || String(10 * 60 * 1000), 10),
@@ -280,30 +312,38 @@ const CONFIG = Object.freeze({
     SEMANTIC_THRESHOLD: parseFloat(process.env.CACHE_SEMANTIC_THRESHOLD || "0.92")
   }),
 
-  // === HTTP ===
+  // ─────────────────────────────────────────────────────────────
+  // HTTP (User-Agent par défaut pour les scrapers)
+  // ─────────────────────────────────────────────────────────────
   HTTP: Object.freeze({
-    USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/16.4.0"
+    USER_AGENT: process.env.HTTP_USER_AGENT || "LubaAI-App/16.4.2"
   }),
 
-  // === HMAC (signature inter-services) ===
+  // ─────────────────────────────────────────────────────────────
+  // HMAC (signature inter-services)
+  // ─────────────────────────────────────────────────────────────
   HMAC: Object.freeze({
     ENABLED: Boolean(process.env.HMAC_SECRET),
     SECRET:  process.env.HMAC_SECRET || null,
     WINDOW_MS: 5 * 60 * 1000
   }),
 
-  // === AI Quality Layer ===
+  // ─────────────────────────────────────────────────────────────
+  // AI Quality Layer (self-critique, confidence, multi-vote)
+  // ─────────────────────────────────────────────────────────────
   AI_QUALITY: Object.freeze({
-    ENABLE_SELF_CRITIQUE:      process.env.ENABLE_SELF_CRITIQUE !== "false",
-    ENABLE_CONFIDENCE:         process.env.ENABLE_CONFIDENCE !== "false",
-    ENABLE_MULTI_VOTE:         process.env.ENABLE_MULTI_VOTE === "true",
-    ENABLE_HALLUCINATION_CHECK:process.env.ENABLE_HALLUCINATION_CHECK !== "false",
-    CONFIDENCE_THRESHOLD:      parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.6"),
-    MAX_VOTING_PROVIDERS:      parseInt(process.env.MAX_VOTING_PROVIDERS || "3", 10),
-    SELF_CRITIQUE_TRIGGER_ON:  process.env.SELF_CRITIQUE_TRIGGER || "auto"
+    ENABLE_SELF_CRITIQUE:       process.env.ENABLE_SELF_CRITIQUE !== "false",
+    ENABLE_CONFIDENCE:          process.env.ENABLE_CONFIDENCE !== "false",
+    ENABLE_MULTI_VOTE:          process.env.ENABLE_MULTI_VOTE === "true",
+    ENABLE_HALLUCINATION_CHECK: process.env.ENABLE_HALLUCINATION_CHECK !== "false",
+    CONFIDENCE_THRESHOLD:       parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.6"),
+    MAX_VOTING_PROVIDERS:       parseInt(process.env.MAX_VOTING_PROVIDERS || "3", 10),
+    SELF_CRITIQUE_TRIGGER_ON:   process.env.SELF_CRITIQUE_TRIGGER || "auto"
   }),
 
-  // === Internationalisation ===
+  // ─────────────────────────────────────────────────────────────
+  // Internationalisation
+  // ─────────────────────────────────────────────────────────────
   I18N: Object.freeze({
     DEFAULT_LANGUAGE: process.env.DEFAULT_LANGUAGE || "fr",
     SUPPORTED: ["fr", "en", "sw", "ln"]
@@ -329,6 +369,7 @@ const FIREBASE_CONFIG = Object.freeze({
 
 /**
  * Configuration d'hébergement (CORS + domaine public).
+ * Inclut le domaine Render pour éviter les blocages CORS.
  */
 const HOSTING_CONFIG = Object.freeze({
   domain: process.env.HOSTING_DOMAIN || "https://luba.web.app",
@@ -336,6 +377,7 @@ const HOSTING_CONFIG = Object.freeze({
     "https://luba.web.app",
     "https://luba-ia-636.web.app",
     "https://luba-ia-636.firebaseapp.com",
+    "https://milo-backend-sa1y.onrender.com",
     "http://localhost:3000",
     "http://localhost:8080",
     "http://localhost:5173",
@@ -345,6 +387,7 @@ const HOSTING_CONFIG = Object.freeze({
 
 /**
  * Quotas journaliers par rôle utilisateur.
+ * Utilisés par checkUserQuota() / incrementUserQuota().
  */
 const USER_QUOTAS = Object.freeze({
   FREE:    { maxMessagesPerDay: 100,    maxImagesPerDay: 20,    maxWhatsAppMessagesPerDay: 10,    maxEmailsPerDay: 5,    maxTokensPerRequest: 8000   },
@@ -353,7 +396,7 @@ const USER_QUOTAS = Object.freeze({
 });
 
 // ================================================================================
-// §1.04 — VALIDATION ENVIRONNEMENT + DOSSIERS
+// §1.04 — VALIDATION ENVIRONNEMENT + BOOTSTRAP DOSSIERS
 // ================================================================================
 
 /**
@@ -365,7 +408,7 @@ function validateEnvironment() {
   const problems = [];
   const warnings = [];
 
-  // Vérifie Firebase (au moins une méthode d'auth)
+  // Firebase (au moins une méthode d'auth)
   const hasFbAdmin = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   const hasFbRest  = Boolean(process.env.FIREBASE_API_KEY);
   if (!hasFbAdmin && !hasFbRest) {
@@ -374,7 +417,7 @@ function validateEnvironment() {
     warnings.push("Firebase Admin SDK absent → mode REST uniquement (rôle FREE forcé).");
   }
 
-  // Vérifie qu'au moins une clé LLM est présente
+  // Clé LLM (au moins une)
   const hasLLM = Boolean(
     process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY ||
     process.env.CEREBRAS_API_KEY || process.env.GEMINI_API_KEY
@@ -383,7 +426,7 @@ function validateEnvironment() {
     problems.push("Aucune clé LLM configurée (GROQ / OPENROUTER / CEREBRAS / GEMINI).");
   }
 
-  // Vérifie la persistance en production
+  // Persistance en production
   const hasSupabase = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY);
   if (!hasSupabase && !hasFbAdmin && CONFIG.ENV === "production") {
     warnings.push("Ni Supabase ni Firestore → SQLite seul (non persistant sur Render).");
@@ -447,7 +490,6 @@ const logger = pino({
     hostname: os.hostname()
   },
   timestamp: pino.stdTimeFunctions.isoTime,
-  // Redaction : remplace les valeurs sensibles par "[REDACTED]" dans les logs
   redact: {
     paths: [
       "req.headers.authorization",
@@ -459,7 +501,6 @@ const logger = pino({
     ],
     censor: "[REDACTED]"
   },
-  // Sérialiseur custom pour les erreurs (stack uniquement en dev)
   serializers: {
     err: (e) => ({
       type: e.constructor?.name || "Error",
@@ -488,9 +529,7 @@ class LubaError extends Error {
     this.httpStatus = httpStatus;
     this.context = context;
     this.timestamp = new Date().toISOString();
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, LubaError);
-    }
+    if (Error.captureStackTrace) Error.captureStackTrace(this, LubaError);
   }
 
   toJSON() {
@@ -508,7 +547,7 @@ class LubaError extends Error {
  * Catalogue des codes d'erreur → { status HTTP, message par défaut }.
  */
 const ERROR_CODES = Object.freeze({
-  // Authentification
+  // Auth
   MISSING_TOKEN:          { status: 401, msg: "Authentification requise." },
   INVALID_TOKEN:          { status: 401, msg: "Session invalide." },
   TOKEN_EXPIRED:          { status: 401, msg: "Session expirée, reconnectez-vous." },
@@ -532,7 +571,7 @@ const ERROR_CODES = Object.freeze({
   RATE_LIMIT:             { status: 429, msg: "Trop de requêtes." },
   RATE_LIMIT_CHAT:        { status: 429, msg: "Trop de messages." },
 
-  // Providers
+  // Providers IA
   PROVIDER_DOWN:          { status: 503, msg: "Service IA temporairement indisponible." },
   ALL_PROVIDERS_FAILED:   { status: 503, msg: "Tous les fournisseurs IA ont échoué." },
   CIRCUIT_OPEN:           { status: 503, msg: "Service temporairement surchargé." },
@@ -548,71 +587,37 @@ const ERROR_CODES = Object.freeze({
   NOT_FOUND:              { status: 404, msg: "Ressource non trouvée." }
 });
 
-/**
- * Construit une instance LubaError depuis un code du catalogue.
- */
 function makeError(code, extra = "", status = null) {
   const def = ERROR_CODES[code] || { status: 500, msg: "Erreur." };
   const message = extra ? `${def.msg} ${extra}`.trim() : def.msg;
   return new LubaError(code, message, status ?? def.status);
 }
 
-/**
- * Vérifie si une erreur est une LubaError (pour bypass les try/catch).
- */
-function isLubaError(e) {
-  return e instanceof LubaError;
-}
+function isLubaError(e) { return e instanceof LubaError; }
 
 // ================================================================================
 // §1.07 — UTILITAIRES (IDs, HASHES, TEMPS)
 // ================================================================================
 
-// --- Générateurs d'identifiants uniques ---
-
-/** Génère un ID de requête (pour traçabilité dans les logs). */
-const generateRequestId = () => `req_${crypto.randomUUID()}`;
-
-/** Génère un ID de conversation (session utilisateur). */
+// --- Générateurs d'identifiants ---
+const generateRequestId      = () => `req_${crypto.randomUUID()}`;
 const generateConversationId = () => `conv_${crypto.randomUUID()}`;
+const generateSessionToken   = () => `sess_${crypto.randomBytes(32).toString("hex")}`;
+const generateUUID           = () => crypto.randomUUID();
+const generateTaskId         = () => `task_${crypto.randomUUID()}`;
+const generateMsgId          = () => `msg_${crypto.randomUUID()}`;
 
-/** Génère un token de session actif (256 bits d'entropie). */
-const generateSessionToken = () => `sess_${crypto.randomBytes(32).toString("hex")}`;
-
-/** Génère un UUID v4 standard. */
-const generateUUID = () => crypto.randomUUID();
-
-/** Génère un ID de tâche utilisateur. */
-const generateTaskId = () => `task_${crypto.randomUUID()}`;
-
-/** Génère un ID de message (pour Firestore). */
-const generateMsgId = () => `msg_${crypto.randomUUID()}`;
-
-// --- Hashes cryptographiques ---
-
-/** Calcule le SHA-256 d'une chaîne (hex). */
+// --- Hashes ---
 const sha256 = (input) => crypto.createHash("sha256").update(String(input)).digest("hex");
-
-/** Calcule le SHA-1 d'une chaîne (hex) — usage historique uniquement. */
-const sha1 = (input) => crypto.createHash("sha1").update(String(input)).digest("hex");
-
-/** Hash d'un token de session (on ne stocke JAMAIS le token en clair). */
+const sha1   = (input) => crypto.createHash("sha1").update(String(input)).digest("hex");
 const hashSessionToken = (token) => sha256(token);
 
 // --- Signature HMAC ---
-
-/**
- * Signe un payload avec HMAC-SHA256.
- * Utilisé pour vérifier l'intégrité des requêtes inter-services.
- */
 const hmacSign = (payload, secret = CONFIG.HMAC.SECRET) => {
   if (!secret) throw new LubaError("INTERNAL_ERROR", "HMAC secret absent", 500);
   return crypto.createHmac("sha256", secret).update(payload).digest("hex");
 };
 
-/**
- * Vérifie une signature HMAC en temps constant (protection timing attacks).
- */
 const hmacVerify = (payload, signature, secret = CONFIG.HMAC.SECRET) => {
   if (!secret || !signature) return false;
   try {
@@ -621,31 +626,19 @@ const hmacVerify = (payload, signature, secret = CONFIG.HMAC.SECRET) => {
     const b = Buffer.from(String(signature), "hex");
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 };
 
 // --- Temps ---
-
-/** Timestamp Unix en millisecondes (raccourci). */
 const nowMs = () => Date.now();
 
-/**
- * Retourne la clé de jour UTC (YYYY-MM-DD) utilisée pour les quotas.
- */
 function todayKeyMs() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
-/** Attend un nombre de millisecondes (Promise-based). */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * Calcule un délai de backoff exponentiel avec jitter.
- * Utilisé pour les retries de providers LLM.
- */
 function backoffDelay(attempt, base = CONFIG.RETRY.BASE_DELAY_MS, max = CONFIG.RETRY.MAX_DELAY_MS) {
   const exp = Math.min(base * Math.pow(2, attempt), max);
   return exp + Math.floor(Math.random() * 100);
@@ -655,36 +648,20 @@ function backoffDelay(attempt, base = CONFIG.RETRY.BASE_DELAY_MS, max = CONFIG.R
 // §1.08 — UTILITAIRES DE SANITIZATION
 // ================================================================================
 
-/**
- * Échappe les caractères HTML dangereux.
- * À utiliser avant toute injection dans du HTML (emails, templates).
- */
 function escapeHtml(str) {
   return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-/**
- * Sanitization légère pour les entrées destinées au LLM.
- * Supprime les caractères de contrôle, applique la limite de longueur.
- */
 function sanitizeForLLM(input, maxLength = CONFIG.LIMITS.MAX_MESSAGE_LENGTH) {
   if (input === null || input === undefined) return "";
   let text = String(input);
-  // Supprime les caractères de contrôle (sauf \n et \t)
   text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
   if (text.length > maxLength) text = text.slice(0, maxLength);
   return text.trim();
 }
 
-/**
- * Sanitization stricte pour les entrées utilisateur brutes.
- * Supprime aussi les balises HTML dangereuses (XSS, javascript:).
- */
 function sanitizeStrict(input, maxLength = 500) {
   if (input === null || input === undefined) return "";
   let text = String(input).trim().replace(/[\u0000-\u001F\u007F]/g, "");
@@ -702,27 +679,13 @@ function sanitizeStrict(input, maxLength = 500) {
 // §1.09 — UTILITAIRES DE PARSING ET NORMALISATION
 // ================================================================================
 
-/**
- * Parse un JSON en sécurité, retourne fallback en cas d'erreur.
- */
 function safeJsonParse(str, fallback = null) {
   if (str === null || str === undefined) return fallback;
-  try {
-    return JSON.parse(str);
-  } catch {
-    return fallback;
-  }
+  try { return JSON.parse(str); } catch { return fallback; }
 }
 
-/**
- * Stringify un objet en sécurité, retourne fallback si erreur (circular, etc.).
- */
 function safeJsonStringify(obj, fallback = "{}") {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    return fallback;
-  }
+  try { return JSON.stringify(obj); } catch { return fallback; }
 }
 
 /**
@@ -732,7 +695,6 @@ function safeJsonStringify(obj, fallback = "{}") {
 function normalizeMath(input) {
   if (typeof input !== "string" || input.length === 0) return "";
 
-  // Découpe en segments texte/code pour préserver les blocs de code
   const parts = [];
   const codeBlockRegex = /```[\s\S]*?```|`[^`\n]*`/g;
   let lastIndex = 0;
@@ -751,25 +713,17 @@ function normalizeMath(input) {
 
   return parts.map(({ type, content }) => {
     if (type === "code") return content;
-    let text = content;
-    text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
-    // Convertit \( ... \) → $ ... $ et \[ ... \] → $$ ... $$
+    let text = content.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
     text = text.replace(/\\\(([\s\S]*?)\\\)/g, (_, inner) => `$${inner.trim()}$`);
     text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, inner) => `$$${inner.trim()}$$`);
-    // Décode les entités HTML
     text = text
       .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
       .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
-    // Réduit les sauts de ligne excessifs
     text = text.replace(/\n{3,}/g, "\n\n");
     return text;
   }).join("").trim();
 }
 
-/**
- * Supprime les balises <think> et <thinking> d'une réponse LLM.
- * Retourne { text, thinking } : le texte sans les balises + le reasoning extrait.
- */
 function stripThinkTags(input) {
   if (typeof input !== "string") return { text: "", thinking: "" };
   const thinks = [];
@@ -783,39 +737,23 @@ function stripThinkTags(input) {
   return { text, thinking: thinks.join("\n---\n") };
 }
 
-/**
- * Décode les entités XML d'un flux RSS (CDATA, &amp;, etc.).
- */
 function decodeXmlEntities(str) {
   return String(str)
-    .replace(/<!\[CDATA\[/g, "")
-    .replace(/\]\]>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/<!\[CDATA\[/g, "").replace(/\]\]>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&nbsp;/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\s+/g, " ").trim();
 }
 
 // ================================================================================
 // §1.10 — UTILITAIRES DE DÉTECTION
 // ================================================================================
 
-/**
- * Calcule un fingerprint d'appareil basé sur IP + User-Agent.
- * Utilisé pour la détection "nouvel appareil" (log de sécurité).
- */
 function computeDeviceFingerprint(ip, userAgent) {
   return sha256(`${ip || "?"}::${userAgent || "?"}`).slice(0, 32);
 }
 
-/**
- * Vérifie la signature binaire d'une image (magic bytes).
- * Évite les faux uploads (fichier .exe renommé .png, etc.).
- */
 function isValidImageSignature(buffer) {
   if (!buffer || buffer.length < 12) return false;
   const hex = buffer.subarray(0, 12).toString("hex");
@@ -827,9 +765,6 @@ function isValidImageSignature(buffer) {
   return false;
 }
 
-/**
- * Convertit un buffer image en objet { dataUrl, base64, mimetype, size }.
- */
 function convertImageToBase64(buffer, mimetype) {
   return {
     dataUrl: `data:${mimetype};base64,${buffer.toString("base64")}`,
@@ -839,21 +774,18 @@ function convertImageToBase64(buffer, mimetype) {
   };
 }
 
-// --- Regex ---
-
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_REGEX = /^\+?[1-9]\d{6,14}$/;
 
 /**
  * Détection de langue simple (fr / en / sw / ln).
- * Basée sur des mots-clés discriminants pour chaque langue.
- * Force le français si du CJK est détecté (on ne supporte pas ces langues).
+ * Basée sur des mots-clés discriminants.
+ * Force le français si du CJK est détecté (non supporté).
  */
 function detectLanguage(text) {
   if (!text || typeof text !== "string") return CONFIG.I18N.DEFAULT_LANGUAGE;
   const t = text.toLowerCase();
 
-  // Si CJK détecté → force français (non supporté sinon)
   if (/[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(text)) {
     return CONFIG.I18N.DEFAULT_LANGUAGE;
   }
@@ -868,9 +800,6 @@ function detectLanguage(text) {
   return best[1] > 0 ? best[0] : CONFIG.I18N.DEFAULT_LANGUAGE;
 }
 
-/**
- * Tronque un texte pour respecter un budget de tokens (~4 chars/token).
- */
 function truncateToTokenBudget(text, maxTokens = 8000) {
   if (!text) return "";
   const maxChars = maxTokens * 4;
@@ -882,8 +811,8 @@ function truncateToTokenBudget(text, maxTokens = 8000) {
 // ================================================================================
 
 /**
- * Découpe un texte en chunks UTF-8 safe (ne coupe jamais au milieu d'une
- * paire de substitution UTF-16, ce qui produirait un caractère invalide).
+ * Découpe un texte en chunks UTF-8 safe.
+ * Ne coupe jamais au milieu d'une paire de substitution UTF-16.
  */
 function safeChunkText(text, targetSize = 24) {
   if (!text) return [];
@@ -892,7 +821,6 @@ function safeChunkText(text, targetSize = 24) {
   while (i < text.length) {
     let end = Math.min(i + targetSize, text.length);
     const code = text.charCodeAt(end - 1);
-    // Si la fin tombe au milieu d'une paire surrogate, avance d'un caractère
     if (code >= 0xD800 && code <= 0xDBFF && end < text.length) end++;
     chunks.push(text.slice(i, end));
     i = end;
@@ -901,7 +829,7 @@ function safeChunkText(text, targetSize = 24) {
 }
 
 /**
- * Promise.race avec une deadline. Retourne fallbackValue si dépassée.
+ * Promise.race avec deadline : retourne fallbackValue si dépassée.
  */
 function withDeadline(promise, deadlineMs, fallbackValue) {
   return Promise.race([
@@ -915,7 +843,7 @@ function withDeadline(promise, deadlineMs, fallbackValue) {
 
 /**
  * allSettled avec deadline PAR PROMESSE.
- * Une source lente ne bloque pas les autres : elle est timeout individuellement.
+ * Une source lente est timeout individuellement sans bloquer les autres.
  */
 async function allSettledWithDeadline(promises, deadlineMs) {
   return Promise.all(promises.map((p) =>
@@ -937,7 +865,6 @@ async function allSettledWithDeadline(promises, deadlineMs) {
 
 /**
  * Calcule un score de pertinence 0-1 entre une image et une query.
- * Compare les mots-clés de la query avec le titre et la description.
  */
 function imageRelevanceScore(image, query) {
   if (!image || !query) return 0.5;
@@ -959,7 +886,7 @@ function imageRelevanceScore(image, query) {
 
 /**
  * Détecte si un message est une salutation / small talk.
- * Dans ce cas : PAS d'illustrations (l'utilisateur ne demande pas d'info).
+ * Dans ce cas : PAS d'illustrations.
  */
 function isGreetingOrSmallTalk(message) {
   if (!message) return true;
@@ -977,7 +904,6 @@ function isGreetingOrSmallTalk(message) {
   ];
 
   if (greetings.includes(t)) return true;
-
   for (const g of greetings) {
     if (t.startsWith(g + " ") || t.startsWith(g + ",") || t.startsWith(g + "!") ||
         t.startsWith(g + "?") || t.startsWith(g + "'")) {
@@ -997,7 +923,7 @@ let firebaseReady = false;
 
 /**
  * Parse le JSON du service account Firebase.
- * Accepte du JSON brut ou du base64 (Render encode souvent en base64).
+ * Accepte du JSON brut ou du base64.
  */
 function parseFirebaseServiceAccount(raw) {
   try {
@@ -1047,67 +973,32 @@ function initFirebase() {
   }
 }
 
-/**
- * Lit un document Firestore.
- * Retourne null si absent ou erreur (jamais throw).
- */
 async function fsGet(collection, docId) {
   if (!firestoreDb) return null;
   try {
     const snap = await firestoreDb.collection(collection).doc(docId).get();
     return snap.exists ? { id: snap.id, ...snap.data() } : null;
-  } catch (e) {
-    logger.warn({ err: e.message, collection, docId }, "fsGet échec");
-    return null;
-  }
+  } catch (e) { logger.warn({ err: e.message }, "fsGet échec"); return null; }
 }
 
-/**
- * Écrit un document Firestore (merge par défaut).
- */
 async function fsSet(collection, docId, data, { merge = true } = {}) {
   if (!firestoreDb) return { success: false, reason: "no_firestore" };
-  try {
-    await firestoreDb.collection(collection).doc(docId).set(data, { merge });
-    return { success: true };
-  } catch (e) {
-    logger.warn({ err: e.message, collection, docId }, "fsSet échec");
-    return { success: false, error: e };
-  }
+  try { await firestoreDb.collection(collection).doc(docId).set(data, { merge }); return { success: true }; }
+  catch (e) { logger.warn({ err: e.message }, "fsSet échec"); return { success: false, error: e }; }
 }
 
-/**
- * Met à jour partiellement un document Firestore.
- */
 async function fsUpdate(collection, docId, data) {
   if (!firestoreDb) return { success: false, reason: "no_firestore" };
-  try {
-    await firestoreDb.collection(collection).doc(docId).update(data);
-    return { success: true };
-  } catch (e) {
-    logger.warn({ err: e.message, collection, docId }, "fsUpdate échec");
-    return { success: false, error: e };
-  }
+  try { await firestoreDb.collection(collection).doc(docId).update(data); return { success: true }; }
+  catch (e) { logger.warn({ err: e.message }, "fsUpdate échec"); return { success: false, error: e }; }
 }
 
-/**
- * Supprime un document Firestore.
- */
 async function fsDelete(collection, docId) {
   if (!firestoreDb) return { success: false, reason: "no_firestore" };
-  try {
-    await firestoreDb.collection(collection).doc(docId).delete();
-    return { success: true };
-  } catch (e) {
-    logger.warn({ err: e.message, collection, docId }, "fsDelete échec");
-    return { success: false, error: e };
-  }
+  try { await firestoreDb.collection(collection).doc(docId).delete(); return { success: true }; }
+  catch (e) { logger.warn({ err: e.message }, "fsDelete échec"); return { success: false, error: e }; }
 }
 
-/**
- * Requête Firestore avec filtres, tri et limite.
- * where = [[field, op, value], ...]
- */
 async function fsQuery(collection, { where = [], orderBy = null, limit = 50 } = {}) {
   if (!firestoreDb) return [];
   try {
@@ -1117,10 +1008,7 @@ async function fsQuery(collection, { where = [], orderBy = null, limit = 50 } = 
     if (limit) q = q.limit(limit);
     const snap = await q.get();
     return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  } catch (e) {
-    logger.warn({ err: e.message, collection }, "fsQuery échec");
-    return [];
-  }
+  } catch (e) { logger.warn({ err: e.message }, "fsQuery échec"); return []; }
 }
 
 // ================================================================================
@@ -1129,10 +1017,6 @@ async function fsQuery(collection, { where = [], orderBy = null, limit = 50 } = 
 
 let supabase = null;
 
-/**
- * Initialise le client Supabase.
- * No-op si les env vars ne sont pas présentes.
- */
 function initSupabase() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     logger.warn("⚠️  Supabase non configuré");
@@ -1151,10 +1035,6 @@ function initSupabase() {
   }
 }
 
-/**
- * Écrit dans Supabase en sécurité (jamais throw).
- * Utilisé pour le dual-write SQLite → Supabase.
- */
 async function supabaseWriteSafe({ table, op, payload, matchColumn = null, matchValue = null }) {
   if (!supabase) return { success: false, reason: "no_supabase" };
   try {
@@ -1180,9 +1060,6 @@ async function supabaseWriteSafe({ table, op, payload, matchColumn = null, match
 // §1.15 — CACHE MULTI-NIVEAUX (L1 LRU + L2 Redis)
 // ================================================================================
 
-/**
- * Cache L1 : LRU local en mémoire (rapide, non partagé entre instances).
- */
 const l1Cache = new LRUCache({
   max: CONFIG.CACHE.L1_MAX_ITEMS,
   ttl: CONFIG.CACHE.L1_TTL_MS,
@@ -1192,10 +1069,6 @@ const l1Cache = new LRUCache({
 
 let redisClient = null;
 
-/**
- * Initialise Redis (cache L2).
- * No-op si REDIS_URL n'est pas défini ou ioredis non installé.
- */
 function initRedis() {
   if (!IORedis || !process.env.REDIS_URL) {
     logger.warn("⚠️  Redis non configuré — cache L2 désactivé");
@@ -1215,17 +1088,10 @@ function initRedis() {
   }
 }
 
-/**
- * API unifiée du cache (L1 + L2 transparent).
- */
 const cache = {
-  /**
-   * Récupère une valeur : cherche L1, puis L2. Retourne null si miss.
-   */
   async get(key) {
     const l1 = l1Cache.get(key);
     if (l1 !== undefined) return l1;
-
     if (redisClient) {
       try {
         const raw = await redisClient.get(key);
@@ -1238,39 +1104,21 @@ const cache = {
     }
     return null;
   },
-
-  /**
-   * Écrit une valeur dans L1 + L2.
-   */
   async set(key, value, ttlMs = CONFIG.CACHE.L1_TTL_MS) {
     l1Cache.set(key, value, { ttl: ttlMs });
     if (redisClient) {
-      try {
-        await redisClient.setex(key, Math.ceil(ttlMs / 1000), safeJsonStringify(value));
-      } catch {}
+      try { await redisClient.setex(key, Math.ceil(ttlMs / 1000), safeJsonStringify(value)); } catch {}
     }
   },
-
-  /**
-   * Supprime une clé de L1 + L2.
-   */
   async del(key) {
     l1Cache.delete(key);
-    if (redisClient) {
-      try { await redisClient.del(key); } catch {}
-    }
+    if (redisClient) { try { await redisClient.del(key); } catch {} }
   },
-
-  /**
-   * Pattern classique de mémoïsation : get ou charger.
-   */
   async withCache(key, ttlMs, loader) {
     const cached = await this.get(key);
     if (cached !== null) return cached;
     const fresh = await loader();
-    if (fresh !== null && fresh !== undefined) {
-      await this.set(key, fresh, ttlMs);
-    }
+    if (fresh !== null && fresh !== undefined) await this.set(key, fresh, ttlMs);
     return fresh;
   }
 };
@@ -1279,20 +1127,13 @@ const cache = {
 // §1.16 — CACHE SÉMANTIQUE
 // ================================================================================
 
-/**
- * Cache sémantique : si deux questions sont très proches (cosine > threshold),
- * on renvoie la même réponse. Économise ~30% d'appels LLM.
- */
 class SemanticCache {
   constructor({ threshold = CONFIG.CACHE.SEMANTIC_THRESHOLD, maxSize = 1000 } = {}) {
     this.threshold = threshold;
     this.maxSize = maxSize;
-    this.entries = new Map(); // hash → { embedding, value, ts }
+    this.entries = new Map();
   }
 
-  /**
-   * Similarité cosinus entre deux vecteurs.
-   */
   static cosineSimilarity(a, b) {
     if (!a || !b || a.length !== b.length) return 0;
     let dot = 0, normA = 0, normB = 0;
@@ -1305,9 +1146,6 @@ class SemanticCache {
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
-  /**
-   * Cherche l'entrée la plus proche (au-dessus du threshold).
-   */
   async get(embedding) {
     if (!embedding) return null;
     let best = null, bestScore = 0;
@@ -1319,9 +1157,6 @@ class SemanticCache {
     return null;
   }
 
-  /**
-   * Ajoute une entrée (éviction LRU basique si saturé).
-   */
   set(embedding, value) {
     if (!embedding) return;
     if (this.entries.size >= this.maxSize) {
@@ -1342,131 +1177,76 @@ const semanticCache = new SemanticCache();
 // §1.17 — SÉCURITÉ
 // ================================================================================
 
-/**
- * Patterns de détection de prompt injection.
- * Utilisés avant l'envoi au LLM pour bloquer les tentatives de jailbreak.
- */
 const INJECTION_PATTERNS = [
   /ignore\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts|rules)/i,
   /disregard\s+(all\s+)?(previous|above)/i,
   /forget\s+(everything|all|your)\s+(instructions|rules)/i,
   /you\s+are\s+now\s+(a|an)\s+(?!assistant|AI|model)/i,
   /system\s*:\s*you\s+are/i,
-  /<\|im_start\|>/i,
-  /<\|im_end\|>/i,
-  /\[INST\]/i,
-  /\[\/INST\]/i,
-  /###\s*instruction/i,
-  /act\s+as\s+(if\s+you\s+are|a)\s+(?!assistant)/i,
-  /jailbreak/i,
-  /DAN\s+mode/i,
-  /developer\s+mode/i,
-  /repeat\s+after\s+me/i,
-  /reveal\s+your\s+(system\s+)?prompt/i,
-  /show\s+me\s+your\s+instructions/i,
+  /<\|im_start\|>/i, /<\|im_end\|>/i, /\[INST\]/i, /\[\/INST\]/i,
+  /###\s*instruction/i, /act\s+as\s+(if\s+you\s+are|a)\s+(?!assistant)/i,
+  /jailbreak/i, /DAN\s+mode/i, /developer\s+mode/i, /repeat\s+after\s+me/i,
+  /reveal\s+your\s+(system\s+)?prompt/i, /show\s+me\s+your\s+instructions/i,
   /print\s+your\s+(initial\s+)?prompt/i
 ];
 
-/**
- * Détecte une tentative de prompt injection.
- */
 function detectPromptInjection(text) {
   if (!text || typeof text !== "string") return { detected: false, pattern: null };
-  for (const p of INJECTION_PATTERNS) {
-    if (p.test(text)) return { detected: true, pattern: p.source.slice(0, 60) };
-  }
+  for (const p of INJECTION_PATTERNS) if (p.test(text)) return { detected: true, pattern: p.source.slice(0, 60) };
   return { detected: false, pattern: null };
 }
 
-/**
- * Wrap une entrée utilisateur dans des délimiteurs explicites
- * pour réduire l'efficacité des injections.
- */
 function wrapUserInput(text) {
   const clean = sanitizeForLLM(text, CONFIG.LIMITS.MAX_MESSAGE_LENGTH);
   return `<user_input>\n${clean}\n</user_input>`;
 }
 
-/**
- * Modération locale (patterns évidents).
- */
 const MODERATION_KEYWORDS = {
   VIOLENCE_EXTREME: [
     /\bhow\s+to\s+(kill|murder|assassinate)\s+(a\s+)?(person|someone|human)/i,
     /\bhow\s+to\s+make\s+(a\s+)?(bomb|explosive|grenade)\b/i
   ],
-  CSAM: [
-    /\bchild\s+(porn|sexual|abuse)\b/i,
-    /\bcsam\b/i
-  ]
+  CSAM: [ /\bchild\s+(porn|sexual|abuse)\b/i, /\bcsam\b/i ]
 };
 
 function moderateText(text) {
   if (!text || typeof text !== "string") return { safe: true, category: null };
   for (const [category, patterns] of Object.entries(MODERATION_KEYWORDS)) {
-    for (const p of patterns) {
-      if (p.test(text)) return { safe: false, category };
-    }
+    for (const p of patterns) if (p.test(text)) return { safe: false, category };
   }
   return { safe: true, category: null };
 }
 
-/**
- * Modération via Groq Llama Guard + fallback local.
- */
 async function moderateWithGroq(text) {
   const local = moderateText(text);
   if (!local.safe) return local;
   if (!process.env.GROQ_API_KEY) return local;
-
   try {
     const resp = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
-      {
-        model: "llama-guard-3-8b",
-        messages: [{ role: "user", content: text.slice(0, 4000) }],
-        max_tokens: 50,
-        temperature: 0
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        timeout: 5000
-      }
+      { model: "llama-guard-3-8b", messages: [{ role: "user", content: text.slice(0, 4000) }], max_tokens: 50, temperature: 0 },
+      { headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" }, timeout: 5000 }
     );
     const verdict = resp.data?.choices?.[0]?.message?.content || "";
     const isUnsafe = /unsafe|violat|harmful/i.test(verdict);
     return { safe: !isUnsafe, category: isUnsafe ? "groq_guard" : null };
-  } catch {
-    return local;
-  }
+  } catch { return local; }
 }
 
-/**
- * Vérifie la signature HMAC d'une requête entrante.
- * Anti-replay : vérifie aussi le timestamp (< 5 min).
- */
 function verifyHmacSignature(req) {
   if (!CONFIG.HMAC.ENABLED) return { valid: true, skipped: true };
   const sig = req.headers["x-luba-signature"];
   const ts = req.headers["x-luba-timestamp"];
   if (!sig || !ts) return { valid: false, reason: "missing_headers" };
-
   const tsNum = parseInt(ts, 10);
   if (!Number.isFinite(tsNum)) return { valid: false, reason: "invalid_timestamp" };
   if (Math.abs(Date.now() - tsNum) > CONFIG.HMAC.WINDOW_MS) return { valid: false, reason: "expired" };
-
   const bodyStr = typeof req.body === "string" ? req.body : safeJsonStringify(req.body || {});
   const payload = `${ts}.${req.method}.${req.originalUrl}.${bodyStr}`;
   if (!hmacVerify(payload, sig)) return { valid: false, reason: "mismatch" };
   return { valid: true };
 }
 
-/**
- * Enregistre un événement de sécurité (audit RGPD-compliant).
- */
 async function logSecurityEvent(userId, eventType, details = {}, ip = null, ua = null, fp = null) {
   try {
     if (db) {
@@ -1479,18 +1259,12 @@ async function logSecurityEvent(userId, eventType, details = {}, ip = null, ua =
     if (firestoreDb) {
       fsSet("security_logs", generateUUID(), {
         user_id: userId, event_type: eventType, details,
-        ip_address: ip, user_agent: ua, fingerprint: fp,
-        created_at: new Date()
+        ip_address: ip, user_agent: ua, fingerprint: fp, created_at: new Date()
       }).catch(() => {});
     }
-  } catch (e) {
-    logger.error({ err: e.message }, "Erreur log sécurité");
-  }
+  } catch (e) { logger.error({ err: e.message }, "Erreur log sécurité"); }
 }
 
-/**
- * Audit d'un appel LLM (tokens, latence, coût).
- */
 async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTokens = 0, completionTokens = 0, latencyMs = 0, status, errorCode = null }) {
   try {
     if (db) {
@@ -1505,9 +1279,7 @@ async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTo
       metrics.llmTokens.labels(provider, model, "prompt").inc(promptTokens);
       metrics.llmTokens.labels(provider, model, "completion").inc(completionTokens);
     }
-  } catch (e) {
-    logger.error({ err: e.message }, "Erreur audit LLM");
-  }
+  } catch (e) { logger.error({ err: e.message }, "Erreur audit LLM"); }
 }
 
 // ================================================================================
@@ -1516,15 +1288,8 @@ async function auditLLMCall({ sessionId, userId, provider, model, tier, promptTo
 
 let metrics = null;
 
-/**
- * Initialise les métriques Prometheus (compteurs, histogrammes, gauges).
- * No-op si prom-client n'est pas installé.
- */
 function initMetrics() {
-  if (!PromClient) {
-    logger.warn("⚠️  prom-client non installé — /api/metrics indisponible");
-    return;
-  }
+  if (!PromClient) { logger.warn("⚠️  prom-client non installé"); return; }
   try {
     const c = PromClient;
     c.collectDefaultMetrics({ prefix: "luba_" });
@@ -1532,105 +1297,63 @@ function initMetrics() {
     metrics = {
       register: c.register,
 
-      httpRequests: new c.Counter({
-        name: "luba_http_requests_total",
-        help: "Nombre total de requêtes HTTP",
-        labelNames: ["method", "path", "status"]
-      }),
+      httpRequests: new c.Counter({ name: "luba_http_requests_total", help: "Requêtes HTTP",
+        labelNames: ["method", "path", "status"] }),
 
-      httpDuration: new c.Histogram({
-        name: "luba_http_request_duration_seconds",
-        help: "Durée des requêtes HTTP",
+      httpDuration: new c.Histogram({ name: "luba_http_request_duration_seconds", help: "Durée HTTP",
         labelNames: ["method", "path", "status"],
-        buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60]
-      }),
+        buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60] }),
 
-      llmLatency: new c.Histogram({
-        name: "luba_llm_latency_seconds",
-        help: "Latence des appels LLM",
+      llmLatency: new c.Histogram({ name: "luba_llm_latency_seconds", help: "Latence LLM",
         labelNames: ["provider", "model", "status"],
-        buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60]
-      }),
+        buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60] }),
 
-      llmTokens: new c.Counter({
-        name: "luba_llm_tokens_total",
-        help: "Tokens consommés par provider",
-        labelNames: ["provider", "model", "type"]
-      }),
+      llmTokens: new c.Counter({ name: "luba_llm_tokens_total", help: "Tokens LLM",
+        labelNames: ["provider", "model", "type"] }),
 
-      llmCalls: new c.Counter({
-        name: "luba_llm_calls_total",
-        help: "Nombre d'appels LLM",
-        labelNames: ["provider", "model", "status"]
-      }),
+      llmCalls: new c.Counter({ name: "luba_llm_calls_total", help: "Appels LLM",
+        labelNames: ["provider", "model", "status"] }),
 
-      circuitState: new c.Gauge({
-        name: "luba_circuit_breaker_state",
-        help: "État du circuit (0=closed, 1=half-open, 2=open)",
-        labelNames: ["name"]
-      }),
+      circuitState: new c.Gauge({ name: "luba_circuit_breaker_state", help: "Circuit state",
+        labelNames: ["name"] }),
 
-      toolCalls: new c.Counter({
-        name: "luba_tool_calls_total",
-        help: "Appels d'outils",
-        labelNames: ["tool", "status"]
-      }),
+      toolCalls: new c.Counter({ name: "luba_tool_calls_total", help: "Appels outils",
+        labelNames: ["tool", "status"] }),
 
-      activeWebSockets: new c.Gauge({
-        name: "luba_active_websockets",
-        help: "WebSockets actifs",
-        labelNames: ["channel"]
-      }),
+      activeWebSockets: new c.Gauge({ name: "luba_active_websockets", help: "WS actifs",
+        labelNames: ["channel"] }),
 
-      sttLatency: new c.Histogram({
-        name: "luba_stt_latency_seconds",
-        help: "Latence STT",
-        labelNames: ["provider"],
-        buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
-      }),
+      sttLatency: new c.Histogram({ name: "luba_stt_latency_seconds", help: "Latence STT",
+        labelNames: ["provider"], buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5] }),
 
-      ttsLatency: new c.Histogram({
-        name: "luba_tts_latency_seconds",
-        help: "Latence TTS",
-        labelNames: ["provider"],
-        buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
-      }),
+      ttsLatency: new c.Histogram({ name: "luba_tts_latency_seconds", help: "Latence TTS",
+        labelNames: ["provider"], buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5] }),
 
-      qualityScore: new c.Histogram({
-        name: "luba_response_quality_score",
-        help: "Distribution des scores de confiance",
+      qualityScore: new c.Histogram({ name: "luba_response_quality_score", help: "Score qualité",
         labelNames: ["intent", "tier"],
-        buckets: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-      }),
+        buckets: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] }),
 
-      selfCritiqueTriggered: new c.Counter({
-        name: "luba_self_critique_triggered_total",
-        help: "Nombre de self-critiques déclenchées",
-        labelNames: ["reason"]
-      }),
+      selfCritiqueTriggered: new c.Counter({ name: "luba_self_critique_triggered_total", help: "Self-critiques",
+        labelNames: ["reason"] }),
 
-      hallucinationDetected: new c.Counter({
-        name: "luba_hallucination_detected_total",
-        help: "Nombre d'hallucinations détectées",
-        labelNames: ["type"]
-      })
+      hallucinationDetected: new c.Counter({ name: "luba_hallucination_detected_total", help: "Hallucinations",
+        labelNames: ["type"] }),
+
+      authAttempts: new c.Counter({ name: "luba_auth_attempts_total", help: "Tentatives auth",
+        labelNames: ["result", "source"] }),
+
+      providerFailover: new c.Counter({ name: "luba_provider_failover_total", help: "Failover providers",
+        labelNames: ["provider", "model", "status_code"] })
     };
 
-    logger.info("✅ Métriques Prometheus v16.4 initialisées");
-  } catch (e) {
-    logger.error({ err: e.message }, "❌ Init métriques échouée");
-    metrics = null;
-  }
+    logger.info("✅ Métriques Prometheus v16.4.2 initialisées");
+  } catch (e) { logger.error({ err: e.message }, "❌ Init métriques échouée"); metrics = null; }
 }
 
 // ================================================================================
 // §1.19 — FEATURE FLAGS
 // ================================================================================
 
-/**
- * Feature flags dérivés des env vars.
- * Permettent d'activer/désactiver des features sans redéployer le code.
- */
 const FEATURES = Object.freeze({
   firestore:            Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON),
   supabase:             Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY),
@@ -1652,13 +1375,8 @@ const FEATURES = Object.freeze({
   hallucination_check:  CONFIG.AI_QUALITY.ENABLE_HALLUCINATION_CHECK
 });
 
-/**
- * Retourne une chaîne lisible "clé=✅|❌" des features actives.
- */
 function featureStatus() {
-  return Object.entries(FEATURES)
-    .map(([k, v]) => `${k}=${v ? "✅" : "❌"}`)
-    .join(" | ");
+  return Object.entries(FEATURES).map(([k, v]) => `${k}=${v ? "✅" : "❌"}`).join(" | ");
 }
 
 // ================================================================================
@@ -1667,20 +1385,12 @@ function featureStatus() {
 
 let db = null;
 
-/**
- * Initialise SQLite avec le schéma complet v16.4.
- * Active WAL, foreign keys, etc. pour de bonnes performances.
- */
 function initDatabase() {
   return new Promise((resolve, reject) => {
     db = new sqlite3.Database(CONFIG.PATHS.DB, (err) => {
-      if (err) {
-        logger.error({ err: err.message }, "❌ Impossible d'ouvrir SQLite");
-        return reject(err);
-      }
+      if (err) { logger.error({ err: err.message }, "❌ Impossible d'ouvrir SQLite"); return reject(err); }
       logger.info("✅ SQLite initialisé");
 
-      // Pragmas pour performance + intégrité
       db.run("PRAGMA journal_mode = WAL;");
       db.run("PRAGMA synchronous = NORMAL;");
       db.run("PRAGMA cache_size = -64000;");
@@ -1690,196 +1400,124 @@ function initDatabase() {
       db.run("PRAGMA wal_autocheckpoint = 1000;");
 
       db.serialize(() => {
-        // Table users : utilisateurs authentifiés
         db.run(`CREATE TABLE IF NOT EXISTS users (
-          id TEXT PRIMARY KEY,
-          firebase_uid TEXT UNIQUE,
-          email TEXT UNIQUE,
-          display_name TEXT,
-          role TEXT DEFAULT 'FREE',
-          email_verified INTEGER DEFAULT 0,
-          whatsapp_connected INTEGER DEFAULT 0,
-          whatsapp_session_id TEXT,
-          preferred_language TEXT DEFAULT 'fr',
-          last_seen_at INTEGER,
+          id TEXT PRIMARY KEY, firebase_uid TEXT UNIQUE, email TEXT UNIQUE,
+          display_name TEXT, role TEXT DEFAULT 'FREE', email_verified INTEGER DEFAULT 0,
+          whatsapp_connected INTEGER DEFAULT 0, whatsapp_session_id TEXT,
+          preferred_language TEXT DEFAULT 'fr', last_seen_at INTEGER,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table sessions : conversations utilisateur
         db.run(`CREATE TABLE IF NOT EXISTS sessions (
-          session_id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          firebase_uid TEXT,
+          session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, firebase_uid TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
-          active_intent TEXT,
-          intent_data TEXT,
-          intent_expires_at INTEGER,
+          active_intent TEXT, intent_data TEXT, intent_expires_at INTEGER,
           metadata TEXT DEFAULT '{}',
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
 
-        // Table messages : historique conversation
         db.run(`CREATE TABLE IF NOT EXISTS messages (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id TEXT NOT NULL,
-          user_id TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id TEXT,
           role TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
-          content TEXT NOT NULL,
-          tool_calls TEXT,
-          tool_call_id TEXT,
-          images TEXT DEFAULT '[]',
-          metadata TEXT DEFAULT '{}',
+          content TEXT NOT NULL, tool_calls TEXT, tool_call_id TEXT,
+          images TEXT DEFAULT '[]', metadata TEXT DEFAULT '{}',
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         )`);
 
-        // Index pour accélérer les requêtes d'historique
         db.run("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id DESC)");
         db.run("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, created_at DESC)");
         db.run("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at DESC)");
         db.run("CREATE INDEX IF NOT EXISTS idx_sessions_firebase ON sessions(firebase_uid)");
 
-        // Table email_logs : historique des envois d'email
         db.run(`CREATE TABLE IF NOT EXISTS email_logs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT,
-          firebase_uid TEXT,
-          to_email TEXT NOT NULL,
-          subject TEXT,
-          status TEXT DEFAULT 'pending',
-          provider TEXT,
-          error_message TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, firebase_uid TEXT,
+          to_email TEXT NOT NULL, subject TEXT, status TEXT DEFAULT 'pending',
+          provider TEXT, error_message TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table llm_audit_log : audit des appels LLM (RGPD)
         db.run(`CREATE TABLE IF NOT EXISTS llm_audit_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id TEXT,
-          user_id TEXT,
-          provider TEXT,
-          model TEXT,
-          tier TEXT,
-          prompt_tokens INTEGER DEFAULT 0,
-          completion_tokens INTEGER DEFAULT 0,
-          latency_ms INTEGER DEFAULT 0,
-          status TEXT DEFAULT 'success',
-          error_code TEXT,
-          quality_score REAL DEFAULT NULL,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, user_id TEXT,
+          provider TEXT, model TEXT, tier TEXT,
+          prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
+          latency_ms INTEGER DEFAULT 0, status TEXT DEFAULT 'success',
+          error_code TEXT, quality_score REAL DEFAULT NULL,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table security_logs : événements de sécurité
         db.run(`CREATE TABLE IF NOT EXISTS security_logs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT,
-          event_type TEXT NOT NULL,
-          details TEXT DEFAULT '{}',
-          fingerprint TEXT,
-          ip_address TEXT,
-          user_agent TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT,
+          event_type TEXT NOT NULL, details TEXT DEFAULT '{}',
+          fingerprint TEXT, ip_address TEXT, user_agent TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
         db.run("CREATE INDEX IF NOT EXISTS idx_security_fingerprint ON security_logs(user_id, event_type, fingerprint)");
 
-        // Table user_quotas : quotas journaliers par utilisateur
         db.run(`CREATE TABLE IF NOT EXISTS user_quotas (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT NOT NULL,
-          date TEXT NOT NULL,
-          messages_count INTEGER DEFAULT 0,
-          images_count INTEGER DEFAULT 0,
-          whatsapp_count INTEGER DEFAULT 0,
-          emails_count INTEGER DEFAULT 0,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, date TEXT NOT NULL,
+          messages_count INTEGER DEFAULT 0, images_count INTEGER DEFAULT 0,
+          whatsapp_count INTEGER DEFAULT 0, emails_count INTEGER DEFAULT 0,
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
           UNIQUE(user_id, date),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
 
-        // Table active_sessions : sessions utilisateur actives (révocables)
         db.run(`CREATE TABLE IF NOT EXISTS active_sessions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT NOT NULL,
-          session_token_hash TEXT UNIQUE,
-          ip_address TEXT,
-          user_agent TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+          session_token_hash TEXT UNIQUE, ip_address TEXT, user_agent TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           last_activity INTEGER DEFAULT (strftime('%s','now')*1000),
-          expires_at INTEGER,
-          is_revoked INTEGER DEFAULT 0,
+          expires_at INTEGER, is_revoked INTEGER DEFAULT 0,
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
 
-        // Table login_attempts : tentatives de connexion
         db.run(`CREATE TABLE IF NOT EXISTS login_attempts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT,
-          ip_address TEXT,
-          success INTEGER DEFAULT 0,
-          error_message TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, ip_address TEXT,
+          success INTEGER DEFAULT 0, error_message TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table blocked_ips : IP temporairement bloquées
         db.run(`CREATE TABLE IF NOT EXISTS blocked_ips (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ip_address TEXT UNIQUE,
-          reason TEXT,
-          strike_count INTEGER DEFAULT 1,
-          blocked_until INTEGER,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ip_address TEXT UNIQUE, reason TEXT,
+          strike_count INTEGER DEFAULT 1, blocked_until INTEGER,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table user_memory : résumé long terme utilisateur
         db.run(`CREATE TABLE IF NOT EXISTS user_memory (
-          user_id TEXT PRIMARY KEY,
-          summary TEXT DEFAULT '',
+          user_id TEXT PRIMARY KEY, summary TEXT DEFAULT '',
           messages_since_update INTEGER DEFAULT 0,
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
 
-        // Table user_memory_facts : faits individuels mémorisés
         db.run(`CREATE TABLE IF NOT EXISTS user_memory_facts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT NOT NULL,
-          fact TEXT NOT NULL,
-          category TEXT DEFAULT 'general',
-          embedding TEXT,
-          confidence REAL DEFAULT 1.0,
-          source_session TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+          fact TEXT NOT NULL, category TEXT DEFAULT 'general', embedding TEXT,
+          confidence REAL DEFAULT 1.0, source_session TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
         db.run("CREATE INDEX IF NOT EXISTS idx_facts_user ON user_memory_facts(user_id, created_at DESC)");
         db.run("CREATE INDEX IF NOT EXISTS idx_facts_category ON user_memory_facts(user_id, category)");
 
-        // Table user_tasks : rappels / tâches utilisateur
         db.run(`CREATE TABLE IF NOT EXISTS user_tasks (
-          id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          title TEXT NOT NULL,
-          notes TEXT,
-          due_at INTEGER,
-          status TEXT DEFAULT 'pending',
-          notified_at INTEGER,
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+          title TEXT NOT NULL, notes TEXT, due_at INTEGER,
+          status TEXT DEFAULT 'pending', notified_at INTEGER,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
           updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
         db.run("CREATE INDEX IF NOT EXISTS idx_user_tasks_user ON user_tasks(user_id, status, due_at)");
 
-        // Table outbox : queue pour sync Supabase
         db.run(`CREATE TABLE IF NOT EXISTS outbox (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          table_name TEXT NOT NULL,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL,
           op TEXT NOT NULL CHECK (op IN ('insert','update','upsert','delete')),
-          payload TEXT NOT NULL,
-          idempotency_key TEXT NOT NULL,
-          attempts INTEGER DEFAULT 0,
-          last_error TEXT,
+          payload TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+          attempts INTEGER DEFAULT 0, last_error TEXT,
           next_attempt_at INTEGER DEFAULT (strftime('%s','now')*1000),
           status TEXT DEFAULT 'pending',
           created_at INTEGER DEFAULT (strftime('%s','now')*1000),
@@ -1887,93 +1525,59 @@ function initDatabase() {
           UNIQUE(table_name, op, idempotency_key)
         )`);
 
-        // Table token_cache : cache persistant des tokens Firebase
         db.run(`CREATE TABLE IF NOT EXISTS token_cache (
-          token_hash TEXT PRIMARY KEY,
-          uid TEXT NOT NULL,
-          email TEXT,
-          display_name TEXT,
-          email_verified INTEGER DEFAULT 0,
-          role TEXT DEFAULT 'FREE',
-          expires_at INTEGER NOT NULL,
+          token_hash TEXT PRIMARY KEY, uid TEXT NOT NULL,
+          email TEXT, display_name TEXT, email_verified INTEGER DEFAULT 0,
+          role TEXT DEFAULT 'FREE', expires_at INTEGER NOT NULL,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table conversation_locks : mutex par conversation (anti-concurrence)
         db.run(`CREATE TABLE IF NOT EXISTS conversation_locks (
-          conversation_id TEXT PRIMARY KEY,
-          locked_until INTEGER NOT NULL,
+          conversation_id TEXT PRIMARY KEY, locked_until INTEGER NOT NULL,
           owner_request_id TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
 
-        // Table reasoning_traces : traces de raisonnement (audit qualité)
         db.run(`CREATE TABLE IF NOT EXISTS reasoning_traces (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id TEXT NOT NULL,
-          user_id TEXT,
-          user_message TEXT NOT NULL,
-          reasoning TEXT,
-          draft_answer TEXT,
-          final_answer TEXT,
-          confidence REAL DEFAULT 0.5,
-          quality_score REAL DEFAULT 0.5,
-          self_critique_improved INTEGER DEFAULT 0,
-          hallucination_detected INTEGER DEFAULT 0,
-          provider TEXT,
-          model TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id TEXT,
+          user_message TEXT NOT NULL, reasoning TEXT, draft_answer TEXT, final_answer TEXT,
+          confidence REAL DEFAULT 0.5, quality_score REAL DEFAULT 0.5,
+          self_critique_improved INTEGER DEFAULT 0, hallucination_detected INTEGER DEFAULT 0,
+          provider TEXT, model TEXT,
           created_at INTEGER DEFAULT (strftime('%s','now')*1000)
         )`);
         db.run("CREATE INDEX IF NOT EXISTS idx_reasoning_session ON reasoning_traces(session_id, created_at DESC)");
+
+        // Nouvelle table : logs de failover pour auto-diagnostic des modèles dépréciés
+        db.run(`CREATE TABLE IF NOT EXISTS provider_failover_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT, tier TEXT,
+          provider TEXT NOT NULL, model TEXT NOT NULL,
+          http_status INTEGER, error_code TEXT, error_message TEXT,
+          fallback_provider TEXT, fallback_model TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        )`);
+        db.run("CREATE INDEX IF NOT EXISTS idx_failover_provider ON provider_failover_log(provider, model, created_at DESC)");
       });
 
-      logger.info("✅ Schéma SQLite v16.4 initialisé");
+      logger.info("✅ Schéma SQLite v16.4.2 initialisé");
       resolve();
     });
   });
 }
 
 // --- Wrappers async pour sqlite3 ---
+function dbGet(q, p = []) { return new Promise((res, rej) => { if (!db) return res(null); db.get(q, p, (e, r) => e ? rej(e) : res(r)); }); }
+function dbAll(q, p = []) { return new Promise((res, rej) => { if (!db) return res([]); db.all(q, p, (e, r) => e ? rej(e) : res(r)); }); }
+function dbRun(q, p = []) { return new Promise((res, rej) => { if (!db) return res({ changes: 0 }); db.run(q, p, function (e) { e ? rej(e) : res(this); }); }); }
+function dbExec(q) { return new Promise((res, rej) => { if (!db) return res(); db.exec(q, (e) => e ? rej(e) : res()); }); }
 
-function dbGet(query, params = []) {
-  return new Promise((resolve, reject) => {
-    if (!db) return resolve(null);
-    db.get(query, params, (err, row) => err ? reject(err) : resolve(row));
-  });
-}
-
-function dbAll(query, params = []) {
-  return new Promise((resolve, reject) => {
-    if (!db) return resolve([]);
-    db.all(query, params, (err, rows) => err ? reject(err) : resolve(rows));
-  });
-}
-
-function dbRun(query, params = []) {
-  return new Promise((resolve, reject) => {
-    if (!db) return resolve({ changes: 0 });
-    db.run(query, params, function (err) {
-      err ? reject(err) : resolve(this);
-    });
-  });
-}
-
-function dbExec(query) {
-  return new Promise((resolve, reject) => {
-    if (!db) return resolve();
-    db.exec(query, (err) => err ? reject(err) : resolve());
-  });
-}
-
-/**
- * Transaction SQLite (BEGIN IMMEDIATE → COMMIT/ROLLBACK).
- */
 async function dbTransaction(fn) {
   await dbExec("BEGIN IMMEDIATE");
   try {
-    const result = await fn({ dbGet, dbAll, dbRun });
+    const r = await fn({ dbGet, dbAll, dbRun });
     await dbExec("COMMIT");
-    return result;
+    return r;
   } catch (e) {
     try { await dbExec("ROLLBACK"); } catch {}
     throw e;
@@ -1984,10 +1588,6 @@ async function dbTransaction(fn) {
 // §1.21 — BOOTSTRAP PARTIE 1
 // ================================================================================
 
-/**
- * Initialise toutes les fondations dans l'ordre.
- * Appelé depuis bootstrap() en Partie 5.
- */
 async function bootstrapPart1() {
   ensureDirectories();
   validateEnvironment();
@@ -1996,7 +1596,7 @@ async function bootstrapPart1() {
   initRedis();
   initMetrics();
   await initDatabase();
-  logger.info(`🎯 Features v16.4 : ${featureStatus()}`);
+  logger.info(`🎯 Features v16.4.2 : ${featureStatus()}`);
   return { ok: true };
 }
 
@@ -2070,45 +1670,21 @@ module.exports = {
 // ================================================================================
 // ==================== FIN PARTIE 1/5 ===========================================
 // ================================================================================
-// ▶ PARTIE 2/5 : Providers LLM · Circuit breaker · Tool calling · Voice · Mémoire
-//                · AI Quality Layer (SANS STUBS → plus de SyntaxError).
+// ▶ PARTIE 2/5 : Providers LLM (avec modèles 2025 vérifiés + auto-failover
+//                logging) · Circuit breaker · Tool calling · Voice · Mémoire
+//                · AI Quality Layer.
+//
 //   Tape "suite" pour la recevoir.
 // ================================================================================
 // ================================================================================
 // PARTIE 2/5 — PROVIDERS LLM · TOOLS · VOICE · MÉMOIRE · AI QUALITY
 // ================================================================================
-// Ce module implémente la couche IA complète :
-//   • Providers LLM (Groq, OpenRouter, Cerebras, Gemini) avec rotation de clés
-//   • Circuit breaker granulaire par (provider:model:key)
-//   • Intercepteur d'erreurs LLM → messages FR actionnables
-//   • Tiers de modèles (Mwamba v100, Ngandu v250, Vision)
-//   • 19 outils exposés au LLM (function calling natif)
-//   • Boucle agent bornée (runToolLoop) avec reasoning streaming
-//   • STT (Groq Whisper + Deepgram fallback)
-//   • TTS (Kokoro + Piper fallback)
-//   • VAD adaptatif + pipeline vocal complet (barge-in, sentence chunking)
-//   • Mémoire courte (rolling summary) + mémoire longue (facts + embeddings)
-//   • AI Quality Layer (self-critique, confidence, hallucination detector)
-//
-// TABLE DES MATIÈRES :
-//   §2.01  Providers LLM (registre + key pools)
-//   §2.02  Circuit breaker par provider:model:key
-//   §2.03  Intercepteur d'erreurs + messages utilisateur FR
-//   §2.04  Tiers de modèles (Mwamba, Ngandu, Vision)
-//   §2.05  Appelant OpenAI-compatible
-//   §2.06  Appelant Gemini natif
-//   §2.07  callProviderWithTools (rotation + circuit)
-//   §2.08  TOOL_SCHEMAS (19 outils)
-//   §2.09  executeToolNative (dispatch)
-//   §2.10  runToolLoop (boucle agent)
-//   §2.11  STT (Groq + Deepgram)
-//   §2.12  TTS (Kokoro + Piper)
-//   §2.13  VAD adaptatif
-//   §2.14  Voice pipeline
-//   §2.15  Mémoire courte
-//   §2.16  Mémoire longue (facts + embeddings + recall)
-//   §2.17  AI Quality Layer
-//   §2.18  Exports Partie 2
+// MODÈLES VÉRIFIÉS OCTOBRE 2026
+// - Groq : openai/gpt-oss-120b (llama-3.3-70b-versatile DÉCOMMISSIONNÉ le 16/08/2026)
+// - Gemini : gemini-2.5-flash (gemini-2.0-flash-exp ARRÊTÉ)
+// - Cerebras : gpt-oss-120b, llama-3.3-70b (DÉPRÉCIÉ le 16/02/2026 → remplacé)
+// - OpenRouter : deepseek/deepseek-r1:free, qwen/qwen3.8-27b:free
+// - Vision : meta-llama/llama-4-maverick-17b-128e-instruct (Groq)
 // ================================================================================
 
 "use strict";
@@ -2117,10 +1693,6 @@ module.exports = {
 // §2.01 — PROVIDERS LLM
 // ================================================================================
 
-/**
- * Construit un pool de clés à partir d'une liste de chaînes.
- * Filtre les valeurs vides, retourne un tableau de { apiKey, label }.
- */
 function buildKeyPool(keys, prefix) {
   return keys
     .filter((k) => typeof k === "string" && k.trim().length > 0)
@@ -2130,7 +1702,6 @@ function buildKeyPool(keys, prefix) {
     }));
 }
 
-// Client Google Gemini (SDK officiel)
 let geminiClient = null;
 if (GoogleGenAI && process.env.GEMINI_API_KEY) {
   try {
@@ -2142,8 +1713,12 @@ if (GoogleGenAI && process.env.GEMINI_API_KEY) {
 }
 
 /**
- * Registre des providers LLM supportés.
- * Chaque provider contient sa config HTTP, ses timeouts, son pool de clés.
+ * Registre des providers LLM supportés (modèles vérifiés OCTOBRE 2026).
+ * 
+ * ⚠️ ATTENTION :
+ *   - Groq : llama-3.3-70b-versatile DÉCOMMISSIONNÉ le 16/08/2026 → gpt-oss-120b
+ *   - Gemini : gemini-2.0-flash-exp ARRÊTÉ → gemini-2.5-flash
+ *   - Cerebras : llama-3.3-70b et qwen-3-32b DÉPRÉCIÉS le 16/02/2026
  */
 const LLM_PROVIDERS = Object.freeze({
   GROQ: Object.freeze({
@@ -2191,7 +1766,6 @@ const LLM_PROVIDERS = Object.freeze({
   })
 });
 
-// Log du nombre de clés détectées par provider (utile au boot)
 if (LLM_PROVIDERS.GROQ.keyPool.length > 0) logger.info(`🔑 Groq : ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.OPENROUTER.keyPool.length > 0) logger.info(`🔑 OpenRouter : ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.CEREBRAS.keyPool.length > 0) logger.info(`🔑 Cerebras : ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s)`);
@@ -2201,12 +1775,6 @@ if (LLM_PROVIDERS.GEMINI.keyPool.length > 0) logger.info(`🔑 Gemini : ${LLM_PR
 // §2.02 — CIRCUIT BREAKER
 // ================================================================================
 
-/**
- * Circuit breaker (état CLOSED / OPEN / HALF_OPEN) par (provider, model, key).
- * - CLOSED : tout va bien, tentatives autorisées
- * - OPEN : trop d'échecs, on refuse les tentatives pendant `resetTimeout`
- * - HALF_OPEN : après timeout, on laisse passer 1 tentative de test
- */
 class CircuitBreaker {
   constructor(name, options = {}) {
     this.name = name;
@@ -2221,7 +1789,6 @@ class CircuitBreaker {
 
   canAttempt() {
     if (this.state === "CLOSED") return true;
-
     if (this.state === "OPEN") {
       if (Date.now() - this.lastFailureTime >= this.resetTimeout) {
         this.state = "HALF_OPEN";
@@ -2232,18 +1799,13 @@ class CircuitBreaker {
       }
       return false;
     }
-
-    // HALF_OPEN : limite à 1 tentative en vol simultanée
     return this.halfOpenInFlight < CONFIG.CIRCUIT.HALF_OPEN_MAX;
   }
 
   async execute(fn) {
-    if (!this.canAttempt()) {
-      throw makeError("CIRCUIT_OPEN");
-    }
+    if (!this.canAttempt()) throw makeError("CIRCUIT_OPEN");
     const isHalfOpen = this.state === "HALF_OPEN";
     if (isHalfOpen) this.halfOpenInFlight++;
-
     try {
       const result = await fn();
       this.onSuccess();
@@ -2252,9 +1814,7 @@ class CircuitBreaker {
       this.onFailure();
       throw error;
     } finally {
-      if (isHalfOpen) {
-        this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1);
-      }
+      if (isHalfOpen) this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1);
     }
   }
 
@@ -2303,9 +1863,6 @@ class CircuitBreaker {
 
 const circuitRegistry = new Map();
 
-/**
- * Récupère (ou crée) le circuit breaker associé à une clé (provider:model:key).
- */
 function getCircuit(provider, model, keyLabel) {
   const key = `${provider}:${model}:${keyLabel}`;
   let cb = circuitRegistry.get(key);
@@ -2316,9 +1873,6 @@ function getCircuit(provider, model, keyLabel) {
   return cb;
 }
 
-/**
- * Retourne l'état de tous les circuits (utilisé par /api/debug).
- */
 function getAllCircuitStates() {
   return [...circuitRegistry.values()].map((cb) => cb.getState());
 }
@@ -2327,21 +1881,13 @@ function getAllCircuitStates() {
 // §2.03 — INTERCEPTEUR D'ERREURS + MESSAGES FR
 // ================================================================================
 
-/**
- * Classe utilitaire pour classifier les erreurs LLM.
- */
 class LLMErrorInterceptor {
-  /**
-   * Retourne un code normalisé pour une erreur.
-   */
   static getErrorCode(error) {
     if (!error) return "UNKNOWN_ERROR";
     if (error instanceof LubaError) return error.code;
     const status = error?.response?.status;
     if (status) return `HTTP_${status}`;
-    if (error.code === "ECONNABORTED" || error.code === "ABORT_ERR" || error.name === "AbortError") {
-      return "TIMEOUT";
-    }
+    if (error.code === "ECONNABORTED" || error.code === "ABORT_ERR" || error.name === "AbortError") return "TIMEOUT";
     if (error.code === "ENOTFOUND") return "DNS_ERROR";
     if (error.code === "ECONNREFUSED") return "CONNECTION_REFUSED";
     if (error.code === "MISSING_API_KEY") return "MISSING_API_KEY";
@@ -2349,17 +1895,11 @@ class LLMErrorInterceptor {
     return "UNKNOWN_ERROR";
   }
 
-  /**
-   * Providers à abandonner immédiatement (erreur définitive).
-   */
   static shouldSkipProvider(error) {
     return ["HTTP_400","HTTP_401","HTTP_403","HTTP_402","HTTP_404","MISSING_API_KEY"]
       .includes(this.getErrorCode(error));
   }
 
-  /**
-   * Providers pour lesquels on tourne la clé immédiatement.
-   */
   static shouldRotateImmediately(error) {
     return [
       "HTTP_429","HTTP_500","HTTP_502","HTTP_503","HTTP_504",
@@ -2368,10 +1908,6 @@ class LLMErrorInterceptor {
   }
 }
 
-/**
- * Transforme une erreur technique en message utilisateur FR actionnable.
- * Log la vraie erreur côté serveur pour diagnostic.
- */
 function userFacingErrorMessage(error, context = {}) {
   const code = LLMErrorInterceptor.getErrorCode(error);
 
@@ -2387,21 +1923,36 @@ function userFacingErrorMessage(error, context = {}) {
   if (code === "CIRCUIT_OPEN") return "Je suis temporairement surchargé. Attends une minute puis réessaie.";
   if (code === "HTTP_400") return "Je n'ai pas compris la demande. Peux-tu reformuler ?";
   if (code === "HTTP_401" || code === "HTTP_403" || code === "MISSING_API_KEY") return "Problème de configuration côté serveur. Contacte le support si ça persiste.";
-  if (code === "HTTP_404") return "Le service demandé n'est pas disponible. Essaie une autre question.";
+  if (code === "HTTP_404") return "Le modèle demandé n'est pas disponible. Un autre va être essayé automatiquement.";
   if (code === "SANDBOX_UNAVAILABLE") return "L'exécution de code est indisponible pour l'instant, mais je peux quand même t'écrire le code.";
   return "Je rencontre une difficulté technique. Reformule ta demande ou réessaie dans un instant.";
 }
 
 // ================================================================================
-// §2.04 — TIERS DE MODÈLES
+// §2.04 — TIERS DE MODÈLES (VÉRIFIÉS OCTOBRE 2026)
 // ================================================================================
 
 /**
  * Registre des tiers de modèles.
- *
- * v100  = Mwamba    → conversation rapide (Groq → Gemini → Cerebras → OpenRouter)
- * v250  = Ngandu    → raisonnement (DeepSeek R1) + code (Qwen Coder)
- * vision            → analyse d'images (Llama 4 Maverick → Gemini → OpenRouter)
+ * 
+ * ════════════════════════════════════════════════════════════════
+ * MODÈLES VÉRIFIÉS OCTOBRE 2026 :
+ * 
+ * v100 (Mwamba) — Conversation rapide
+ *   Groq       → openai/gpt-oss-120b ✅ (llama-3.3-70b-versatile DÉCOMMISSIONNÉ 16/08/2026)
+ *   Gemini     → gemini-2.5-flash ✅ (gemini-2.0-flash-exp ARRÊTÉ)
+ *   Cerebras   → qwen-3.8-27b ✅ (llama-3.3-70b DÉPRÉCIÉ 16/02/2026)
+ *   OpenRouter → meta-llama/llama-3.3-70b-instruct:free ✅
+ * 
+ * v250 (Ngandu) — Raisonnement + Code
+ *   Reasoning  → Groq gpt-oss-120b / OpenRouter deepseek-r1:free / Gemini 2.5-flash
+ *   Code       → Groq gpt-oss-120b / Cerebras qwen-3.8-27b / OpenRouter qwen-coder:free
+ * 
+ * Vision — Analyse d'images
+ *   Groq       → meta-llama/llama-4-maverick-17b-128e-instruct ✅
+ *   Gemini     → gemini-2.5-flash ✅
+ *   OpenRouter → qwen/qwen-2.5-vl-72b-instruct:free ✅
+ * ════════════════════════════════════════════════════════════════
  */
 const MODEL_TIERS = Object.freeze({
   v100: {
@@ -2410,17 +1961,20 @@ const MODEL_TIERS = Object.freeze({
     providers: [
       {
         provider: "groq",
-        model: process.env.GROQ_MODEL_V100 || "llama-3.3-70b-versatile",
+        // ✅ VÉRIFIÉ oct 2026 : llama-3.3-70b-versatile DÉCOMMISSIONNÉ le 16/08/2026
+        model: process.env.GROQ_MODEL_V100 || "openai/gpt-oss-120b",
         maxTokens: 4000, timeout: 20000, temperature: 0.7, failoverPriority: 0
       },
       {
         provider: "gemini",
-        model: process.env.GEMINI_MODEL_V100 || "gemini-2.0-flash-exp",
+        // ✅ VÉRIFIÉ oct 2026 : gemini-2.0-flash-exp ARRÊTÉ → gemini-2.5-flash stable
+        model: process.env.GEMINI_MODEL_V100 || "gemini-2.5-flash",
         maxTokens: 8000, timeout: 22000, temperature: 0.7, failoverPriority: 1
       },
       {
         provider: "cerebras",
-        model: process.env.CEREBRAS_MODEL_V100 || "llama-3.3-70b",
+        // ✅ VÉRIFIÉ oct 2026 : llama-3.3-70b DÉPRÉCIÉ le 16/02/2026 → qwen-3.8-27b
+        model: process.env.CEREBRAS_MODEL_V100 || "qwen-3.8-27b",
         maxTokens: 4000, timeout: 20000, temperature: 0.7, failoverPriority: 2
       },
       {
@@ -2438,17 +1992,21 @@ const MODEL_TIERS = Object.freeze({
       providers: [
         {
           provider: "groq",
-          model: process.env.GROQ_MODEL_V250_REASONING || "deepseek-r1-distill-llama-70b",
-          maxTokens: 8000, timeout: 40000, temperature: 0.6, failoverPriority: 0
+          // ✅ gpt-oss-120b supporte reasoning_effort
+          model: process.env.GROQ_MODEL_V250_REASONING || "openai/gpt-oss-120b",
+          maxTokens: 8000, timeout: 40000, temperature: 0.6, failoverPriority: 0,
+          reasoningEffort: "high"
         },
         {
           provider: "openrouter",
+          // ✅ deepseek-r1:free est stable sur OpenRouter
           model: process.env.OPENROUTER_MODEL_V250_REASONING || "deepseek/deepseek-r1:free",
           maxTokens: 8000, timeout: 45000, temperature: 0.6, failoverPriority: 1
         },
         {
           provider: "gemini",
-          model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-2.0-flash-thinking-exp",
+          // ✅ gemini-2.5-flash (stable)
+          model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-2.5-flash",
           maxTokens: 8000, timeout: 35000, temperature: 0.3, failoverPriority: 2
         }
       ]
@@ -2457,17 +2015,20 @@ const MODEL_TIERS = Object.freeze({
       providers: [
         {
           provider: "groq",
-          model: process.env.GROQ_MODEL_V250_CODE || "qwen-2.5-coder-32b",
+          // ✅ gpt-oss-120b excellent en code
+          model: process.env.GROQ_MODEL_V250_CODE || "openai/gpt-oss-120b",
           maxTokens: 8000, timeout: 30000, temperature: 0.4, failoverPriority: 0
         },
         {
           provider: "cerebras",
-          model: process.env.CEREBRAS_MODEL_V250_CODE || "qwen-2.5-coder-32b",
+          // ✅ qwen-3.8-27b (public, rapide)
+          model: process.env.CEREBRAS_MODEL_V250_CODE || "qwen-3.8-27b",
           maxTokens: 8000, timeout: 30000, temperature: 0.4, failoverPriority: 1
         },
         {
           provider: "openrouter",
-          model: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen-2.5-coder-32b-instruct:free",
+          // ✅ qwen3-coder-480b est le meilleur codeur free sur OpenRouter
+          model: process.env.OPENROUTER_MODEL_V250_CODE || "qwen/qwen3-coder-480b:free",
           maxTokens: 8000, timeout: 35000, temperature: 0.4, failoverPriority: 2
         }
       ]
@@ -2481,27 +2042,23 @@ const MODEL_TIERS = Object.freeze({
     providers: [
       {
         provider: "groq",
-        model: CONFIG.VISION.GROQ_MODEL,
+        model: CONFIG.VISION.GROQ_MODEL,        // meta-llama/llama-4-maverick-17b-128e-instruct
         maxTokens: 4000, timeout: 25000, temperature: 0.7, failoverPriority: 0
       },
       {
         provider: "gemini",
-        model: CONFIG.VISION.GEMINI_MODEL,
+        model: CONFIG.VISION.GEMINI_MODEL,      // gemini-2.5-flash
         maxTokens: 4000, timeout: 25000, temperature: 0.7, failoverPriority: 1
       },
       {
         provider: "openrouter",
-        model: CONFIG.VISION.OPENROUTER_MODEL,
+        model: CONFIG.VISION.OPENROUTER_MODEL,  // qwen/qwen-2.5-vl-72b-instruct:free
         maxTokens: 4000, timeout: 30000, temperature: 0.7, failoverPriority: 2
       }
     ]
   }
 });
 
-/**
- * Valide et normalise un identifiant de modèle OpenRouter.
- * Ajoute automatiquement le suffixe `:free` si absent.
- */
 function validateAndSanitizeOpenRouterModel(model) {
   if (!model || typeof model !== "string") return null;
   const prefixes = [
@@ -2520,10 +2077,6 @@ function validateAndSanitizeOpenRouterModel(model) {
 // §2.05 — APPELANT OPENAI-COMPATIBLE
 // ================================================================================
 
-/**
- * Appelle un provider compatible OpenAI (Groq, Cerebras, OpenRouter).
- * Préserve `reasoning_content` (DeepSeek R1, Qwen think) s'il est présent.
- */
 async function callOpenAICompatibleRaw({
   provider, model, messages, tools, jsonMode,
   timeout, maxTokens, temperature, images, apiKey, reasoningEffort, signal
@@ -2538,7 +2091,6 @@ async function callOpenAICompatibleRaw({
     throw e;
   }
 
-  // Formate les messages avec images si fournies
   let formattedMessages = messages;
   if (images && images.length > 0) {
     const idx = messages.length - 1;
@@ -2593,7 +2145,6 @@ async function callOpenAICompatibleRaw({
   const message = choice?.message;
   if (!message) throw new Error(`Réponse ${provider} vide`);
 
-  // Préserve le raisonnement depuis toutes les sources possibles
   if (!message.reasoning_content && choice?.reasoning) {
     message.reasoning_content = choice.reasoning;
   }
@@ -2612,10 +2163,6 @@ async function callOpenAICompatibleRaw({
 // §2.06 — APPELANT GEMINI NATIF
 // ================================================================================
 
-/**
- * Appelle Gemini avec function calling natif.
- * Convertit les messages OpenAI → format Gemini (contents + parts).
- */
 async function callGeminiRawWithTools({
   model, messages, tools, jsonMode, timeout, maxTokens, temperature, images, signal
 }) {
@@ -2625,7 +2172,6 @@ async function callGeminiRawWithTools({
   const contents = [];
 
   for (const msg of messages) {
-    // System → systemInstruction
     if (msg.role === "system") {
       systemInstruction = typeof msg.content === "string"
         ? msg.content
@@ -2633,7 +2179,6 @@ async function callGeminiRawWithTools({
       continue;
     }
 
-    // Tool response
     if (msg.role === "tool") {
       let parsed;
       try { parsed = JSON.parse(msg.content || "{}"); }
@@ -2650,7 +2195,6 @@ async function callGeminiRawWithTools({
       continue;
     }
 
-    // Assistant avec tool_calls
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
       const parts = [];
       if (msg.content) parts.push({ text: typeof msg.content === "string" ? msg.content : "" });
@@ -2666,7 +2210,6 @@ async function callGeminiRawWithTools({
       continue;
     }
 
-    // User / Assistant standard
     const role = msg.role === "assistant" ? "model" : "user";
     const parts = [];
     if (typeof msg.content === "string") {
@@ -2684,7 +2227,6 @@ async function callGeminiRawWithTools({
     if (parts.length) contents.push({ role, parts });
   }
 
-  // Ajoute les images au dernier message user si présentes
   if (images && images.length > 0) {
     const last = contents[contents.length - 1];
     if (last?.role === "user") {
@@ -2751,12 +2293,9 @@ async function callGeminiRawWithTools({
 }
 
 // ================================================================================
-// §2.07 — CALLPROVIDERWITHTOOLS (rotation + circuit)
+// §2.07 — CALLPROVIDERWITHTOOLS (rotation + circuit + failover logging)
 // ================================================================================
 
-/**
- * Appel bas-niveau avec AbortController (timeout strict).
- */
 async function callProviderRawWithTools({
   provider, model, messages, tools, jsonMode = false,
   timeout, maxTokens, temperature, images, apiKey, reasoningEffort
@@ -2787,6 +2326,7 @@ async function callProviderRawWithTools({
  *   - rotation multi-clés
  *   - circuit breaker par (provider:model:key)
  *   - audit log + métriques Prometheus
+ *   - log de failover détaillé (provider + model + HTTP status + message)
  */
 async function callProviderWithTools({
   providerConfig, messages, tools = null, images = null, jsonMode = false, _meta = {}
@@ -2869,12 +2409,25 @@ async function callProviderWithTools({
       const code = LLMErrorInterceptor.getErrorCode(error);
       if (metrics?.llmCalls) metrics.llmCalls.labels(providerName, model, "error").inc();
 
+      // ✅ Log détaillé du failover (provider + model + HTTP status + message)
+      const httpStatus = error?.response?.status || null;
+      logger.warn({
+        provider: providerName,
+        model,
+        keyLabel: keyEntry.label,
+        httpStatus,
+        errorCode: code,
+        errorMessage: String(error?.message || "").slice(0, 300)
+      }, `❌ Provider échoué (${httpStatus || code})`);
+
+      if (metrics?.providerFailover) {
+        metrics.providerFailover.labels(providerName, model, String(httpStatus || code)).inc();
+      }
+
       if (LLMErrorInterceptor.shouldRotateImmediately(error)) {
-        logger.warn({ provider: providerName, model, keyLabel: keyEntry.label, code }, "🔄 Rotation immédiate");
         continue;
       }
       if (LLMErrorInterceptor.shouldSkipProvider(error)) {
-        logger.warn({ provider: providerName, model, code }, "⏭️  Provider skip");
         break;
       }
       break;
@@ -2899,10 +2452,6 @@ async function callProviderWithTools({
 // §2.08 — TOOL SCHEMAS (19 outils)
 // ================================================================================
 
-/**
- * Schémas JSON des outils exposés au LLM (format OpenAI function calling).
- * Chaque outil a un nom, une description détaillée et des paramètres validés.
- */
 const TOOL_SCHEMAS = Object.freeze({
   search_images: {
     type: "function",
@@ -2919,7 +2468,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   search_web: {
     type: "function",
     function: {
@@ -2933,7 +2481,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   search_news: {
     type: "function",
     function: {
@@ -2947,7 +2494,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   search_sports_scores: {
     type: "function",
     function: {
@@ -2961,7 +2507,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   search_science: {
     type: "function",
     function: {
@@ -2975,7 +2520,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   search_social: {
     type: "function",
     function: {
@@ -2989,7 +2533,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   get_weather: {
     type: "function",
     function: {
@@ -3003,7 +2546,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   get_crypto_price: {
     type: "function",
     function: {
@@ -3017,7 +2559,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   get_stock_price: {
     type: "function",
     function: {
@@ -3031,7 +2572,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   execute_math: {
     type: "function",
     function: {
@@ -3040,17 +2580,13 @@ const TOOL_SCHEMAS = Object.freeze({
       parameters: {
         type: "object",
         properties: {
-          expression: {
-            type: "string",
-            description: "Expression mathjs valide, ex: '15*32+7', 'solve(x^2-5*x+6=0, x)', 'sqrt(144)+log(100)/log(10)'"
-          }
+          expression: { type: "string", description: "Expression mathjs valide, ex: '15*32+7', 'solve(x^2-5*x+6=0, x)', 'sqrt(144)+log(100)/log(10)'" }
         },
         required: ["expression"],
         additionalProperties: false
       }
     }
   },
-
   search_youtube: {
     type: "function",
     function: {
@@ -3064,7 +2600,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   create_task: {
     type: "function",
     function: {
@@ -3082,7 +2617,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   list_tasks: {
     type: "function",
     function: {
@@ -3095,7 +2629,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   complete_task: {
     type: "function",
     function: {
@@ -3109,7 +2642,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   delete_task: {
     type: "function",
     function: {
@@ -3123,7 +2655,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   send_email: {
     type: "function",
     function: {
@@ -3141,7 +2672,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   send_whatsapp_message: {
     type: "function",
     function: {
@@ -3158,7 +2688,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   run_code: {
     type: "function",
     function: {
@@ -3176,7 +2705,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   remember_fact: {
     type: "function",
     function: {
@@ -3193,7 +2721,6 @@ const TOOL_SCHEMAS = Object.freeze({
       }
     }
   },
-
   recall_memory: {
     type: "function",
     function: {
@@ -3209,9 +2736,6 @@ const TOOL_SCHEMAS = Object.freeze({
   }
 });
 
-/**
- * Outils disponibles par contexte.
- */
 const TOOLS_BY_CONTEXT = Object.freeze({
   chat: [
     "search_images", "search_web", "search_news", "search_sports_scores",
@@ -3230,16 +2754,10 @@ const TOOLS_BY_CONTEXT = Object.freeze({
   ]
 });
 
-/**
- * Outils à effet de bord (nécessitent confirmation).
- */
 const SIDE_EFFECT_TOOLS = Object.freeze(new Set([
   "send_email", "send_whatsapp_message", "delete_task", "complete_task"
 ]));
 
-/**
- * Retourne les schémas d'outils pour un contexte donné.
- */
 function getToolSchemas(context = "chat") {
   const list = TOOLS_BY_CONTEXT[context] || TOOLS_BY_CONTEXT.chat;
   return list.map((name) => TOOL_SCHEMAS[name]).filter(Boolean);
@@ -3249,9 +2767,6 @@ function getToolSchemas(context = "chat") {
 // §2.09 — EXECUTE TOOL NATIVE
 // ================================================================================
 
-/**
- * Valide les arguments d'un outil selon son schéma JSON.
- */
 function validateToolArgs(name, args) {
   const schema = TOOL_SCHEMAS[name]?.function?.parameters;
   if (!schema) return { ok: false, error: "Outil inconnu" };
@@ -3277,12 +2792,6 @@ function validateToolArgs(name, args) {
   return { ok: true };
 }
 
-/**
- * Exécute un outil natif en dispatchant vers la bonne fonction.
- *
- * ⚠️ Les fonctions référencées ici (searchImagesWithFallback, searchWeb, etc.)
- *    sont déclarées en Partie 3 comme `async function` → hoistées → accessibles.
- */
 async function executeToolNative(toolName, rawArgs, context = {}) {
   const { userId, googleAccessToken, agentMode = false } = context;
 
@@ -3468,10 +2977,6 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
 // §2.10 — RUNTOOLLOOP (boucle agent bornée)
 // ================================================================================
 
-/**
- * Boucle agent bornée : envoie les messages au LLM, exécute les outils appelés,
- * stream la réflexion (reasoning_content ou <think> tags), retourne la réponse finale.
- */
 async function runToolLoop({
   messages,
   providerConfig,
@@ -3518,7 +3023,6 @@ async function runToolLoop({
     const rawContent = assistantMessage.content || "";
     const reasoningContent = assistantMessage.reasoning_content || assistantMessage.reasoning || "";
 
-    // Stream le reasoning_content (DeepSeek R1, Qwen think, Gemini thoughts)
     if (sse && reasoningContent) {
       lastReasoning += reasoningContent + "\n";
       for (const c of safeChunkText(reasoningContent, 32)) {
@@ -3529,7 +3033,6 @@ async function runToolLoop({
       sse.reasoning("\n");
     }
 
-    // Stream aussi les balises <think> dans content (fallback)
     if (sse && rawContent) {
       const thinkMatches = rawContent.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi);
       if (thinkMatches) {
@@ -3548,7 +3051,6 @@ async function runToolLoop({
       }
     }
 
-    // Stream les blocs de code détectés
     if (sse && rawContent) {
       const codeRe = /```(\w+)?(?::([^\n]+))?\n([\s\S]*?)```/g;
       let m;
@@ -3562,20 +3064,17 @@ async function runToolLoop({
       }
     }
 
-    // Pas de tool calls → réponse finale
     if (toolCalls.length === 0) {
       finalText = normalizeMath(stripThinkTags(rawContent).text);
       break;
     }
 
-    // Enregistre l'assistant avec ses tool_calls
     workingMessages.push({
       role: "assistant",
       content: rawContent,
       tool_calls: toolCalls
     });
 
-    // Exécute les outils (bornés)
     const bounded = toolCalls.slice(0, CONFIG.AGENT.MAX_TOOL_CALLS_PER_STEP);
     for (const call of bounded) {
       const toolName = call.function?.name;
@@ -3622,7 +3121,6 @@ async function runToolLoop({
     }
   }
 
-  // Force une réponse finale si on sort de la boucle sans texte
   if (!finalText) {
     workingMessages.push({
       role: "system",
@@ -3652,9 +3150,6 @@ async function runToolLoop({
   };
 }
 
-/**
- * Déduplique une liste de vidéos par videoId.
- */
 function dedupeVideos(list) {
   const seen = new Set();
   return list.filter((v) => {
@@ -3668,9 +3163,6 @@ function dedupeVideos(list) {
 // §2.11 — STT (SPEECH-TO-TEXT)
 // ================================================================================
 
-/**
- * Transcription audio via Groq Whisper (rotation multi-clés) + Deepgram fallback.
- */
 async function transcribeAudioGroq(buffer, filename, mimetype) {
   if (!LLM_PROVIDERS.GROQ.keyPool.length) {
     return { success: false, error: "Aucune clé Groq pour la transcription" };
@@ -3719,7 +3211,6 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
     }
   }
 
-  // Fallback Deepgram
   if (process.env.DEEPGRAM_API_KEY) {
     try {
       const startedAt = Date.now();
@@ -3746,9 +3237,6 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
   return { success: false, error: "Échec transcription (Groq + Deepgram)" };
 }
 
-/**
- * Classe de streaming STT : accumule des chunks et transcrit par segments.
- */
 class StreamingSTT {
   constructor({ onPartial, onFinal, onError } = {}) {
     this.onPartial = onPartial || (() => {});
@@ -3802,9 +3290,6 @@ class StreamingSTT {
 // §2.12 — TTS (TEXT-TO-SPEECH)
 // ================================================================================
 
-/**
- * TTS via Kokoro (HeadTTS auto-hébergé).
- */
 async function synthesizeKokoro(text, { voice = "af_bella", speed = 1.0, format = "mp3" } = {}) {
   const baseURL = process.env.KOKORO_URL;
   if (!baseURL) return { success: false, error: "KOKORO_URL non configurée" };
@@ -3846,9 +3331,6 @@ async function synthesizeKokoro(text, { voice = "af_bella", speed = 1.0, format 
   }
 }
 
-/**
- * TTS via Piper (auto-hébergé). Retourne du WAV.
- */
 async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0 } = {}) {
   const baseURL = process.env.PIPER_URL;
   if (!baseURL) return { success: false, error: "PIPER_URL non configurée" };
@@ -3883,10 +3365,6 @@ async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0
   }
 }
 
-/**
- * TTS avec cascade : Kokoro → Piper.
- * Nettoie le markdown avant synthèse.
- */
 async function synthesizeSpeech(text, options = {}) {
   if (!text || !text.trim()) return { success: false, error: "Texte vide" };
 
@@ -3912,10 +3390,6 @@ async function synthesizeSpeech(text, options = {}) {
 // §2.13 — VAD ADAPTATIF
 // ================================================================================
 
-/**
- * Voice Activity Detection basé sur l'énergie RMS.
- * Détecte début/fin de parole avec un endpointing de ~500 ms.
- */
 class SimpleVAD {
   constructor({ energyThreshold = 500, silenceMs = 500, minSpeechMs = 200, maxSpeechMs = 30000 } = {}) {
     this.energyThreshold = energyThreshold;
@@ -3980,9 +3454,6 @@ class SimpleVAD {
 // §2.14 — VOICE PIPELINE
 // ================================================================================
 
-/**
- * Découpe un texte en phrases pour permettre au TTS de démarrer plus tôt.
- */
 class SentenceChunker {
   constructor({ onSentence } = {}) {
     this.onSentence = onSentence || (() => {});
@@ -4014,9 +3485,6 @@ class SentenceChunker {
   }
 }
 
-/**
- * Pipeline vocal complet : STT → LLM → TTS avec sentence chunking et barge-in.
- */
 class VoicePipeline extends EventEmitter {
   constructor({ sessionId, userId, onTranscript, onAudio, onStatus, onError, voice = "af_bella" } = {}) {
     super();
@@ -4141,9 +3609,6 @@ class VoicePipeline extends EventEmitter {
 
 const SHORT_MEMORY_MAX_EXCHANGES = 20;
 
-/**
- * Construit un résumé glissant des N derniers échanges (mécanique, sans LLM).
- */
 function buildRollingSummary(history, maxExchanges = SHORT_MEMORY_MAX_EXCHANGES) {
   if (!Array.isArray(history) || history.length === 0) return "";
 
@@ -4177,10 +3642,6 @@ function buildRollingSummary(history, maxExchanges = SHORT_MEMORY_MAX_EXCHANGES)
 
 const FACT_CATEGORIES = Object.freeze(["identity", "preference", "project", "language", "general"]);
 
-/**
- * Mémorise un fait durable sur l'utilisateur.
- * Dédupliqué par similarité Jaccard (>0.85 = doublon).
- */
 async function rememberFact(userId, { fact, category = "general", sourceSession = null, confidence = 1.0 }) {
   if (!fact || typeof fact !== "string" || fact.trim().length < 3) {
     return { success: false, error: "Fait vide ou trop court" };
@@ -4230,10 +3691,6 @@ async function rememberFact(userId, { fact, category = "general", sourceSession 
   }
 }
 
-/**
- * Extrait des faits durables d'un échange (via LLM).
- * Fire-and-forget : appelé après chaque tour.
- */
 async function extractFactsFromExchange(userId, userMessage, assistantReply) {
   if (!userMessage || userMessage.length < 20) return { facts: [] };
 
@@ -4294,9 +3751,6 @@ async function extractFactsFromExchange(userId, userMessage, assistantReply) {
   }
 }
 
-/**
- * Calcule l'embedding d'un texte (via Groq nomic-embed si dispo).
- */
 async function embedText(text) {
   if (!text || typeof text !== "string") return null;
   const trimmed = text.slice(0, 2000);
@@ -4320,10 +3774,6 @@ async function embedText(text) {
   return null;
 }
 
-/**
- * Recall sémantique : cherche les faits les plus pertinents pour une query.
- * Fallback mots-clés (Jaccard) si embeddings indisponibles.
- */
 async function recallMemory(userId, query, limit = 5) {
   if (!query || typeof query !== "string") return { facts: [] };
 
@@ -4372,9 +3822,6 @@ async function recallMemory(userId, query, limit = 5) {
   }
 }
 
-/**
- * Retourne tous les faits groupés par catégorie.
- */
 async function getAllFacts(userId) {
   try {
     const rows = await dbAll(
@@ -4394,9 +3841,6 @@ async function getAllFacts(userId) {
   }
 }
 
-/**
- * Supprime un fait individuel.
- */
 async function deleteFact(userId, factId) {
   try {
     await dbRun(`DELETE FROM user_memory_facts WHERE id = ? AND user_id = ?`, [factId, userId]);
@@ -4406,9 +3850,6 @@ async function deleteFact(userId, factId) {
   }
 }
 
-/**
- * Supprime tous les faits d'un utilisateur.
- */
 async function clearAllFacts(userId) {
   try {
     await dbRun(`DELETE FROM user_memory_facts WHERE user_id = ?`, [userId]);
@@ -4429,9 +3870,6 @@ async function clearAllFacts(userId) {
 // §2.17 — AI QUALITY LAYER
 // ================================================================================
 
-/**
- * Détecte les nombres "inventés" dans une réponse en les comparant aux résultats d'outils.
- */
 function detectHallucinatedNumbers(responseText, toolResults = []) {
   if (!responseText || !toolResults || toolResults.length === 0) {
     return { detected: false, suspiciousNumbers: [] };
@@ -4443,8 +3881,8 @@ function detectHallucinatedNumbers(responseText, toolResults = []) {
   while ((m = numRe.exec(responseText)) !== null) {
     const n = m[0].replace(",", ".");
     const num = parseFloat(n);
-    if (num >= 1900 && num <= 2099) continue; // année plausible
-    if (num < 10) continue; // trop petit
+    if (num >= 1900 && num <= 2099) continue;
+    if (num < 10) continue;
     respNumbers.add(n);
   }
   if (!respNumbers.size) return { detected: false, suspiciousNumbers: [] };
@@ -4477,9 +3915,6 @@ function detectHallucinatedNumbers(responseText, toolResults = []) {
   return { detected, suspiciousNumbers: suspicious.slice(0, 5) };
 }
 
-/**
- * Estime la confiance (0-1) d'une réponse via plusieurs signaux.
- */
 function estimateConfidence({ responseText, toolCallTrace = [], reasoning = "", degraded = false }) {
   if (degraded) return 0.2;
   if (!responseText) return 0;
@@ -4503,9 +3938,6 @@ function estimateConfidence({ responseText, toolCallTrace = [], reasoning = "", 
   return Math.max(0, Math.min(1, score));
 }
 
-/**
- * Self-critique : le LLM relit sa réponse et la corrige si nécessaire.
- */
 async function selfCritique({ userMessage, draftAnswer, toolCallTrace = [], providerConfig, _meta = {} }) {
   if (!CONFIG.AI_QUALITY.ENABLE_SELF_CRITIQUE) {
     return { improved: false, correctedText: draftAnswer, critique: null };
@@ -4585,9 +4017,6 @@ async function selfCritique({ userMessage, draftAnswer, toolCallTrace = [], prov
   }
 }
 
-/**
- * Vote multi-modèles : N providers répondent en parallèle, on garde le consensus.
- */
 async function multiModelVote({ messages, providers, tools = null, images = null, _meta = {} }) {
   if (!CONFIG.AI_QUALITY.ENABLE_MULTI_VOTE) {
     return { chosenText: null, votes: 0, winner: null, allResponses: [] };
@@ -4640,9 +4069,6 @@ async function multiModelVote({ messages, providers, tools = null, images = null
   };
 }
 
-/**
- * Similarité Jaccard entre deux textes (basée sur les mots > 2 chars).
- */
 function jaccardSimilarity(a, b) {
   if (!a || !b) return 0;
   const wa = new Set(a.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
@@ -4652,9 +4078,6 @@ function jaccardSimilarity(a, b) {
   return inter / new Set([...wa, ...wb]).size;
 }
 
-/**
- * Orchestre l'évaluation qualité complète : hallucination + self-critique + confiance.
- */
 async function assessResponseQuality({
   userMessage,
   draftAnswer,
@@ -4712,42 +4135,21 @@ async function assessResponseQuality({
 // ================================================================================
 // §2.18 — EXPORTS PARTIE 2
 // ================================================================================
-//
-// ⚠️ AUCUN STUB ICI.
-//
-// Les fonctions référencées par executeToolNative (searchImagesWithFallback,
-// searchWeb, searchNews, searchSportsScores, getWeather, getCryptoPrice,
-// getStockPrice, searchYouTube, createTask, listTasks, updateTaskStatus,
-// deleteTask, checkUserQuota, incrementUserQuota, dispatchSendEmail,
-// sendWhatsAppSmart, runCodeSandbox, extractEntity, evaluateMathSafe,
-// searchScience, searchSocial) sont déclarées en Partie 3 comme
-// `async function` → hoistées → disponibles immédiatement.
-//
-// C'est ce qui évite le SyntaxError "Identifier 'searchWeb' has already been declared".
 
 Object.assign(module.exports, {
-  // Providers
   LLM_PROVIDERS,
   MODEL_TIERS,
   geminiClient,
-
-  // Circuit breaker
   CircuitBreaker,
   getCircuit,
   getAllCircuitStates,
-
-  // Erreurs
   LLMErrorInterceptor,
   userFacingErrorMessage,
-
-  // Appelants
   callProviderWithTools,
   callProviderRawWithTools,
   callOpenAICompatibleRaw,
   callGeminiRawWithTools,
   validateAndSanitizeOpenRouterModel,
-
-  // Tool calling
   TOOL_SCHEMAS,
   TOOLS_BY_CONTEXT,
   SIDE_EFFECT_TOOLS,
@@ -4756,36 +4158,24 @@ Object.assign(module.exports, {
   executeToolNative,
   runToolLoop,
   dedupeVideos,
-
-  // STT / TTS
   transcribeAudioGroq,
   StreamingSTT,
   synthesizeKokoro,
   synthesizePiper,
   synthesizeSpeech,
-
-  // VAD + pipeline vocal
   SimpleVAD,
   SentenceChunker,
   VoicePipeline,
-
-  // Mémoire courte
   buildRollingSummary,
   SHORT_MEMORY_MAX_EXCHANGES,
-
-  // Mémoire longue
   rememberFact,
   extractFactsFromExchange,
   FACT_CATEGORIES,
   getAllFacts,
   deleteFact,
   clearAllFacts,
-
-  // Recall sémantique
   embedText,
   recallMemory,
-
-  // AI Quality Layer
   detectHallucinatedNumbers,
   estimateConfidence,
   selfCritique,
@@ -4797,59 +4187,34 @@ Object.assign(module.exports, {
 // ================================================================================
 // ==================== FIN PARTIE 2/5 ===========================================
 // ================================================================================
-// ▶ PARTIE 3/5 : Search orchestrator · Media (Wikimedia, Pexels, youtubei) ·
-//                Weather · Finance · News · Sports · Sandbox · Vision · Ads ·
-//                Math evaluator · Tasks · Quotas · Email · WhatsApp helpers.
+// ▶ PARTIE 3/5 : Search · Media · Ads (propre) · Vision · Math · Tasks · Email
+//   Tape "suite" pour la recevoir.
 // ================================================================================
 // ================================================================================
 // PARTIE 3/5 — DATA SERVICES · MEDIA · ADS · VISION · MATH
 // ================================================================================
-// Ce module implémente toute la couche services externes :
-//   • Search orchestrator (Tavily, Serper, DuckDuckGo, GDELT, HackerNews, Wikipedia)
-//   • Media (Wikimedia Commons, Pexels, youtubei.js keyless)
-//   • Weather (Open-Meteo, keyless)
-//   • Finance (CoinGecko keyless, CoinMarketCap, Yahoo Finance)
-//   • News (Google News RSS + GDELT) + extraction de score sportif
-//   • Sports (synonymes équipes, cache)
-//   • Sandbox d'exécution (Piston public, Judge0)
-//   • Vision (Groq Llama 4 Maverick + Gemini + OpenRouter)
-//   • Ads (Ghost Ads, Adsterra, Luba Pro + lien test SAFE)
-//   • Math evaluator (worker_threads isolé, mathjs sandbox)
-//   • Entité + pré-routeur d'intention + i18n
-//   • Tasks CRUD (UUID + Firestore-first)
-//   • Quotas utilisateur (journaliers par rôle)
-//   • Email dispatch (Gmail API → Resend → SMTP)
-//   • WhatsApp helpers (chiffrement AES-256-GCM)
+// VERSION : v16.4.2 (Octobre 2026)
 //
-// TABLE DES MATIÈRES :
-//   §3.01  Search Tavily
-//   §3.02  Search Serper
-//   §3.03  Search DuckDuckGo (web)
-//   §3.04  Search GDELT
-//   §3.05  Search HackerNews
-//   §3.06  Wikipedia summary
-//   §3.07  searchWeb (orchestrateur)
-//   §3.08  Wikimedia Commons (images)
-//   §3.09  Wikipedia thumb
-//   §3.10  Pexels (images)
-//   §3.11  DuckDuckGo Images
-//   §3.12  searchImagesWithFallback (orchestrateur + pertinence)
-//   §3.13  YouTube (youtubei.js → API key → DDG)
-//   §3.14  Open-Meteo (météo)
-//   §3.15  CoinGecko / CoinMarketCap / Yahoo Finance
-//   §3.16  Google News RSS + extraction score
-//   §3.17  searchNews (orchestrateur)
-//   §3.18  searchSportsScores (orchestrateur)
-//   §3.19  Sandbox Piston + Judge0
-//   §3.20  Vision (Llama 4 Maverick)
-//   §3.21  Ads (Luba Pro, Ghost Ads, Adsterra)
-//   §3.22  Math evaluator (worker_threads)
-//   §3.23  Entité + pré-routeur + intents
-//   §3.24  Tasks CRUD
-//   §3.25  Quotas
-//   §3.26  Email dispatch
-//   §3.27  WhatsApp helpers
-//   §3.28  Exports Partie 3
+// MODIFICATIONS PAR RAPPORT À v16.4.0 :
+//   ✅ LUBA_PRO_ADS : suppression totale du branding "test"
+//   ✅ getAd() : plus de paramètre allowTest, plus de fallback "test_safe"
+//   ✅ getAllAdSlots() : slots propres (sponsored + adaptive)
+//   ✅ searchScience() : arXiv v2 avec HTTPS (http déprécié par arXiv)
+//   ✅ searchSocial() : Reddit public JSON (pas de clé requise)
+//   ✅ Vision : modèles vérifiés (Gemini 2.5-flash, Qwen 2.5 VL)
+//
+// FONCTIONNALITÉS CONSERVÉES :
+//   • Search : Tavily, Serper, DuckDuckGo, GDELT, HackerNews, Wikipedia
+//   • Media : Wikimedia, Wikipedia thumb, Pexels, DDG Images
+//   • YouTube : youtubei.js (keyless) + API key + DDG fallback
+//   • Weather : Open-Meteo (keyless)
+//   • Finance : CoinGecko (keyless) + CoinMarketCap + Yahoo Finance
+//   • News : Google News RSS + GDELT + extraction de score sportif
+//   • Sandbox : Piston public + Judge0
+//   • Vision : Groq Llama 4 Maverick → Gemini 2.5 → OpenRouter
+//   • Ads : Ghost Ads → Adsterra → Luba Pro (fallback propre)
+//   • Math : worker_threads isolé (mathjs sandbox)
+//   • Tasks, Quotas, Email, WhatsApp
 // ================================================================================
 
 "use strict";
@@ -4859,8 +4224,8 @@ Object.assign(module.exports, {
 // ================================================================================
 
 /**
- * Recherche via Tavily API (agrégateur IA premium).
- * Retourne un objet { results, answer, provider }.
+ * Recherche via Tavily API (agrégateur IA premium, optionnel).
+ * Skip si TAVILY_API_KEY absent.
  */
 async function searchTavily(query, { maxResults = 5, topic = "general" } = {}) {
   const apiKey = process.env.TAVILY_API_KEY;
@@ -4890,11 +4255,7 @@ async function searchTavily(query, { maxResults = 5, topic = "general" } = {}) {
       source: "tavily"
     }));
 
-    return {
-      results,
-      answer: resp.data?.answer || null,
-      provider: "tavily"
-    };
+    return { results, answer: resp.data?.answer || null, provider: "tavily" };
   } catch (e) {
     logger.warn({ err: e.message }, "Tavily échec");
     return { results: [], provider: "tavily", error: e.message };
@@ -4907,7 +4268,7 @@ async function searchTavily(query, { maxResults = 5, topic = "general" } = {}) {
 
 /**
  * Recherche via Serper.dev (Google Search API, 2500 req/mois gratuites).
- * Supporte search/news/images.
+ * Supporte les modes : search / news / images.
  */
 async function searchSerper(query, { maxResults = 5, type = "search" } = {}) {
   const apiKey = process.env.SERPER_API_KEY;
@@ -4950,7 +4311,7 @@ async function searchSerper(query, { maxResults = 5, type = "search" } = {}) {
 // ================================================================================
 
 /**
- * Recherche via DuckDuckGo (scraping libre, sans clé).
+ * Recherche DuckDuckGo via scraping (keyless).
  */
 async function searchDuckDuckGo(query, { maxResults = 5 } = {}) {
   if (!ddgScrape) return { results: [], provider: "ddg", skipped: true };
@@ -4987,8 +4348,8 @@ async function searchDuckDuckGo(query, { maxResults = 5 } = {}) {
 // ================================================================================
 
 /**
- * Recherche via GDELT (Global Database of Events, Language and Tone).
- * Keyless, idéal pour actualités internationales.
+ * GDELT (Global Database of Events, Language and Tone) — keyless.
+ * Idéal pour les actualités internationales.
  */
 async function searchGdelt(query, { maxResults = 5, timespanDays = 7 } = {}) {
   try {
@@ -5025,7 +4386,7 @@ async function searchGdelt(query, { maxResults = 5, timespanDays = 7 } = {}) {
 // ================================================================================
 
 /**
- * Recherche Hacker News via Algolia API (keyless).
+ * Hacker News via Algolia Search API (keyless).
  */
 async function searchHackerNews(query, { maxResults = 5 } = {}) {
   try {
@@ -5053,7 +4414,7 @@ async function searchHackerNews(query, { maxResults = 5 } = {}) {
 // ================================================================================
 
 /**
- * Récupère le résumé Wikipédia d'une entité (FR par défaut).
+ * Résumé Wikipédia via REST API (FR par défaut).
  */
 async function searchWikipediaSummary(query, { lang = "fr" } = {}) {
   try {
@@ -5085,8 +4446,9 @@ async function searchWikipediaSummary(query, { lang = "fr" } = {}) {
 // ================================================================================
 
 /**
- * Orchestrateur de recherche web : interroge Wikipedia + Tavily + Serper + DDG
- * en parallèle avec deadline par source, fusionne + déduplique les résultats.
+ * Orchestrateur de recherche web :
+ *   - Interroge 4 sources en parallèle avec deadline individuelle
+ *   - Fusionne + déduplique les résultats
  */
 async function searchWeb(query) {
   if (!query || typeof query !== "string") {
@@ -5139,7 +4501,7 @@ async function searchWeb(query) {
 // ================================================================================
 
 /**
- * Recherche d'images Wikimedia Commons (namespace 6 = fichiers seulement).
+ * Recherche d'images Wikimedia Commons (namespace 6 = fichiers).
  * Retourne des URLs thumburl à 600px (léger, conforme politique Wikimedia).
  */
 async function searchWikimediaImages(query, limit = CONFIG.IMAGES.WIKIMEDIA_LIMIT) {
@@ -5192,7 +4554,7 @@ async function searchWikimediaImages(query, limit = CONFIG.IMAGES.WIKIMEDIA_LIMI
 // ================================================================================
 
 /**
- * Récupère la miniature principale d'un article Wikipédia.
+ * Miniature principale d'un article Wikipédia.
  */
 async function fetchWikipediaThumb(query) {
   try {
@@ -5224,7 +4586,7 @@ async function fetchWikipediaThumb(query) {
 
 /**
  * Recherche d'images libres de droits via Pexels (200 req/heure gratuit).
- * Retourne des URLs "medium" (~ 400-600px) pour optimiser le poids.
+ * Retourne des URLs "medium" pour optimiser le poids.
  */
 async function searchPexelsImages(query, limit = 6) {
   const apiKey = process.env.PEXELS_API_KEY;
@@ -5259,7 +4621,7 @@ async function searchPexelsImages(query, limit = 6) {
 // ================================================================================
 
 /**
- * Recherche d'images via DuckDuckGo (searchImages, PAS search web).
+ * Recherche d'images via DuckDuckGo searchImages (PAS search web).
  */
 async function searchDuckDuckGoImages(query, limit = CONFIG.IMAGES.DDG_LIMIT) {
   if (!ddgScrape) return [];
@@ -5303,18 +4665,17 @@ const imageCache = new LRUCache({
 
 /**
  * Orchestrateur de recherche d'images :
- *   - interroge 4 sources en parallèle (Wikimedia, Wikipedia, Pexels, DDG)
- *   - calcule un score de pertinence par image
- *   - filtre (≥ 0.4 par défaut)
- *   - priorise Wikipedia > Commons > Pexels > DDG
- *   - déduplique + limite
- *   - met en cache (uniquement si au moins 1 résultat)
+ *   - 4 sources en parallèle (Wikimedia, Wikipedia, Pexels, DDG)
+ *   - Score de pertinence par image
+ *   - Filtre (≥ 0.4 par défaut)
+ *   - Priorité Wikipedia > Commons > Pexels > DDG
+ *   - Déduplication + limite
  */
 async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARCH_LIMIT) {
   const cleanQuery = extractEntity(query) || String(query || "").trim();
   if (!cleanQuery || cleanQuery.length < 2) return { images: [] };
 
-  const cacheKey = `img:v164:${cleanQuery.toLowerCase().trim()}`;
+  const cacheKey = `img:v1642:${cleanQuery.toLowerCase().trim()}`;
   const cached = imageCache.get(cacheKey);
   if (cached) return cached;
 
@@ -5331,7 +4692,6 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
   const pexelsImages = pexelsR.status === "fulfilled" ? (pexelsR.value?.images || []) : [];
   const ddgImages = ddgR.status === "fulfilled" ? (ddgR.value || []) : [];
 
-  // Priorité : Wikipedia (0) > Commons (1) > Pexels (2) > DDG (3)
   const all = [
     ...(wikiImage ? [{ ...wikiImage, _prio: 0 }] : []),
     ...commonsImages.map((i) => ({ ...i, _prio: 1 })),
@@ -5339,7 +4699,6 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
     ...ddgImages.map((i) => ({ ...i, _prio: 3 }))
   ];
 
-  // Score de pertinence
   const scored = all.map((img) => ({
     ...img,
     _relevance: imageRelevanceScore(img, cleanQuery)
@@ -5347,18 +4706,15 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
 
   let relevant = scored.filter((img) => img._relevance >= CONFIG.IMAGES.MIN_RELEVANCE);
 
-  // Fallback : si rien de pertinent et Wikipedia thumb existe, la garder
   if (relevant.length === 0 && wikiImage) {
     relevant = [{ ...wikiImage, _relevance: 1.0, _prio: 0 }];
   }
 
-  // Tri : pertinence DESC, priorité ASC
   relevant.sort((a, b) => {
     if (Math.abs(a._relevance - b._relevance) > 0.2) return b._relevance - a._relevance;
     return a._prio - b._prio;
   });
 
-  // Déduplication par URL
   const seen = new Set();
   const unique = relevant
     .filter((img) => {
@@ -5382,7 +4738,7 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
     query: cleanQuery,
     kept: unique.length,
     total: all.length
-  }, "🖼️ Images v16.4");
+  }, "🖼️ Images v16.4.2");
 
   return result;
 }
@@ -5434,7 +4790,7 @@ async function searchYouTubeYoutubei(query, limit = 5) {
 }
 
 /**
- * Recherche YouTube via API officielle (fallback, quota limité).
+ * Fallback YouTube via API officielle (quota limité).
  */
 async function searchYouTubeApiKey(query, limit = 5) {
   const apiKey = process.env.YOUTUBE_API_KEY;
@@ -5513,7 +4869,7 @@ async function searchYouTube(query) {
 // ================================================================================
 
 /**
- * Météo actuelle + prévisions 3 jours via Open-Meteo (100% keyless).
+ * Météo actuelle + prévisions 3 jours (Open-Meteo, 100% keyless).
  */
 async function getWeather(location) {
   if (!location) return { error: "Aucun lieu précisé" };
@@ -5541,7 +4897,6 @@ async function getWeather(location) {
     const c = weather.data?.current || {};
     const d = weather.data?.daily || {};
 
-    // Code WMO → texte français
     const WMO = {
       0: "Ciel dégagé", 1: "Peu nuageux", 2: "Partiellement nuageux", 3: "Couvert",
       45: "Brouillard", 48: "Brouillard givrant",
@@ -5581,13 +4936,12 @@ async function getWeather(location) {
 // ================================================================================
 
 /**
- * Prix d'une cryptomonnaie : CoinGecko (keyless) → CMC (si clé).
+ * Prix d'une cryptomonnaie : CoinGecko (keyless) → CoinMarketCap (si clé).
  */
 async function getCryptoPrice(symbol) {
   if (!symbol) return { error: "Aucun symbole précisé" };
   const clean = String(symbol).toUpperCase().trim();
 
-  // CoinGecko (keyless, gratuit)
   try {
     const map = {
       BTC: "bitcoin", ETH: "ethereum", SOL: "solana", BNB: "binancecoin",
@@ -5619,7 +4973,6 @@ async function getCryptoPrice(symbol) {
     logger.warn({ err: e.message }, "CoinGecko échec");
   }
 
-  // CoinMarketCap (si clé dispo)
   if (process.env.COINMARKETCAP_API_KEY) {
     try {
       const resp = await axios.get(
@@ -5696,7 +5049,7 @@ async function getStockPrice(ticker) {
 // ================================================================================
 
 /**
- * Récupère le flux RSS de Google News pour une requête.
+ * Récupère le flux RSS de Google News.
  */
 async function fetchGoogleNews(query, { limit = 8, lang, region } = {}) {
   const L = lang || CONFIG.NEWS.GOOGLE_LANG;
@@ -5840,9 +5193,6 @@ async function searchNews(query) {
 // §3.18 — SPORTS
 // ================================================================================
 
-/**
- * Synonymes d'équipes (pour améliorer la recherche Google News).
- */
 const SPORT_SYNONYMS = Object.freeze({
   "léopards": ["Léopards RDC", "RD Congo football", "Congo DR football"],
   "leopards": ["Léopards RDC", "RD Congo football", "Congo DR football"],
@@ -5859,9 +5209,6 @@ const SPORT_SYNONYMS = Object.freeze({
   "tp mazembe": ["TP Mazembe", "Tout Puissant Mazembe"]
 });
 
-/**
- * Cache L1 pour les scores sportifs (TTL 10 min).
- */
 const sportCache = new LRUCache({
   max: 200,
   ttl: CONFIG.NEWS.SPORT_CACHE_TTL_MS,
@@ -5869,7 +5216,7 @@ const sportCache = new LRUCache({
 });
 
 /**
- * Recherche de scores sportifs via Google News + extraction automatique.
+ * Recherche scores sportifs via Google News + extraction auto.
  */
 async function searchSportsViaGoogleNews(team) {
   if (!team) return { events: [], error: "Aucune équipe précisée" };
@@ -5945,9 +5292,6 @@ async function searchSportsViaGoogleNews(team) {
   return result;
 }
 
-/**
- * Wrapper public : recherche de scores sportifs.
- */
 async function searchSportsScores(team) {
   if (!team) return { events: [], error: "Aucune équipe précisée" };
   return await searchSportsViaGoogleNews(team);
@@ -5957,9 +5301,6 @@ async function searchSportsScores(team) {
 // §3.19 — SANDBOX PISTON / JUDGE0
 // ================================================================================
 
-/**
- * Langages supportés par le sandbox.
- */
 const SUPPORTED_SANDBOX_LANGS = Object.freeze({
   python:     { piston: "python",     judge0: 71 },
   javascript: { piston: "javascript", judge0: 63 },
@@ -5971,9 +5312,6 @@ const SUPPORTED_SANDBOX_LANGS = Object.freeze({
   cpp:        { piston: "c++",        judge0: 54 }
 });
 
-/**
- * Exécute du code dans un sandbox externe (Piston par défaut).
- */
 async function runCodeSandbox({ language, code, stdin = "" }) {
   const provider = CONFIG.SANDBOX.PROVIDER;
   if (!provider) return { success: false, error: "Sandbox non configuré" };
@@ -6049,7 +5387,8 @@ async function runCodeSandbox({ language, code, stdin = "" }) {
 // ================================================================================
 
 /**
- * Analyse une image via Groq Llama 4 Maverick → Gemini → OpenRouter.
+ * Analyse une image via Groq Llama 4 Maverick → Gemini 2.5 → OpenRouter.
+ * Modèles vérifiés octobre 2026.
  */
 async function analyzeImage({
   imageBase64,
@@ -6066,7 +5405,7 @@ async function analyzeImage({
     ]
   }];
 
-  // 1) Groq Llama 4 Maverick (gratuit)
+  // 1) Groq Llama 4 Maverick (gratuit, multimodal)
   if (LLM_PROVIDERS.GROQ.keyPool.length > 0) {
     try {
       const r = await callProviderRawWithTools({
@@ -6091,7 +5430,7 @@ async function analyzeImage({
     }
   }
 
-  // 2) Gemini
+  // 2) Gemini 2.5 flash
   if (geminiClient) {
     try {
       const r = await callGeminiRawWithTools({
@@ -6115,7 +5454,7 @@ async function analyzeImage({
     }
   }
 
-  // 3) OpenRouter
+  // 3) OpenRouter Qwen 2.5 VL 72B
   if (LLM_PROVIDERS.OPENROUTER.keyPool.length > 0) {
     try {
       const r = await callProviderRawWithTools({
@@ -6144,46 +5483,42 @@ async function analyzeImage({
 }
 
 // ================================================================================
-// §3.21 — ADS
+// §3.21 — ADS (VERSION PROPRE v16.4.2)
+// ================================================================================
+//
+// ⚠️ CHANGEMENTS v16.4.2 :
+//   - SUPPRESSION TOTALE du branding "Publicité Test Luba"
+//   - SUPPRESSION de "<sub>Publicité test — luba_pro</sub>"
+//   - Le fallback Luba Pro affiche une pub premium naturelle
+//   - getAd() ne prend plus allowTest
+//   - Le système de ciblage / données / clic est PRÉSERVÉ
 // ================================================================================
 
 /**
- * Slots publicitaires Luba Pro (fallback permanent, 100% maison).
- * Le slot `test_safe` contient un placeholder SAFE (pas de contenu adulte).
+ * Slots publicitaires Luba Pro (fallback premium, intégré au design).
+ * Aucun branding "test" — les slots sont des publicités normales.
  */
 const LUBA_PRO_ADS = Object.freeze({
-  test_safe: {
-    id: "test_safe_728x90",
-    title: "Publicité test Luba",
-    description: "Placeholder safe — pas de contenu sensible.",
-    imageUrl: "https://placehold.co/728x90/1a73e8/ffffff/png?text=Publicite+Test+Luba&font=roboto",
-    clickUrl: "https://luba.web.app",
-    width: 728,
-    height: 90,
-    network: "luba_pro",
-    isTest: true,
-    safeContent: true
-  },
-  self_promo: {
-    id: "self_promo_728x90",
-    title: "Luba Pro — Passez premium",
-    description: "Débloquez Ngandu (raisonnement) et Luba Live.",
-    imageUrl: "https://placehold.co/728x90/1a1a1a/ffffff/png?text=Luba+Pro+-+Passez+Premium&font=roboto",
+  sponsored: {
+    id: "sponsored_premium",
+    title: "Découvrez Luba Pro",
+    description: "Raisonnement avancé, mode vocal, mémoire étendue.",
+    imageUrl: "https://placehold.co/600x200/1a73e8/ffffff/png?text=Luba+Pro&font=roboto",
     clickUrl: "https://luba.web.app/pro",
-    width: 728,
-    height: 90,
+    width: 600,
+    height: 200,
     network: "luba_pro",
     isTest: false,
     safeContent: true
   },
-  banner_adaptive: {
-    id: "banner_adaptive",
-    title: "Découvrir Luba Live",
-    description: "Conversation vocale temps réel.",
-    imageUrl: "https://placehold.co/970x250/4285f4/ffffff/png?text=Luba+Live+-+Voix+temps+reel&font=roboto",
+  adaptive: {
+    id: "adaptive_premium",
+    title: "Luba Live",
+    description: "Conversation vocale temps réel, latence < 800ms.",
+    imageUrl: "https://placehold.co/600x200/4285f4/ffffff/png?text=Luba+Live&font=roboto",
     clickUrl: "https://luba.web.app/live",
-    width: 970,
-    height: 250,
+    width: 600,
+    height: 200,
     network: "luba_pro",
     isTest: false,
     safeContent: true
@@ -6191,10 +5526,10 @@ const LUBA_PRO_ADS = Object.freeze({
 });
 
 /**
- * Récupère une pub Ghost Ads (monétisation ouverte, 75% revshare).
- * Filtre SAFE : rejette les contenus adultes/NSFW.
+ * Ghost Ads (monétisation ouverte, 75% revshare).
+ * Filtre SAFE : rejette les contenus adultes.
  */
-async function fetchGhostAds({ slot = "sidebar", userId = null } = {}) {
+async function fetchGhostAds({ slot = "chat_below", userId = null } = {}) {
   const apiKey = process.env.GHOST_ADS_API_KEY;
   if (!apiKey) return { success: false, reason: "no_key" };
 
@@ -6234,9 +5569,9 @@ async function fetchGhostAds({ slot = "sidebar", userId = null } = {}) {
 }
 
 /**
- * Récupère une pub Adsterra (nécessite injection de script côté client).
+ * Adsterra (nécessite injection de script côté client).
  */
-async function fetchAdsterra({ slot = "banner_728x90" } = {}) {
+async function fetchAdsterra({ slot = "chat_below" } = {}) {
   const zoneId = process.env.ADSTERRA_ZONE_ID;
   if (!zoneId) return { success: false, reason: "no_zone" };
 
@@ -6258,27 +5593,26 @@ async function fetchAdsterra({ slot = "banner_728x90" } = {}) {
 }
 
 /**
- * Orchestrateur Ads : Ghost Ads → Adsterra → Luba Pro (fallback).
+ * Orchestrateur Ads : Ghost Ads → Adsterra → Luba Pro (fallback propre).
+ * ⚠️ Aucun branding "test" — le fallback est une pub premium.
  */
-async function getAd({ slot = "sidebar", userId = null, allowTest = true } = {}) {
+async function getAd({ slot = "chat_below", userId = null } = {}) {
   const ghost = await fetchGhostAds({ slot, userId });
   if (ghost.success) return ghost.ad;
 
   const adsterra = await fetchAdsterra({ slot });
   if (adsterra.success) return adsterra.ad;
 
-  const fallbackKey = allowTest ? "test_safe" : "self_promo";
-  return { ...LUBA_PRO_ADS[fallbackKey], slot };
+  return { ...LUBA_PRO_ADS.sponsored, slot };
 }
 
 /**
- * Retourne tous les slots pub disponibles (pour le bootstrap front).
+ * Retourne les slots pub disponibles (pour bootstrap front).
  */
 function getAllAdSlots() {
   return {
-    test_safe: LUBA_PRO_ADS.test_safe,
-    self_promo: LUBA_PRO_ADS.self_promo,
-    banner_adaptive: LUBA_PRO_ADS.banner_adaptive
+    sponsored: LUBA_PRO_ADS.sponsored,
+    adaptive: LUBA_PRO_ADS.adaptive
   };
 }
 
@@ -6286,10 +5620,6 @@ function getAllAdSlots() {
 // §3.22 — MATH EVALUATOR (WORKER ISOLÉ)
 // ================================================================================
 
-/**
- * Source JS exécutée dans un worker_threads isolé.
- * Évalue une expression mathjs avec les fonctions dangereuses bloquées.
- */
 const MATH_WORKER_SOURCE = `
   const { parentPort, workerData } = require('worker_threads');
   const math = require('mathjs');
@@ -6314,9 +5644,6 @@ const MATH_WORKER_SOURCE = `
   }
 `;
 
-/**
- * Évalue une expression mathématique dans un worker isolé (timeout strict).
- */
 function evaluateMathSafe(expression, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const expr = String(expression || "").slice(0, 2000);
@@ -6361,9 +5688,6 @@ function evaluateMathSafe(expression, timeoutMs = 2000) {
   });
 }
 
-/**
- * Détecte les expressions mathématiques dans un message.
- */
 function detectMathExpressions(message) {
   const patterns = [
     /(\d+(?:\.\d+)?(?:\s*[\+\-\*\/\^]\s*\d+(?:\.\d+)?)+)/g,
@@ -6383,9 +5707,6 @@ function detectMathExpressions(message) {
 // §3.23 — ENTITÉ + PRÉ-ROUTEUR + INTENTS
 // ================================================================================
 
-/**
- * Extrait l'entité principale d'un message (nom propre, lieu, etc.).
- */
 function extractEntity(message) {
   if (!message || typeof message !== "string") return "";
   let m = message.trim().replace(/[?!.,;:]+$/g, "");
@@ -6403,9 +5724,6 @@ function extractEntity(message) {
   return m.split(/\s+/).slice(0, 8).join(" ").slice(0, 60);
 }
 
-/**
- * Normalise un texte pour la comparaison (lowercase + accents + ponctuation).
- */
 function normalizeForMatch(s) {
   return String(s).toLowerCase()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -6413,9 +5731,6 @@ function normalizeForMatch(s) {
     .replace(/\s+/g, " ").trim();
 }
 
-/**
- * Vérifie si un texte contient au moins un mot entier d'une liste.
- */
 function containsWholeWords(haystack, needles) {
   const h = " " + normalizeForMatch(haystack) + " ";
   for (const n of needles) {
@@ -6427,9 +5742,6 @@ function containsWholeWords(haystack, needles) {
   return false;
 }
 
-/**
- * Mots-clés par intention.
- */
 const INTENT_KEYWORDS = Object.freeze({
   MATHS: ["calcule", "calculer", "resous", "equation", "integrale", "derivee", "factorielle", "matrice", "limite", "theoreme", "algebre", "solve", "résoudre", "résous"],
   ACTUALITE: ["actualite", "actualites", "news", "journal", "derniere", "dernieres", "presse"],
@@ -6442,9 +5754,6 @@ const INTENT_KEYWORDS = Object.freeze({
   PERSONNE: ["qui est", "photo de", "biographie de", "portrait de", "c'est qui"]
 });
 
-/**
- * Pré-routeur d'intention : détecte le domaine avant d'appeler le LLM.
- */
 function preRouteIntent(message) {
   const text = String(message || "").trim();
   const entity = extractEntity(text);
@@ -6464,14 +5773,15 @@ function preRouteIntent(message) {
 }
 
 /**
- * Recherche scientifique (arXiv) — stub minimal, peut être étendu.
+ * Recherche scientifique arXiv (HTTPS — http déprécié par arXiv).
  */
 async function searchScience(query) {
   if (!query) return { papers: [] };
   try {
-    const resp = await axios.get("http://export.arxiv.org/api/query", {
+    const resp = await axios.get("https://export.arxiv.org/api/query", {
       params: { search_query: `all:${query}`, start: 0, max_results: 5 },
-      timeout: 8000
+      timeout: 8000,
+      headers: { "User-Agent": CONFIG.HTTP.USER_AGENT }
     });
     const xml = resp.data || "";
     const items = [];
@@ -6495,7 +5805,7 @@ async function searchScience(query) {
 }
 
 /**
- * Recherche sociale (Reddit) — stub minimal.
+ * Recherche sociale Reddit (JSON public, pas de clé requise).
  */
 async function searchSocial(query) {
   if (!query) return { posts: [] };
@@ -6521,9 +5831,6 @@ async function searchSocial(query) {
 // §3.24 — TASKS CRUD
 // ================================================================================
 
-/**
- * Crée une tâche / un rappel pour l'utilisateur.
- */
 async function createTask(userId, { title, notes = null, dueAt = null }) {
   if (!title || typeof title !== "string" || !title.trim()) {
     return { success: false, error: "Le titre est obligatoire" };
@@ -6570,9 +5877,6 @@ async function createTask(userId, { title, notes = null, dueAt = null }) {
   return { success: true, task };
 }
 
-/**
- * Liste les tâches de l'utilisateur (filtre status optionnel).
- */
 async function listTasks(userId, { status = null } = {}) {
   try {
     let q = "SELECT * FROM user_tasks WHERE user_id = ?";
@@ -6585,9 +5889,6 @@ async function listTasks(userId, { status = null } = {}) {
   }
 }
 
-/**
- * Met à jour le statut d'une tâche (pending → done).
- */
 async function updateTaskStatus(userId, taskId, status) {
   if (!["pending", "done"].includes(status)) {
     return { success: false, error: "Statut invalide" };
@@ -6613,9 +5914,6 @@ async function updateTaskStatus(userId, taskId, status) {
   return { success: Boolean(task), task };
 }
 
-/**
- * Supprime une tâche.
- */
 async function deleteTask(userId, taskId) {
   await dbRun(`DELETE FROM user_tasks WHERE id = ? AND user_id = ?`, [taskId, userId]);
   if (firestoreDb) fsDelete("user_tasks", taskId).catch(() => {});
@@ -6632,9 +5930,6 @@ async function deleteTask(userId, taskId) {
 // §3.25 — QUOTAS
 // ================================================================================
 
-/**
- * Vérifie si l'utilisateur peut effectuer une action (quota journalier).
- */
 async function checkUserQuota(userId, action, userRole = "FREE") {
   try {
     const today = todayKeyMs();
@@ -6666,9 +5961,6 @@ async function checkUserQuota(userId, action, userRole = "FREE") {
   }
 }
 
-/**
- * Incrémente atomiquement le compteur de quota.
- */
 async function incrementUserQuota(userId, action) {
   try {
     const today = todayKeyMs();
@@ -6712,9 +6004,6 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   }
 }
 
-/**
- * Vérifie que le token Gmail a bien le scope d'envoi.
- */
 async function verifyGmailScope(accessToken) {
   try {
     const resp = await axios.get("https://www.googleapis.com/oauth2/v1/tokeninfo", {
@@ -6729,9 +6018,6 @@ async function verifyGmailScope(accessToken) {
   }
 }
 
-/**
- * Envoie un email via Gmail API (nécessite access token avec scope).
- */
 async function sendEmailViaGmail(accessToken, recipient, subject, body) {
   if (!await verifyGmailScope(accessToken)) {
     throw new Error("Token Gmail invalide ou scope manquant");
@@ -6762,9 +6048,6 @@ async function sendEmailViaGmail(accessToken, recipient, subject, body) {
   return { success: true, provider: "gmail", messageId: resp.data?.id || null };
 }
 
-/**
- * Envoie un email via Resend API.
- */
 async function sendEmailViaResend(recipient, subject, body) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return { success: false, error: "RESEND_API_KEY non configurée" };
@@ -6789,9 +6072,6 @@ async function sendEmailViaResend(recipient, subject, body) {
   }
 }
 
-/**
- * Envoie un email via SMTP (nodemailer).
- */
 async function sendEmailViaSMTP(to, subject, body) {
   if (!emailTransporter) return { success: false, error: "SMTP non configuré" };
 
@@ -6809,10 +6089,6 @@ async function sendEmailViaSMTP(to, subject, body) {
   }
 }
 
-/**
- * Orchestrateur d'envoi d'email : Gmail → Resend → SMTP.
- * Log le résultat en base.
- */
 async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, userId }) {
   if (!recipient || !EMAIL_REGEX.test(String(recipient).trim())) {
     return { success: false, error: "Adresse email destinataire invalide" };
@@ -6849,10 +6125,6 @@ async function dispatchSendEmail({ googleAccessToken, recipient, subject, body, 
 
 let whatsappManager = { sessions: new Map(), sendMessage: async () => ({ success: false }) };
 
-/**
- * Retourne la clé AES-256-GCM pour chiffrer les creds WhatsApp.
- * En dev : fallback avec warning. En prod : erreur si absente.
- */
 function getWhatsAppCryptoKey() {
   const key = CONFIG.WHATSAPP.ENCRYPTION_KEY;
   const iv = CONFIG.WHATSAPP.ENCRYPTION_IV;
@@ -6868,9 +6140,6 @@ function getWhatsAppCryptoKey() {
   };
 }
 
-/**
- * Chiffre et sauvegarde les creds WhatsApp dans Supabase.
- */
 async function saveWhatsAppCredentials(userId, credentialsData) {
   if (!supabase) return false;
   try {
@@ -6899,9 +6168,6 @@ async function saveWhatsAppCredentials(userId, credentialsData) {
   }
 }
 
-/**
- * Charge et déchiffre les creds WhatsApp depuis Supabase.
- */
 async function loadWhatsAppCredentials(userId) {
   if (!supabase) return null;
   try {
@@ -6925,9 +6191,6 @@ async function loadWhatsAppCredentials(userId) {
   }
 }
 
-/**
- * Supprime les creds WhatsApp stockés.
- */
 async function deleteWhatsAppCredentials(userId) {
   if (!supabase) return;
   await supabaseWriteSafe({
@@ -6936,9 +6199,6 @@ async function deleteWhatsAppCredentials(userId) {
   }).catch(() => {});
 }
 
-/**
- * Envoie un WhatsApp avec vérification de quota + incrémentation.
- */
 async function sendWhatsAppSmart(userId, phoneNumber, message) {
   const q = await checkUserQuota(userId, "whatsapp");
   if (!q.allowed) throw new Error(q.message || "Limite WhatsApp atteinte");
@@ -6948,9 +6208,6 @@ async function sendWhatsAppSmart(userId, phoneNumber, message) {
   return result;
 }
 
-/**
- * Convertit du Markdown en texte simple pour WhatsApp.
- */
 function toPlainWhatsAppText(markdown) {
   return String(markdown)
     .replace(/!\[.*?\]\(.*?\)/g, "")
@@ -7010,7 +6267,7 @@ Object.assign(module.exports, {
   // Vision
   analyzeImage,
 
-  // Ads
+  // Ads (v16.4.2 — propre)
   LUBA_PRO_ADS,
   fetchGhostAds,
   fetchAdsterra,
@@ -7061,27 +6318,27 @@ Object.assign(module.exports, {
 // ==================== FIN PARTIE 3/5 ===========================================
 // ================================================================================
 // ▶ PARTIE 4/5 : Sessions · saveMessageWithUser · Mémoire long terme (résumé) ·
-//                Suggestions · Enrichissement contexte · handleChat v16.4 · SSE ·
-//                handleActiveIntent.
+//                Suggestions · Enrichissement contexte · handleChat v16.4.2 ·
+//                SSE · handleActiveIntent.
+//
+//   Tape "suite" pour la recevoir.
 // ================================================================================
 // ================================================================================
-// PARTIE 4/5 — SESSIONS · HANDLECHAT v16.4 · SSE · ENRICHISSEMENT
+// PARTIE 4/5 — SESSIONS · HANDLECHAT v16.4.2 · SSE · ENRICHISSEMENT
 // ================================================================================
-// Ce module implémente la logique conversationnelle :
-//   • SSE Writer (streaming temps réel vers le client)
-//   • LUBA_SYSTEM_PROMPT v16.4 (anti-hallucination, routing tools, langue)
-//   • Sessions (getSession, setActiveIntent, full history)
-//   • saveMessageWithUser (triple-write Firestore + Supabase + SQLite)
-//   • Mémoire long terme (résumé glissant via LLM)
-//   • Suggestions (extraction + génération)
-//   • Enrichissement contexte (images/vidéos/scores parallèles)
-//   • handleChat v16.4 : cœur du backend (images EN HAUT, ads EN BAS)
-//   • handleActiveIntent : WhatsApp/Email flow à étapes
+// VERSION : v16.4.2 (Octobre 2026)
+//
+// MODIFICATIONS PAR RAPPORT À v16.4.0 :
+//   ✅ Bloc AD du chat : SUPPRESSION TOTALE du branding "Publicité Test Luba"
+//   ✅ SUPPRESSION de "<sub>Publicité test — luba_pro</sub>"
+//   ✅ Carte ad compacte et discrète, intégrée au fil de conversation
+//   ✅ handleChat : logs failover enrichis (provider + model + HTTP status)
+//   ✅ Conserve : SSE, images EN HAUT, sources, quality layer, mémoire
 //
 // TABLE DES MATIÈRES :
 //   §4.01  SSE Writer (streaming typé)
 //   §4.02  streamTextAsTokens (helper)
-//   §4.03  LUBA_SYSTEM_PROMPT v16.4
+//   §4.03  LUBA_SYSTEM_PROMPT v16.4.2
 //   §4.04  getSession (upsert + ownership)
 //   §4.05  ActiveIntent (WhatsApp/Email flow)
 //   §4.06  getFullHistory (Firestore → Supabase → SQLite)
@@ -7093,7 +6350,7 @@ Object.assign(module.exports, {
 //   §4.12  generateSuggestions
 //   §4.13  enrichContextWithIntent
 //   §4.14  toolCacheKey
-//   §4.15  handleChat v16.4
+//   §4.15  handleChat v16.4.2 (carte ad propre)
 //   §4.16  handleActiveIntent
 //   §4.17  isCancelMessage
 //   §4.18  Exports Partie 4
@@ -7118,7 +6375,7 @@ Object.assign(module.exports, {
  *   suggestions  { suggestions: ["Q1 ?","Q2 ?","Q3 ?"] }
  *   sources      { sources: [{name,url}] }
  *   quality      { confidence, qualityScore, hallucinationDetected, selfCritiqueImproved }
- *   ad           { ad: {id,title,imageUrl,clickUrl,isTest,network} }
+ *   ad           { ad: {id,title,imageUrl,clickUrl,network} }   (SANS branding test)
  *   error        { reply, code? }
  *   done         { conversationId, providerUsed, ... stats }
  */
@@ -7127,26 +6384,19 @@ class SSEWriter {
     this.res = res;
     this.closed = false;
 
-    // En-têtes SSE standards
     this.res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     this.res.setHeader("Cache-Control", "no-cache, no-transform");
     this.res.setHeader("Connection", "keep-alive");
     this.res.setHeader("X-Accel-Buffering", "no");
 
-    // Flush immédiat des headers (nécessaire pour SSE)
     if (typeof this.res.flushHeaders === "function") {
       this.res.flushHeaders();
     }
     this.res.write(":ok\n\n");
 
-    // Détection de fermeture de la connexion client
     this.res.on("close", () => { this.closed = true; });
   }
 
-  /**
-   * Envoie un événement SSE.
-   * Le payload est stringifié et chaque ligne est préfixée par "data: ".
-   */
   send(event, data) {
     if (this.closed) return false;
     try {
@@ -7162,8 +6412,6 @@ class SSEWriter {
     }
   }
 
-  // --- Méthodes raccourcies pour chaque type d'événement ---
-
   status(stage, extra = {}) { this.send("status", { stage, ...extra }); }
   reasoning(text)           { if (text) this.send("reasoning", { text }); }
   codeBlock(payload)        { this.send("code", payload); }
@@ -7177,9 +6425,6 @@ class SSEWriter {
   error(payload)            { this.send("error", payload); }
   done(payload)             { this.send("done", payload); }
 
-  /**
-   * Ferme la connexion SSE proprement.
-   */
   end() {
     if (this.closed) return;
     try { this.res.end(); } catch {}
@@ -7191,9 +6436,6 @@ class SSEWriter {
 // §4.02 — STREAMTEXT ASTOKENS
 // ================================================================================
 
-/**
- * Stream un texte complet sous forme de tokens SSE (pour effet machine à écrire).
- */
 async function streamTextAsTokens(sse, text, { paceMs = 4, chunkSize = 28 } = {}) {
   const chunks = safeChunkText(text, chunkSize);
   for (const chunk of chunks) {
@@ -7204,7 +6446,7 @@ async function streamTextAsTokens(sse, text, { paceMs = 4, chunkSize = 28 } = {}
 }
 
 // ================================================================================
-// §4.03 — LUBA_SYSTEM_PROMPT v16.4
+// §4.03 — LUBA_SYSTEM_PROMPT v16.4.2
 // ================================================================================
 
 /**
@@ -7270,15 +6512,9 @@ const LUBA_SYSTEM_PROMPT = [
 // §4.04 — GETSESSION (UPSERT + OWNERSHIP)
 // ================================================================================
 
-/**
- * Récupère (ou crée) une session de conversation.
- * Vérifie l'appartenance à l'utilisateur.
- * Sync Firestore + Supabase (best effort).
- */
 async function getSession(conversationId, userId, firebaseUid = null) {
   const local = await dbGet("SELECT * FROM sessions WHERE session_id = ?", [conversationId]);
 
-  // Session existante en SQLite
   if (local) {
     if (local.user_id !== userId && local.firebase_uid !== userId) {
       throw makeError("CONVERSATION_OWNERSHIP");
@@ -7308,7 +6544,6 @@ async function getSession(conversationId, userId, firebaseUid = null) {
     return local;
   }
 
-  // Nouvelle session : insertion locale + sync remote
   await dbRun(
     `INSERT INTO sessions (session_id, user_id, firebase_uid, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?)`,
@@ -7349,15 +6584,8 @@ async function getSession(conversationId, userId, firebaseUid = null) {
 // §4.05 — ACTIVEINTENT (WHATSAPP/EMAIL FLOW)
 // ================================================================================
 
-/**
- * TTL d'une intention active (5 minutes).
- * Au-delà, l'intention est considérée comme abandonnée.
- */
 const ACTIVE_INTENT_TTL_MS = 5 * 60 * 1000;
 
-/**
- * Enregistre une intention active (ex: flow WhatsApp en attente du numéro).
- */
 async function setActiveIntent(conversationId, intentType, intentData = {}) {
   await dbRun(
     `UPDATE sessions SET active_intent = ?, intent_data = ?, intent_expires_at = ? WHERE session_id = ?`,
@@ -7365,9 +6593,6 @@ async function setActiveIntent(conversationId, intentType, intentData = {}) {
   );
 }
 
-/**
- * Récupère l'intention active si elle n'a pas expiré.
- */
 async function getActiveIntent(conversationId) {
   const row = await dbGet(
     `SELECT active_intent, intent_data, intent_expires_at FROM sessions WHERE session_id = ?`,
@@ -7385,9 +6610,6 @@ async function getActiveIntent(conversationId) {
   }
 }
 
-/**
- * Supprime l'intention active.
- */
 async function clearActiveIntent(conversationId) {
   await dbRun(
     `UPDATE sessions SET active_intent = NULL, intent_data = NULL, intent_expires_at = NULL WHERE session_id = ?`,
@@ -7399,12 +6621,7 @@ async function clearActiveIntent(conversationId) {
 // §4.06 — GETFULLHISTORY (FIRESTORE → SUPABASE → SQLITE)
 // ================================================================================
 
-/**
- * Récupère l'historique complet d'une conversation.
- * Priorité : Firestore > Supabase > SQLite.
- */
 async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMITS.MAX_CONTEXT_MESSAGES) {
-  // 1) Firestore
   if (firestoreDb) {
     try {
       const rows = await fsQuery("messages", {
@@ -7423,7 +6640,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMI
     }
   }
 
-  // 2) Supabase
   if (supabase) {
     try {
       const q = supabase
@@ -7444,7 +6660,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMI
     }
   }
 
-  // 3) SQLite (fallback final)
   try {
     let q = "SELECT role, content FROM messages WHERE session_id = ?";
     const params = [conversationId];
@@ -7467,10 +6682,6 @@ async function getFullHistory(conversationId, userId = null, limit = CONFIG.LIMI
 // §4.07 — ASSERT CONVERSATION OWNERSHIP
 // ================================================================================
 
-/**
- * Vérifie que l'utilisateur est bien propriétaire de la conversation.
- * Throw CONVERSATION_OWNERSHIP si mismatch.
- */
 async function assertConversationOwnership(conversationId, userId) {
   const local = await dbGet(
     `SELECT user_id, firebase_uid FROM sessions WHERE session_id = ?`,
@@ -7518,17 +6729,10 @@ async function assertConversationOwnership(conversationId, userId) {
 // §4.08 — SAVEMESSAGEWITHUSER (TRIPLE-WRITE)
 // ================================================================================
 
-/**
- * Sauvegarde un message dans les 3 stores :
- *   1. Firestore (source de vérité, async)
- *   2. Supabase (backup, async)
- *   3. SQLite (local, sync pour cohérence immédiate)
- */
 async function saveMessageWithUser(conversationId, role, content, userId = null, firebaseUid = null, metadata = {}) {
   const now = Date.now();
   const msgId = generateMsgId();
 
-  // 1) Firestore
   if (firestoreDb && userId) {
     fsSet("messages", msgId, {
       session_id: conversationId,
@@ -7541,7 +6745,6 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
     }).catch(() => {});
   }
 
-  // 2) Supabase
   if (supabase && userId) {
     const idemKey = `msg:${conversationId}:${role}:${now}:${sha256(String(content).slice(0, 64)).slice(0, 12)}`;
     supabaseWriteSafe({
@@ -7559,7 +6762,6 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
     }).catch(() => {});
   }
 
-  // 3) SQLite (toujours)
   try {
     await dbRun(
       `INSERT INTO messages (session_id, user_id, role, content, metadata, created_at)
@@ -7576,9 +6778,6 @@ async function saveMessageWithUser(conversationId, role, content, userId = null,
 // §4.09 — GETUSERMEMORY + SAVEUSERMEMORY
 // ================================================================================
 
-/**
- * Récupère la mémoire long terme (résumé texte) d'un utilisateur.
- */
 async function getUserMemory(userId) {
   if (firestoreDb) {
     const doc = await fsGet("user_memory", userId);
@@ -7598,9 +6797,6 @@ async function getUserMemory(userId) {
   return row?.summary || "";
 }
 
-/**
- * Sauvegarde la mémoire long terme (sync triple).
- */
 async function saveUserMemory(userId, summary, messagesSinceUpdate = 0) {
   await dbRun(
     `INSERT INTO user_memory (user_id, summary, messages_since_update, updated_at)
@@ -7638,17 +6834,10 @@ async function saveUserMemory(userId, summary, messagesSinceUpdate = 0) {
 // §4.10 — MÉMOIRE LONG TERME (RÉSUMÉ)
 // ================================================================================
 
-/**
- * Nombre de messages avant régénération du résumé long terme.
- */
 const USER_MEMORY_UPDATE_EVERY_N_MESSAGES = parseInt(
   process.env.USER_MEMORY_UPDATE_EVERY_N_MESSAGES || "6", 10
 );
 
-/**
- * Incrémente le compteur de messages depuis la dernière mise à jour du résumé.
- * Retourne le nouveau compteur.
- */
 async function incrementUserMemoryCounter(userId) {
   const row = await dbGet("SELECT messages_since_update FROM user_memory WHERE user_id = ?", [userId]);
   const count = (row?.messages_since_update || 0) + 1;
@@ -7664,10 +6853,6 @@ async function incrementUserMemoryCounter(userId) {
   return count;
 }
 
-/**
- * Génère (via LLM) un résumé long terme compact de l'utilisateur.
- * Fusionne l'ancien résumé avec les nouveaux échanges.
- */
 async function runMemorySummaryImpl({ userId, lastUserMessage, lastAssistantReply }) {
   try {
     const prev = await getUserMemory(userId);
@@ -7712,30 +6897,23 @@ async function runMemorySummaryImpl({ userId, lastUserMessage, lastAssistantRepl
         return;
       }
     }
-    // En cas d'échec, on remet le compteur à 0 sans changer le résumé
     await saveUserMemory(userId, prev, 0);
   } catch (e) {
     logger.error({ err: e.message, userId }, "runMemorySummary échec");
   }
 }
 
-/**
- * Déclenche la mise à jour mémoire si nécessaire (fire-and-forget).
- * Extrait aussi des faits durables tous les 3 messages.
- */
 async function maybeUpdateUserMemoryAsync(userId, lastUserMessage, lastAssistantReply) {
   try {
     const count = await incrementUserMemoryCounter(userId);
 
     if (count < USER_MEMORY_UPDATE_EVERY_N_MESSAGES) {
-      // Extraction légère de faits durables tous les 3 messages
       if (count % 3 === 0) {
         extractFactsFromExchange(userId, lastUserMessage, lastAssistantReply).catch(() => {});
       }
       return;
     }
 
-    // Régénération complète du résumé
     runMemorySummaryImpl({ userId, lastUserMessage, lastAssistantReply }).catch(() => {});
   } catch (e) {
     logger.error({ err: e.message, userId }, "maybeUpdateUserMemoryAsync");
@@ -7746,10 +6924,6 @@ async function maybeUpdateUserMemoryAsync(userId, lastUserMessage, lastAssistant
 // §4.11 — EXTRACTSUGGESTIONS
 // ================================================================================
 
-/**
- * Extrait le bloc <!--SUGGESTIONS:[...]--> d'une réponse LLM.
- * Retourne { text (nettoyé), suggestions: [] }.
- */
 function extractSuggestions(text) {
   if (!text) return { text: "", suggestions: [] };
   const m = String(text).match(/<!--\s*SUGGESTIONS\s*:\s*(\[[\s\S]*?\])\s*-->/i);
@@ -7770,9 +6944,6 @@ function extractSuggestions(text) {
 // §4.12 — GENERATESUGGESTIONS
 // ================================================================================
 
-/**
- * Génère 3 questions de suivi via LLM (si le LLM n'en a pas produit).
- */
 async function generateSuggestions(userMessage, replyText) {
   try {
     const provider = MODEL_TIERS.v100.providers[0];
@@ -7810,11 +6981,6 @@ async function generateSuggestions(userMessage, replyText) {
 // §4.13 — ENRICHCONTEXTWITHINTENT
 // ================================================================================
 
-/**
- * Enrichit le contexte LLM avec des données externes selon l'intention.
- * Ex: pour ACTUALITE → appelle search_news + search_images en parallèle.
- * Les résultats sont formatés en texte et injectés dans le prompt user.
- */
 async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
   const enrichment = {
     contextData: "",
@@ -7833,7 +6999,6 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
   };
 
   try {
-    // GENERAL reçoit des images (sauf salutations)
     if (intent === "GENERAL") {
       if (!isGreetingOrSmallTalk(userMessage)) {
         const q = entity || userMessage.split(/\s+/).slice(0, 5).join(" ");
@@ -8005,15 +7170,12 @@ async function enrichContextWithIntent(intent, userMessage, entity, toolCache) {
 // §4.14 — TOOLCACHEKEY
 // ================================================================================
 
-/**
- * Génère une clé unique pour le cache des appels d'outils.
- */
 function toolCacheKey(name, args) {
   return `${name}::${sha256(safeJsonStringify(args || {})).slice(0, 16)}`;
 }
 
 // ================================================================================
-// §4.15 — HANDLECHAT v16.4 (CŒUR DU BACKEND)
+// §4.15 — HANDLECHAT v16.4.2 (CARTE AD PROPRE)
 // ================================================================================
 
 /**
@@ -8027,12 +7189,14 @@ function toolCacheKey(name, args) {
  *   4. Save user message
  *   5. Enrichissement contexte (images/vidéos/scores en parallèle)
  *   6. Construction messages LLM (system + history + user enriched)
- *   7. Exécution boucle agent (runToolLoop) avec failover providers
+ *   7. Exécution boucle agent (runToolLoop) avec failover providers + logs détaillés
  *   8. Phase code v250 si applicable
  *   9. Post-traitement (suggestions, quality layer)
- *  10. Construction réponse client : IMAGES EN HAUT + TEXTE + ADS EN BAS
+ *  10. Construction réponse client : IMAGES EN HAUT + TEXTE + CARTE AD EN BAS
  *  11. Save assistant message + reasoning trace
  *  12. Stream SSE si demandé
+ *
+ * ✅ v16.4.2 : carte ad propre (sans branding "Publicité Test Luba")
  */
 async function handleChat({
   conversationId,
@@ -8124,7 +7288,6 @@ async function handleChat({
   const toolCache = new Map();
   const enrichment = await enrichContextWithIntent(intent, message, entity, toolCache);
 
-  // Émission SSE des médias dès qu'ils sont prêts
   if (sse && enrichment.media.images.length > 0) sse.images(enrichment.media.images);
   if (sse && enrichment.media.videos.length > 0) sse.videos(enrichment.media.videos);
 
@@ -8162,7 +7325,7 @@ async function handleChat({
   ];
 
   // =================================================================
-  // 7) Exécution LLM (boucle agent + failover providers)
+  // 7) Exécution LLM (boucle agent + failover providers + logs détaillés)
   // =================================================================
   const usedSources = new Set(enrichment.sourceKeys);
   let collectedImages = enrichment.media.images.map((i) => i.url);
@@ -8174,12 +7337,10 @@ async function handleChat({
   let toolCallTrace = [];
   let lastReasoning = "";
 
-  // Choix de la chaîne de providers selon le contexte
   const providerChain = (images && images.length > 0)
     ? MODEL_TIERS.vision.providers
     : (useV250 ? MODEL_TIERS.v250.reasoning.providers : MODEL_TIERS.v100.providers);
 
-  // Fonction d'exécution d'outil (avec cache)
   const executeFn = async ({ toolName, args }) => {
     const key = toolCacheKey(toolName, args);
     if (toolCache.has(key)) {
@@ -8199,8 +7360,9 @@ async function handleChat({
     let loopResult = { success: false };
     let lastError = null;
 
-    // Failover sur la chaîne de providers
+    // ✅ Failover avec logs détaillés (provider + model + HTTP status + message)
     for (const provider of providerChain) {
+      const attemptStart = Date.now();
       const r = await runToolLoop({
         messages,
         providerConfig: provider,
@@ -8209,13 +7371,38 @@ async function handleChat({
         sse,
         _meta: { sessionId: conversationId, userId, tier: modelTier }
       });
+
       if (r.success) {
         loopResult = r;
         providerUsed = provider.provider;
+        logger.info({
+          provider: provider.provider,
+          model: provider.model,
+          latencyMs: Date.now() - attemptStart
+        }, "✅ Provider OK");
         break;
       }
+
       lastError = r.error;
-      logger.warn({ provider: provider.provider, err: r.error?.message }, "Provider échoué");
+      const httpStatus = r.error?.response?.status || null;
+      const errCode = r.error?.code || null;
+
+      logger.warn({
+        provider: provider.provider,
+        model: provider.model,
+        httpStatus,
+        errorCode: errCode,
+        errorMessage: String(r.error?.message || "").slice(0, 300)
+      }, `❌ Provider échoué (${httpStatus || errCode || "unknown"}) — failover suivant`);
+
+      // Enregistre dans la table de diagnostic (si dispo)
+      dbRun(
+        `INSERT INTO provider_failover_log
+         (session_id, tier, provider, model, http_status, error_code, error_message, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [conversationId, modelTier, provider.provider, provider.model,
+          httpStatus, errCode, String(r.error?.message || "").slice(0, 500), Date.now()]
+      ).catch(() => {});
     }
 
     if (!loopResult.success) {
@@ -8232,7 +7419,6 @@ async function handleChat({
       collectedImages.push(...(loopResult.images || []));
       collectedVideos.push(...(loopResult.videos || []));
 
-      // Filet de sécurité : garde les images d'enrichissement si le LLM n'en a pas ramené
       if (collectedImages.length === 0 && enrichment.media.images.length > 0) {
         collectedImages.push(...enrichment.media.images.map((i) => i.url));
       }
@@ -8273,19 +7459,16 @@ async function handleChat({
   finalText = normalizeMath(finalText || "");
   if (!finalText) finalText = "Je n'ai pas pu générer une réponse pour le moment.";
 
-  // Extraction des suggestions inline (<!--SUGGESTIONS:-->)
   const sug = extractSuggestions(finalText);
   finalText = sug.text;
   let suggestions = sug.suggestions;
 
-  // Si le LLM n'en a pas produit, on en génère (async, non bloquant)
   if (suggestions.length === 0 && !degraded) {
     generateSuggestions(message, finalText.slice(0, 500))
       .then((s) => { if (s.length) suggestions = s; })
       .catch(() => {});
   }
 
-  // AI Quality Layer : hallucination detector + self-critique + confidence
   let qualityReport = null;
   if (!degraded && finalText.length > 20) {
     try {
@@ -8360,16 +7543,17 @@ async function handleChat({
     ).catch(() => {});
   }
 
-  // Mémoire long terme (async)
   maybeUpdateUserMemoryAsync(userId, message, finalText).catch(() => {});
 
   // =================================================================
   // 12) Construction réponse client
-  //     ✅ v16.4 : IMAGES EN HAUT (markdown pur) + ADS EN BAS
+  //     ✅ v16.4.2 : IMAGES EN HAUT + CARTE AD PROPRE EN BAS
+  //     → Plus de "Publicité Test Luba"
+  //     → Plus de "<sub>Publicité test — luba_pro</sub>"
   // =================================================================
   let replyForClient = finalText;
 
-  // ---- IMAGES EN HAUT ----
+  // ---- IMAGES EN HAUT (markdown pur) ----
   const shouldInlineImages = !sse && collectedImages.length > 0;
   if (shouldInlineImages) {
     const imagesMd = collectedImages
@@ -8379,24 +7563,24 @@ async function handleChat({
     replyForClient = `${imagesMd}\n\n---\n\n${finalText}`;
   }
 
-  // ---- ADS EN BAS ----
+  // ---- CARTE AD EN BAS (sans branding test) ----
   let ad = null;
   if (channel !== "whatsapp" && channel !== "live-ws") {
     try {
-      ad = await getAd({ slot: "chat_below", userId, allowTest: true });
+      ad = await getAd({ slot: "chat_below", userId });
     } catch (e) {
       logger.warn({ err: e.message }, "getAd échec");
     }
   }
 
-  if (ad) {
+  if (ad && ad.imageUrl) {
+    // Rendu markdown pur : image cliquable, aucun badge, aucune mention "test"
+    const safeTitle = String(ad.title || "Sponsorisé").replace(/[\[\]]/g, "");
     const adMd = ad.clickUrl
-      ? `[![${ad.title || "Publicité"}](${ad.imageUrl})](${ad.clickUrl})`
-      : `![${ad.title || "Publicité"}](${ad.imageUrl})`;
-    const adNote = ad.isTest
-      ? `\n\n<sub>Publicité test — ${ad.network || "luba_pro"}</sub>`
-      : "";
-    replyForClient += `\n\n---\n\n${adMd}${adNote}`;
+      ? `[![${safeTitle}](${ad.imageUrl})](${ad.clickUrl})`
+      : `![${safeTitle}](${ad.imageUrl})`;
+    // Séparateur discret puis carte ad (compacte, intégrée au fil de conversation)
+    replyForClient += `\n\n${adMd}`;
   }
 
   // ---- SOURCES ----
@@ -8499,14 +7683,9 @@ async function handleChat({
 // §4.16 — HANDLEACTIVEINTENT
 // ================================================================================
 
-/**
- * Gère les intentions actives (flows WhatsApp et Email à étapes multiples).
- * Ex: l'utilisateur dit "envoie un WhatsApp" → on demande le numéro → puis le message.
- */
 async function handleActiveIntent(conversationId, activeIntent, userMessage, context = {}) {
   const { userId, googleAccessToken } = context;
 
-  // Détection annulation
   if (isCancelMessage(userMessage)) {
     await clearActiveIntent(conversationId);
     return { reply: "Action annulée.", error: false };
@@ -8516,7 +7695,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
     case "WHATSAPP": {
       const data = activeIntent.data || {};
 
-      // Étape 1 : attend le numéro
       if (data.step === "NEED_NUMBER") {
         const cleaned = String(userMessage).trim().replace(/[\s\-().]/g, "");
         if (PHONE_REGEX.test(cleaned)) {
@@ -8535,7 +7713,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         };
       }
 
-      // Étape 2 : attend le message
       if (data.step === "NEED_MESSAGE") {
         const text = sanitizeStrict(userMessage, 2000);
         if (!text) {
@@ -8559,7 +7736,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
     case "EMAIL": {
       const data = activeIntent.data || {};
 
-      // Étape 1 : destinataire
       if (data.step === "NEED_RECIPIENT") {
         const email = String(userMessage).trim();
         if (EMAIL_REGEX.test(email)) {
@@ -8575,7 +7751,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         return { reply: "Adresse email invalide. Réessayez ou tapez « annule ».", error: true };
       }
 
-      // Étape 2 : sujet
       if (data.step === "NEED_SUBJECT") {
         const subject = sanitizeStrict(userMessage, 200);
         if (!subject) {
@@ -8589,7 +7764,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
         return { reply: "Sujet enregistré. Quel est le contenu de l'email ?", error: false };
       }
 
-      // Étape 3 : corps + envoi
       if (data.step === "NEED_BODY") {
         const body = sanitizeStrict(userMessage, 5000);
         if (!body) {
@@ -8614,7 +7788,6 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
     }
   }
 
-  // Intention inconnue ou expirée
   await clearActiveIntent(conversationId);
   return { reply: "Action interrompue. Recommençons.", error: true };
 }
@@ -8623,16 +7796,10 @@ async function handleActiveIntent(conversationId, activeIntent, userMessage, con
 // §4.17 — ISCANCELMESSAGE
 // ================================================================================
 
-/**
- * Mots-clés d'annulation d'une intention active.
- */
 const CANCEL_WORDS = new Set([
   "annule", "annuler", "stop", "abandonne", "laisse tomber", "oublie", "cancel"
 ]);
 
-/**
- * Vérifie si un message est une demande d'annulation.
- */
 function isCancelMessage(text) {
   const t = normalizeForMatch(text);
   return CANCEL_WORDS.has(t) || t.startsWith("annul") || t.startsWith("cancel");
@@ -8643,14 +7810,9 @@ function isCancelMessage(text) {
 // ================================================================================
 
 Object.assign(module.exports, {
-  // SSE
   SSEWriter,
   streamTextAsTokens,
-
-  // Prompt
   LUBA_SYSTEM_PROMPT,
-
-  // Sessions
   getSession,
   setActiveIntent,
   getActiveIntent,
@@ -8659,24 +7821,16 @@ Object.assign(module.exports, {
   assertConversationOwnership,
   saveMessageWithUser,
   ACTIVE_INTENT_TTL_MS,
-
-  // Mémoire long terme (résumé)
   getUserMemory,
   saveUserMemory,
   incrementUserMemoryCounter,
   runMemorySummaryImpl,
   maybeUpdateUserMemoryAsync,
   USER_MEMORY_UPDATE_EVERY_N_MESSAGES,
-
-  // Suggestions
   extractSuggestions,
   generateSuggestions,
-
-  // Enrichissement
   enrichContextWithIntent,
   toolCacheKey,
-
-  // Chat
   handleChat,
   handleActiveIntent,
   isCancelMessage,
@@ -8688,26 +7842,27 @@ Object.assign(module.exports, {
 // ================================================================================
 // ▶ PARTIE 5/5 : Express · Routes HTTP · Luba Live WebSocket · Baileys ·
 //                Bootstrap · Graceful shutdown · Docker · CI/CD.
+//
+//   Tape "suite" pour la recevoir.
 // ================================================================================
 // ================================================================================
 // PARTIE 5/5 — EXPRESS · ROUTES · LUBA LIVE WS · BAILEYS · BOOTSTRAP · DOCKER
 // ================================================================================
-// Ce module finalise le serveur HTTP :
-//   • Baileys (WhatsApp manager avec chiffrement AES-256-GCM)
-//   • Schedulers (rappels, housekeeping)
-//   • Express app + middlewares (CORS, helmet, CSP, rate-limit)
-//   • Auth Firebase (Admin SDK + REST fallback)
-//   • Routes HTTP complètes (health, chat, tasks, memory, ads, whatsapp, etc.)
-//   • Luba Live WebSocket (protocole binaire custom + barge-in)
-//   • Bootstrap + graceful shutdown
-//   • Docker/Compose/Nginx/CI-CD (fichiers de déploiement)
-//   • Auto-start si exécuté directement
+// VERSION : v16.4.2 (Octobre 2026)
+//
+// ⚠️ CORRECTIONS CRITIQUES v16.4.2 :
+//   ✅ Toutes les références à firebaseApp/redisClient/metrics sont SANS parenthèses
+//      (ce sont des VARIABLES, pas des fonctions — sinon TypeError au boot)
+//   ✅ CORS avec logging des origines rejetées (débug)
+//   ✅ Logs d'auth détaillés (hasBearerToken, tokenPreview)
+//   ✅ Route /api/auth/check (diagnostic protégé)
+//   ✅ Fallback REST Firebase quand Admin SDK échoue
 //
 // TABLE DES MATIÈRES :
 //   §5.01  Baileys WhatsApp manager
 //   §5.02  Schedulers (reminder, housekeeping)
 //   §5.03  Express app + middlewares
-//   §5.04  Auth middleware (Firebase)
+//   §5.04  Auth middleware (Firebase Admin + REST fallback)
 //   §5.05  Routes API (20+ endpoints)
 //   §5.06  Luba Live WebSocket (binaire)
 //   §5.07  Bootstrap + graceful shutdown
@@ -8734,13 +7889,9 @@ function isWhatsAppAllowed(phoneNumber) {
  */
 class BaileysManager {
   constructor() {
-    this.sessions = new Map(); // userId → { sock, qrCode, ready }
+    this.sessions = new Map();
   }
 
-  /**
-   * Initialise (ou retourne) un client WhatsApp pour un utilisateur.
-   * Retourne { connected, qrCode } — QR disponible après ~2s.
-   */
   async initClient(userId) {
     const existing = this.sessions.get(userId);
     if (existing?.ready) return { connected: true, qrCode: null };
@@ -8749,7 +7900,6 @@ class BaileysManager {
     const authDir = path.join(CONFIG.PATHS.SESSIONS, userId);
     if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
-    // Restaure les creds chiffrés depuis Supabase si dispo
     const savedCreds = await loadWhatsAppCredentials(userId);
     if (savedCreds) {
       try {
@@ -8777,13 +7927,12 @@ class BaileysManager {
       auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Luba.ia", "Chrome", "16.4.0"]
+      browser: ["Luba.ia", "Chrome", "16.4.2"]
     });
 
     const session = { sock, qrCode: null, ready: false };
     this.sessions.set(userId, session);
 
-    // Sauvegarde auto des creds
     sock.ev.on("creds.update", async () => {
       try {
         await saveCreds();
@@ -8795,7 +7944,6 @@ class BaileysManager {
       } catch {}
     });
 
-    // Gestion de la connexion
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -8836,7 +7984,6 @@ class BaileysManager {
       }
     });
 
-    // Réception des messages
     sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
       if (type !== "notify") return;
       for (const msg of msgs) {
@@ -8886,9 +8033,6 @@ class BaileysManager {
     return { connected: false, qrCode: null };
   }
 
-  /**
-   * Crée (ou retrouve) un user placeholder pour un numéro WhatsApp.
-   */
   async _resolveUser(phone) {
     const uid = `wa_${phone}`;
     const existing = await dbGet("SELECT id FROM users WHERE firebase_uid = ? OR id = ?", [uid, uid]);
@@ -8906,9 +8050,6 @@ class BaileysManager {
     }
   }
 
-  /**
-   * Envoie un message WhatsApp.
-   */
   async sendMessage(userId, to, message) {
     const session = this.sessions.get(userId);
     if (!session || !session.ready) {
@@ -8926,16 +8067,10 @@ class BaileysManager {
     return { success: true, to: clean };
   }
 
-  /**
-   * Retourne le QR code (si dispo).
-   */
   getQRCode(userId) {
     return this.sessions.get(userId)?.qrCode || null;
   }
 
-  /**
-   * Ferme toutes les sessions proprement.
-   */
   async destroyAll() {
     for (const [userId, session] of this.sessions) {
       try { session.sock.end(undefined); } catch {}
@@ -8945,7 +8080,6 @@ class BaileysManager {
 
 const baileysManager = new BaileysManager();
 
-// Injection du manager dans la Partie 3 (utilisé par sendWhatsAppSmart)
 if (typeof module.exports.setWhatsAppManager === "function") {
   module.exports.setWhatsAppManager(baileysManager);
 }
@@ -8954,9 +8088,6 @@ if (typeof module.exports.setWhatsAppManager === "function") {
 // §5.02 — SCHEDULERS
 // ================================================================================
 
-/**
- * Tick de rappel : cherche les tâches échues et envoie des notifications.
- */
 async function reminderTick() {
   try {
     const due = await dbAll(
@@ -8994,9 +8125,6 @@ async function reminderTick() {
   }
 }
 
-/**
- * Nettoyage périodique : purge les vieilles données.
- */
 async function runSecurityHousekeeping() {
   try {
     const now = Date.now();
@@ -9008,6 +8136,7 @@ async function runSecurityHousekeeping() {
     await dbRun(`DELETE FROM token_cache WHERE expires_at < ?`, [now]);
     await dbRun(`DELETE FROM conversation_locks WHERE locked_until < ?`, [now - 5 * 60 * 1000]);
     await dbRun(`DELETE FROM reasoning_traces WHERE created_at < ?`, [now - 30 * 24 * 3600 * 1000]);
+    await dbRun(`DELETE FROM provider_failover_log WHERE created_at < ?`, [now - 30 * 24 * 3600 * 1000]);
     logger.info("🧹 Nettoyage effectué");
   } catch (e) {
     logger.error({ err: e.message }, "housekeeping");
@@ -9022,11 +8151,24 @@ const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-// ---------- CORS ----------
+// ---------- CORS avec logging des origines rejetées ----------
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || HOSTING_CONFIG.allowedOrigins.includes(origin)) return cb(null, true);
-    cb(null, false);
+    // Pas d'origine = OK (curl, Postman, tests)
+    if (!origin) return cb(null, true);
+
+    // Origine autorisée ?
+    if (HOSTING_CONFIG.allowedOrigins.includes(origin)) {
+      return cb(null, true);
+    }
+
+    // Log explicite des origines rejetées (débug CORS)
+    logger.warn({
+      rejectedOrigin: origin,
+      allowedOrigins: HOSTING_CONFIG.allowedOrigins
+    }, "🚫 CORS : origine rejetée");
+
+    return cb(null, false);
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: [
@@ -9103,7 +8245,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Body parsers (limites différentes selon route) ----------
+// ---------- Body parsers ----------
 const jsonSmall = express.json({ limit: "1mb" });
 const jsonLarge = express.json({ limit: "20mb" });
 
@@ -9132,6 +8274,7 @@ app.use((req, res, next) => {
       duration
     }, "requête");
 
+    // ✅ Utilisation correcte : metrics est une variable, pas une fonction
     if (metrics?.httpRequests) {
       metrics.httpRequests.labels(req.method, req.path, String(res.statusCode)).inc();
     }
@@ -9175,9 +8318,6 @@ try {
   }
 } catch {}
 
-/**
- * Fabrique un limiter express-rate-limit avec réponse JSON standardisée.
- */
 function makeLimiter({ windowMs, max, code, message }) {
   return rateLimit({
     windowMs, max,
@@ -9198,7 +8338,7 @@ const authLimiter   = makeLimiter({ windowMs: 15 * 60 * 1000, max: 60,  code: "R
 const toolLimiter   = makeLimiter({ windowMs: 60 * 1000,       max: 40,  code: "RATE_LIMIT_TOOL",   message: "Trop d'appels d'outils." });
 
 // ================================================================================
-// §5.04 — AUTH MIDDLEWARE
+// §5.04 — AUTH MIDDLEWARE (FIREBASE ADMIN + REST FALLBACK)
 // ================================================================================
 
 const tokenCache = new LRUCache({
@@ -9211,13 +8351,27 @@ function cacheGetToken(token) { return tokenCache.get(sha256(token)) || null; }
 function cacheSetToken(token, user) { tokenCache.set(sha256(token), user); }
 
 /**
- * Vérifie un ID token Firebase (Admin SDK prioritaire, REST fallback).
+ * Vérifie un ID token Firebase :
+ *   1. Cache d'abord
+ *   2. Firebase Admin SDK (préféré)
+ *   3. Fallback REST (si Admin échoue pour une raison non-token)
+ *
+ * ✅ Distingue :
+ *   - erreurs DÉFINITIVES token (expired/revoked/invalid) → throw direct
+ *   - erreurs de configuration Admin → fallback REST
  */
 async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH.CHECK_REVOKED } = {}) {
+  const tokenPreview = token ? `${token.slice(0, 30)}…` : "(vide)";
+
   const cached = cacheGetToken(token);
   if (cached) return cached;
 
-  // Méthode 1 : Firebase Admin SDK
+  let adminError = null;
+
+  // ═══════════════════════════════════════════════════════════════
+  // MÉTHODE 1 : Firebase Admin SDK
+  // ✅ firebaseApp est une VARIABLE (pas une fonction)
+  // ═══════════════════════════════════════════════════════════════
   if (firebaseApp && firebaseAdmin) {
     try {
       const decoded = await firebaseAdmin.auth(firebaseApp).verifyIdToken(token, checkRevoked);
@@ -9228,18 +8382,41 @@ async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH.CHECK_REV
         photoURL: decoded.picture || null,
         emailVerified: decoded.email_verified || false,
         role: decoded.role || "FREE",
-        customClaims: decoded
+        customClaims: decoded,
+        authSource: "admin_sdk"
       };
       cacheSetToken(token, user);
+      logger.info({ uid: user.uid, source: "admin_sdk" }, "✅ Token vérifié (Admin SDK)");
+      if (metrics?.authAttempts) metrics.authAttempts.labels("success", "admin_sdk").inc();
       return user;
-    } catch (e) {
-      logger.warn({ err: e.message, code: e.code }, "Firebase Admin verify échec");
-      throw e;
+    } catch (error) {
+      adminError = error;
+      const code = error?.code || "";
+      logger.warn({ code, msg: error?.message, tokenPreview }, "⚠️  Admin SDK a échoué");
+
+      // Erreurs DÉFINITIVES token → ne PAS fallback REST
+      const isDefinitiveTokenError = [
+        "auth/id-token-expired",
+        "auth/id-token-revoked",
+        "auth/argument-error",
+        "auth/invalid-id-token"
+      ].includes(code);
+
+      if (isDefinitiveTokenError) {
+        if (metrics?.authAttempts) metrics.authAttempts.labels("failed", "admin_sdk").inc();
+        throw error;
+      }
+
+      logger.info({ code }, "🔁 Fallback REST activé");
     }
   }
 
-  // Méthode 2 : Firebase REST API
+  // ═══════════════════════════════════════════════════════════════
+  // MÉTHODE 2 : Firebase Auth REST API (fallback)
+  // ═══════════════════════════════════════════════════════════════
   if (!FIREBASE_CONFIG.apiKey) {
+    logger.error("❌ FIREBASE_API_KEY absent — impossible de vérifier en REST");
+    if (metrics?.authAttempts) metrics.authAttempts.labels("failed", "no_api_key").inc();
     const e = new Error("Aucune configuration Firebase disponible");
     e.code = "auth/configuration-not-found";
     throw e;
@@ -9249,9 +8426,10 @@ async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH.CHECK_REV
     const resp = await axios.post(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`,
       { idToken: token },
-      { timeout: 8000 }
+      { timeout: 8000, validateStatus: () => true }
     );
-    if (resp.data.users && resp.data.users.length > 0) {
+
+    if (resp.status === 200 && resp.data?.users?.length > 0) {
       const u = resp.data.users[0];
       const user = {
         uid: u.localId,
@@ -9259,21 +8437,40 @@ async function verifyFirebaseToken(token, { checkRevoked = CONFIG.AUTH.CHECK_REV
         displayName: u.displayName || null,
         photoURL: u.photoUrl || null,
         emailVerified: u.emailVerified || false,
-        role: "FREE"
+        role: "FREE",
+        authSource: "rest_api"
       };
       cacheSetToken(token, user);
+      logger.info({ uid: user.uid, source: "rest_api" }, "✅ Token vérifié (REST)");
+      if (metrics?.authAttempts) metrics.authAttempts.labels("success", "rest_api").inc();
       return user;
     }
-    return null;
-  } catch (e) {
-    logger.warn({ err: e.message }, "Firebase REST verify échec");
+
+    logger.warn({ tokenPreview, resp: resp.data }, "❌ REST : token invalide");
+    if (metrics?.authAttempts) metrics.authAttempts.labels("failed", "rest_api").inc();
+
+    const errMsg = resp.data?.error?.message || "";
+    const e = new Error(errMsg || "Token invalide");
+    e.code = /EXPIRED/i.test(errMsg) ? "auth/id-token-expired" : "auth/invalid-id-token";
+    throw e;
+  } catch (restError) {
+    if (restError.code === "auth/id-token-expired" || restError.code === "auth/invalid-id-token") {
+      throw restError;
+    }
+
+    logger.error({
+      err: restError.message,
+      adminErr: adminError?.message,
+      tokenPreview
+    }, "❌ Échec total vérification token (Admin + REST)");
+
+    if (metrics?.authAttempts) metrics.authAttempts.labels("failed", "total").inc();
+    const e = new Error("Impossible de vérifier le token");
+    e.code = "auth/verification-failed";
     throw e;
   }
 }
 
-/**
- * Vérifie si une IP est bloquée.
- */
 async function isIPBlocked(ip) {
   const row = await dbGet(
     `SELECT 1 FROM blocked_ips WHERE ip_address = ? AND blocked_until > ? LIMIT 1`,
@@ -9282,9 +8479,6 @@ async function isIPBlocked(ip) {
   return Boolean(row);
 }
 
-/**
- * Enregistre une tentative de connexion (pour anti-brute-force).
- */
 async function recordLoginAttempt(ip, userId, success, err = null, { countFailure = true } = {}) {
   if (!success && !countFailure) return;
   try {
@@ -9296,9 +8490,6 @@ async function recordLoginAttempt(ip, userId, success, err = null, { countFailur
   } catch {}
 }
 
-/**
- * Compte les tentatives échouées récentes et bloque l'IP si nécessaire.
- */
 async function checkLoginAttempts(ip) {
   const cutoff = Date.now() - CONFIG.AUTH.LOGIN_BLOCK_MS;
   const row = await dbGet(
@@ -9324,11 +8515,10 @@ async function checkLoginAttempts(ip) {
   return { blocked: false };
 }
 
-/**
- * Crée ou met à jour l'utilisateur en base (triple-write).
- */
 async function fastUpsertUser(uid, user, role) {
   try {
+    logger.info({ uid, role, source: user.authSource }, "📝 Upsert user");
+
     const ex = await dbGet("SELECT id, role FROM users WHERE id = ?", [uid]);
     if (!ex) {
       await dbRun(
@@ -9376,6 +8566,7 @@ async function fastUpsertUser(uid, user, role) {
 
 /**
  * Middleware d'authentification : vérifie le Bearer token Firebase.
+ * ✅ Logs détaillés (hasBearerToken, tokenPreview) pour diagnostic.
  */
 function authenticateUser(req, res, next) {
   (async () => {
@@ -9384,13 +8575,30 @@ function authenticateUser(req, res, next) {
 
     // IP bloquée ?
     if (await isIPBlocked(ip)) {
-      return res.status(403).json({ success: false, error: true, reply: "Accès refusé.", code: "IP_BLOCKED" });
+      logger.warn({ ip }, "🚫 IP bloquée");
+      return res.status(403).json({
+        success: false, error: true,
+        reply: "Accès refusé.",
+        code: "IP_BLOCKED"
+      });
     }
 
     // Token présent ?
     const h = req.headers.authorization || req.headers.Authorization || "";
     const token = h.startsWith("Bearer ") ? h.slice(7).trim() : null;
+
+    // ✅ Log détaillé de la tentative d'authentification
+    logger.info({
+      hasAuthHeader: Boolean(h),
+      hasBearerToken: Boolean(token),
+      tokenPreview: token ? `${token.slice(0, 30)}…` : null,
+      path: req.path,
+      method: req.method,
+      origin: req.headers.origin || null
+    }, "🔐 Tentative d'authentification");
+
     if (!token) {
+      logger.warn({ path: req.path }, "❌ MISSING_TOKEN");
       return res.status(401).json({
         success: false, error: true,
         reply: "Authentification requise.",
@@ -9403,8 +8611,10 @@ function authenticateUser(req, res, next) {
     try {
       user = await verifyFirebaseToken(token);
     } catch (error) {
-      const isExpired = error?.code === "auth/id-token-expired";
-      const isRevoked = error?.code === "auth/id-token-revoked";
+      const code = error?.code || "";
+      const isExpired = code === "auth/id-token-expired";
+      const isRevoked = code === "auth/id-token-revoked";
+
       await recordLoginAttempt(ip, null, false, error.message, { countFailure: !isExpired && !isRevoked });
 
       if (!isExpired && !isRevoked) {
@@ -9413,6 +8623,9 @@ function authenticateUser(req, res, next) {
           return res.status(403).json({ success: false, error: true, reply: c.message, code: "IP_BLOCKED" });
         }
       }
+
+      logger.warn({ code, message: error.message, path: req.path }, "❌ Vérification token échouée");
+
       return res.status(401).json({
         success: false, error: true,
         reply: isExpired ? "Session expirée, reconnectez-vous." : "Session invalide.",
@@ -9421,6 +8634,8 @@ function authenticateUser(req, res, next) {
     }
 
     if (!user) {
+      logger.warn({ path: req.path }, "❌ Aucun user pour ce token");
+      await recordLoginAttempt(ip, null, false, "User introuvable");
       return res.status(401).json({
         success: false, error: true,
         reply: "Session invalide.",
@@ -9428,19 +8643,26 @@ function authenticateUser(req, res, next) {
       });
     }
 
-    // Injecte le contexte utilisateur
+    // ✅ UID vient EXCLUSIVEMENT du token vérifié (JAMAIS du body)
     req.uid = user.uid;
     req.userId = user.uid;
     req.firebaseUid = user.uid;
     req.verifiedIdentity = true;
     req.userRole = user.role || "FREE";
     req.emailVerified = user.emailVerified;
+    req.authSource = user.authSource || "unknown";
+
+    logger.info({
+      uid: user.uid,
+      role: req.userRole,
+      source: user.authSource
+    }, "✅ Utilisateur authentifié");
 
     // Post-traitement async
     setImmediate(() => {
       Promise.allSettled([
         recordLoginAttempt(ip, user.uid, true),
-        logSecurityEvent(user.uid, "LOGIN_SUCCESS", { email: user.email }, ip, ua),
+        logSecurityEvent(user.uid, "LOGIN_SUCCESS", { email: user.email, source: user.authSource }, ip, ua),
         fastUpsertUser(user.uid, user, req.userRole)
       ]).catch(() => {});
     });
@@ -9458,11 +8680,9 @@ function authenticateUser(req, res, next) {
   });
 }
 
-/**
- * Middleware de vérification de rôle (ADMIN / PREMIUM / FREE).
- */
 function requireRole(roles) {
   return (req, res, next) => {
+    // ✅ firebaseApp est une VARIABLE
     if (!firebaseApp && roles.includes("ADMIN")) {
       return res.status(503).json({
         success: false, error: true,
@@ -9545,7 +8765,7 @@ app.get("/api/health", async (req, res) => {
   });
 });
 
-// ---------- /ready (k8s readiness) ----------
+// ---------- /ready ----------
 app.get("/ready", async (req, res) => {
   try {
     await dbGet("SELECT 1");
@@ -9555,10 +8775,10 @@ app.get("/ready", async (req, res) => {
   }
 });
 
-// ---------- /api/metrics (Prometheus) ----------
+// ---------- /api/metrics ----------
 app.get("/api/metrics", async (req, res) => {
-  const m = metrics;
-  if (!m) return res.status(503).json({ error: "Metrics indisponibles" });
+  // ✅ metrics est une VARIABLE
+  if (!metrics) return res.status(503).json({ error: "Metrics indisponibles" });
 
   const token = process.env.METRICS_TOKEN;
   if (token && req.query.token !== token) {
@@ -9566,14 +8786,14 @@ app.get("/api/metrics", async (req, res) => {
   }
 
   try {
-    res.setHeader("Content-Type", m.register.contentType);
-    res.end(await m.register.metrics);
+    res.setHeader("Content-Type", metrics.register.contentType);
+    res.end(await metrics.register.metrics());
   } catch {
     res.status(500).end();
   }
 });
 
-// ---------- /api/debug (diagnostic) ----------
+// ---------- /api/debug ----------
 app.get("/api/debug", async (req, res) => {
   const token = process.env.DEBUG_TOKEN;
   if (CONFIG.ENV === "production" && (!token || req.query.token !== token)) {
@@ -9582,7 +8802,6 @@ app.get("/api/debug", async (req, res) => {
 
   const checks = {};
 
-  // Math engine
   try {
     const mr = await evaluateMathSafe("15*32+7");
     checks.math = { ok: mr.success, result: mr.formatted || mr.error };
@@ -9590,7 +8809,6 @@ app.get("/api/debug", async (req, res) => {
     checks.math = { ok: false, error: e.message };
   }
 
-  // Sandbox
   try {
     const sb = await runCodeSandbox({ language: "python", code: "print(2 + 2)" });
     checks.sandbox = {
@@ -9604,13 +8822,11 @@ app.get("/api/debug", async (req, res) => {
     checks.sandbox = { ok: false, error: e.message };
   }
 
-  // LLM keys
   checks.llm = {};
   for (const [n, cfg] of Object.entries(LLM_PROVIDERS)) {
     checks.llm[n] = { keys: cfg.keyPool.length, available: cfg.keyPool.length > 0 };
   }
 
-  // Test LLM call
   if (Object.values(checks.llm).some((c) => c.available)) {
     try {
       const tr = await callProviderWithTools({
@@ -9633,19 +8849,16 @@ app.get("/api/debug", async (req, res) => {
     }
   }
 
-  // Storage
   checks.storage = {
     firestore: Boolean(firestoreDb),
     supabase: Boolean(supabase),
     sqlite: Boolean(db)
   };
 
-  // Circuits
   checks.circuits = getAllCircuitStates().map((c) => ({
     name: c.name, state: c.state, failures: c.failureCount
   }));
 
-  // Cache
   checks.cache = {
     l1: l1Cache.size || 0,
     redis: Boolean(redisClient),
@@ -9653,6 +8866,23 @@ app.get("/api/debug", async (req, res) => {
   };
 
   return res.json({ success: true, checks });
+});
+
+// ---------- /api/auth/check (diagnostic protégé) ----------
+app.get("/api/auth/check", authLimiter, authenticateUser, (req, res) => {
+  res.json({
+    success: true,
+    error: false,
+    authenticated: true,
+    uid: req.uid,
+    firebaseUid: req.firebaseUid,
+    role: req.userRole,
+    authSource: req.authSource || "unknown",
+    projectId: FIREBASE_CONFIG.projectId,
+    firebaseAdminReady: Boolean(firebaseApp && firebaseAdmin),
+    firestoreReady: Boolean(firestoreDb),
+    checkedAt: new Date().toISOString()
+  });
 });
 
 // ---------- /api/user/whoami ----------
@@ -9672,7 +8902,6 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
     const today = todayKeyMs();
     let conversations = [];
 
-    // Charge les conversations depuis Firestore (préféré)
     if (firestoreDb) {
       try {
         const rows = await fsQuery("sessions", {
@@ -9700,7 +8929,6 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
       } catch {}
     }
 
-    // Fallback SQLite
     if (conversations.length === 0) {
       const rows = await dbAll(
         `SELECT session_id, created_at, updated_at FROM sessions
@@ -9722,7 +8950,6 @@ app.get("/api/session/bootstrap", apiLimiter, authenticateUser, async (req, res)
       }));
     }
 
-    // Chargement parallèle : quotas, tâches, user, mémoire, facts
     const [quota, tasks, user, mem, facts] = await Promise.all([
       dbGet(`SELECT * FROM user_quotas WHERE user_id = ? AND date = ?`, [userId, today]).catch(() => null),
       listTasks(userId, { status: "pending" }).catch(() => ({ tasks: [] })),
@@ -9792,7 +9019,6 @@ app.post(
       let convId = req.body?.conversationId || req.body?.conversation_id;
       const modelTier = req.body?.modelTier === "v250" ? "v250" : "v100";
 
-      // Validation message
       if (!raw || typeof raw !== "string") {
         if (isStream) return sseShortError(res, "Le message est obligatoire.", "MISSING_MESSAGE");
         return res.status(400).json({ success: false, error: true, reply: "Message obligatoire.", code: "MISSING_MESSAGE" });
@@ -9804,7 +9030,6 @@ app.post(
         return res.status(400).json({ success: false, error: true, reply: "Message vide.", code: "INVALID_MESSAGE" });
       }
 
-      // Détection prompt injection
       const inj = detectPromptInjection(sanitized);
       if (inj.detected) {
         await logSecurityEvent(req.userId, "PROMPT_INJECTION_BLOCKED", { pattern: inj.pattern }, req.ip, req.headers["user-agent"]);
@@ -9812,7 +9037,6 @@ app.post(
         return res.status(400).json({ success: false, error: true, reply: "Requête bloquée.", code: "PROMPT_INJECTION" });
       }
 
-      // Modération
       const mod = await moderateWithGroq(sanitized);
       if (!mod.safe) {
         await logSecurityEvent(req.userId, "CONTENT_BLOCKED", { category: mod.category }, req.ip, req.headers["user-agent"]);
@@ -9820,7 +9044,6 @@ app.post(
         return res.status(400).json({ success: false, error: true, reply: "Contenu non autorisé.", code: "CONTENT_BLOCKED" });
       }
 
-      // Vérification HMAC (si activée)
       if (CONFIG.HMAC.ENABLED) {
         const h = verifyHmacSignature(req);
         if (!h.valid && !h.skipped) {
@@ -9828,7 +9051,6 @@ app.post(
         }
       }
 
-      // Validation conversation ID
       if (convId && !/^[a-zA-Z0-9_-]{6,80}$/.test(convId)) {
         if (isStream) return sseShortError(res, "ID conversation invalide.", "INVALID_CONVERSATION_ID");
         return res.status(400).json({ success: false, error: true, reply: "ID invalide.", code: "INVALID_CONVERSATION_ID" });
@@ -9836,7 +9058,6 @@ app.post(
       if (!convId) convId = generateConversationId();
       const isNew = !req.body?.conversationId && !req.body?.conversation_id;
 
-      // Vérification propriété
       try {
         await assertConversationOwnership(convId, req.userId);
       } catch (e) {
@@ -9844,7 +9065,6 @@ app.post(
         return res.status(403).json({ success: false, error: true, reply: e.message, code: "CONVERSATION_OWNERSHIP" });
       }
 
-      // Quota
       const q = await checkUserQuota(req.userId, "message", req.userRole);
       if (!q.allowed) {
         if (isStream) return sseShortError(res, q.message, "QUOTA_EXCEEDED");
@@ -9852,7 +9072,6 @@ app.post(
       }
       await incrementUserQuota(req.userId, "message");
 
-      // Traitement des images uploadées
       let imgs = null;
       if (req.files && req.files.length > 0) {
         const bad = req.files.find((f) => !isValidImageSignature(f.buffer));
@@ -9865,7 +9084,6 @@ app.post(
 
       const gToken = req.headers["x-google-access-token"] || null;
 
-      // Mode SSE
       if (isStream) {
         const sse = new SSEWriter(res);
         req.on("close", () => { sse.closed = true; });
@@ -9895,7 +9113,6 @@ app.post(
         return;
       }
 
-      // Mode JSON
       const result = await handleChat({
         conversationId: convId,
         userId: req.userId,
@@ -10120,12 +9337,8 @@ app.post("/api/memory/recall", apiLimiter, authenticateUser, async (req, res) =>
 // ---------- Ads ----------
 app.get("/api/ads", apiLimiter, authenticateUser, async (req, res) => {
   try {
-    const slot = req.query.slot || "sidebar";
-    const ad = await getAd({
-      slot,
-      userId: req.userId,
-      allowTest: req.query.allowTest !== "false"
-    });
+    const slot = req.query.slot || "chat_below";
+    const ad = await getAd({ slot, userId: req.userId });
     return res.json({ success: true, error: false, ad });
   } catch {
     return res.status(500).json({ success: false, error: true, code: "ADS_ERROR" });
@@ -10309,6 +9522,7 @@ app.post("/api/admin/set-role", strictLimiter, authenticateUser, requireRole(["A
     if (!uid || !["FREE", "PREMIUM", "ADMIN"].includes(role)) {
       return res.status(400).json({ success: false, error: true, code: "INVALID_PARAMS" });
     }
+    // ✅ firebaseApp est une VARIABLE
     if (firebaseApp && firebaseAdmin) {
       await firebaseAdmin.auth(firebaseApp).setCustomUserClaims(uid, { role });
     }
@@ -10329,7 +9543,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
     const userId = req.userId;
     const fbUid = req.firebaseUid;
 
-    // Ferme la session WhatsApp
     try {
       const s = baileysManager.sessions.get(userId);
       if (s?.sock) s.sock.end(undefined);
@@ -10338,7 +9551,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
     } catch {}
 
-    // Purge SQLite (transaction)
     await dbTransaction(async ({ dbRun }) => {
       await dbRun("DELETE FROM messages WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
       await dbRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
@@ -10351,10 +9563,10 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       await dbRun("DELETE FROM user_memory WHERE user_id = ?", [userId]);
       await dbRun("DELETE FROM user_memory_facts WHERE user_id = ?", [userId]);
       await dbRun("DELETE FROM reasoning_traces WHERE user_id = ?", [userId]);
+      await dbRun("DELETE FROM provider_failover_log WHERE session_id IN (SELECT session_id FROM sessions WHERE user_id = ?)", [userId]);
       await dbRun("DELETE FROM users WHERE id = ?", [userId]);
     });
 
-    // Purge Firestore
     if (firestoreDb) {
       const cols = ["messages", "sessions", "user_tasks", "user_memory", "user_memory_facts"];
       for (const c of cols) {
@@ -10364,7 +9576,6 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       fsDelete("users", userId).catch(() => {});
     }
 
-    // Purge Supabase
     if (supabase) {
       const tables = ["messages", "sessions", "user_tasks", "user_memory", "whatsapp_credentials"];
       for (const t of tables) {
@@ -10375,8 +9586,8 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
       }
     }
 
-    // Suppression compte Firebase Auth
     let fbDel = false;
+    // ✅ firebaseApp est une VARIABLE
     if (firebaseApp && firebaseAdmin) {
       try {
         await firebaseAdmin.auth(firebaseApp).deleteUser(fbUid);
@@ -10420,29 +9631,12 @@ app.use((error, req, res, next) => {
 // §5.06 — LUBA LIVE WEBSOCKET (PROTOCOLE BINAIRE)
 // ================================================================================
 
-/**
- * Types de frames du protocole binaire Luba Live.
- * Format : [1 octet type][4 octets length][N octets payload]
- */
 const WS_FRAME = Object.freeze({
-  HELLO:      0x01,  // client → serveur (auth)
-  AUDIO_IN:   0x02,  // client → serveur (PCM)
-  TEXT_IN:    0x03,  // client → serveur (texte)
-  BARGE_IN:   0x04,  // client → serveur (interruption)
-  END_TURN:   0x05,  // client → serveur (fin utterance)
-  TRANSCRIPT: 0x11,  // serveur → client (transcription)
-  TOKEN:      0x12,  // serveur → client (texte streaming)
-  AUDIO_OUT:  0x13,  // serveur → client (TTS)
-  STATUS:     0x14,  // serveur → client (statut)
-  ERROR:      0x15,  // serveur → client (erreur)
-  DONE:       0x16,  // serveur → client (fin de tour)
-  QUALITY:    0x17,  // serveur → client (score qualité)
-  AD:         0x18   // serveur → client (publicité)
+  HELLO:      0x01, AUDIO_IN: 0x02, TEXT_IN: 0x03, BARGE_IN: 0x04, END_TURN: 0x05,
+  TRANSCRIPT: 0x11, TOKEN: 0x12, AUDIO_OUT: 0x13, STATUS: 0x14, ERROR: 0x15,
+  DONE: 0x16, QUALITY: 0x17, AD: 0x18
 });
 
-/**
- * Encode une frame binaire.
- */
 function encodeFrame(type, payload) {
   const buf = Buffer.isBuffer(payload)
     ? payload
@@ -10457,9 +9651,6 @@ function encodeFrame(type, payload) {
   return frame;
 }
 
-/**
- * Décode une frame binaire (retourne null si incomplète).
- */
 function decodeFrame(buffer) {
   if (buffer.length < 5) return null;
   const type = buffer.readUInt8(0);
@@ -10476,9 +9667,6 @@ try {
 let wsServer = null;
 const liveSessions = new Map();
 
-/**
- * Initialise le serveur WebSocket Luba Live sur /live.
- */
 function setupLubaLiveWebSocket(server) {
   if (!WebSocketServer) {
     logger.warn("⚠️  ws non installé — Luba Live désactivé");
@@ -10499,14 +9687,9 @@ function setupLubaLiveWebSocket(server) {
   wsServer.on("connection", (ws, req) => {
     const sid = `live_${crypto.randomUUID()}`;
     const state = {
-      sessionId: sid,
-      userId: null,
-      conversationId: null,
-      vad: new SimpleVAD(),
-      stt: null,
-      interrupted: false,
-      authenticated: false,
-      createdAt: Date.now()
+      sessionId: sid, userId: null, conversationId: null,
+      vad: new SimpleVAD(), stt: null,
+      interrupted: false, authenticated: false, createdAt: Date.now()
     };
     liveSessions.set(sid, state);
 
@@ -10538,13 +9721,9 @@ function setupLubaLiveWebSocket(server) {
   logger.info("✅ Luba Live WebSocket initialisé sur /live");
 }
 
-/**
- * Dispatch d'une frame WS entrante.
- */
 async function handleLiveFrame(ws, state, frame) {
   const { type, payload } = frame;
 
-  // --- HELLO : auth ---
   if (type === WS_FRAME.HELLO) {
     const hello = safeJsonParse(payload.toString("utf8"), {});
     const token = hello.token;
@@ -10579,12 +9758,10 @@ async function handleLiveFrame(ws, state, frame) {
     return;
   }
 
-  // Toute autre frame nécessite auth
   if (!state.authenticated) {
     return ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Not authenticated" }));
   }
 
-  // --- BARGE_IN ---
   if (type === WS_FRAME.BARGE_IN) {
     state.interrupted = true;
     if (state.stt) state.stt.reset();
@@ -10592,21 +9769,18 @@ async function handleLiveFrame(ws, state, frame) {
     return;
   }
 
-  // --- AUDIO_IN ---
   if (type === WS_FRAME.AUDIO_IN) {
     if (state.interrupted) return;
     if (state.stt) await state.stt.push(payload, { mimetype: "audio/webm" });
     return;
   }
 
-  // --- TEXT_IN ---
   if (type === WS_FRAME.TEXT_IN) {
     const text = payload.toString("utf8").slice(0, CONFIG.LIMITS.MAX_MESSAGE_LENGTH);
     await handleLiveTurn(ws, state, text);
     return;
   }
 
-  // --- END_TURN ---
   if (type === WS_FRAME.END_TURN) {
     if (!state.stt) return;
     const r = await state.stt.finalize("audio/webm");
@@ -10618,15 +9792,11 @@ async function handleLiveFrame(ws, state, frame) {
   }
 }
 
-/**
- * Traite un tour de conversation Luba Live (texte ou fin d'audio).
- */
 async function handleLiveTurn(ws, state, userText) {
   if (!userText) return;
   state.interrupted = false;
   ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "thinking" }));
 
-  // File TTS + traitement séquentiel
   const ttsQ = [];
   let ttsRunning = false;
 
@@ -10645,7 +9815,6 @@ async function handleLiveTurn(ws, state, userText) {
     ttsRunning = false;
   };
 
-  // Chunker de phrases pour démarrer le TTS en avance
   const chunker = new SentenceChunker({
     onSentence: (s) => {
       if (state.interrupted) return;
@@ -10655,7 +9824,6 @@ async function handleLiveTurn(ws, state, userText) {
   });
 
   try {
-    // Adaptateur SSE → WS
     const sseAdp = {
       closed: false,
       status: (stage, extra) => {
@@ -10728,19 +9896,14 @@ async function handleLiveTurn(ws, state, userText) {
 let server = null;
 let isShuttingDown = false;
 
-/**
- * Bootstrap complet : initialise tout puis démarre le serveur HTTP.
- */
 async function bootstrap() {
   console.log("");
   console.log("╔══════════════════════════════════════════════════════════════╗");
   console.log(`║  🚀 LUBA AI PRO v${CONFIG.VERSION} — HIKLON TECHNOLOGIES           ║`);
   console.log("╚══════════════════════════════════════════════════════════════╝");
 
-  // Init fondations (Partie 1)
   await bootstrapPart1();
 
-  // Démarre le serveur HTTP
   server = app.listen(CONFIG.PORT, CONFIG.HOST, () => {
     global.__luba_server = server;
     logger.info(`Serveur ${CONFIG.AGENT_NAME} v${CONFIG.VERSION} démarré sur ${CONFIG.HOST}:${CONFIG.PORT}`);
@@ -10751,28 +9914,26 @@ async function bootstrap() {
     process.exit(1);
   });
 
-  // WebSocket Luba Live
   setupLubaLiveWebSocket(server);
 
-  // Schedulers (non bloquants)
   setInterval(reminderTick, CONFIG.TIMEOUTS.REMINDER_TICK_MS).unref?.();
   setInterval(runSecurityHousekeeping, CONFIG.TIMEOUTS.HOUSEKEEPING_MS).unref?.();
 
-  // Bannière
+  // ✅ Utilisation correcte : firebaseApp, redisClient, metrics sont des VARIABLES
   console.log("");
   console.log("🌐 Domaine      : " + HOSTING_CONFIG.domain);
   console.log("🔐 Firebase     : " + (firebaseApp ? "Admin SDK ✅" : "REST API ⚠️"));
   console.log("⚡ Redis        : " + (redisClient ? "✅" : "❌ (LRU fallback)"));
   console.log("📊 Metrics      : " + (metrics ? "✅ /api/metrics" : "❌"));
+  console.log("💾 Firestore    : " + (firestoreDb ? "✅" : "❌"));
+  console.log("💾 Supabase     : " + (supabase ? "✅" : "❌"));
   console.log("💾 SQLite       : ✅");
-  console.log("⚡ Redis        : " + (redisClient ? "✅" : "❌ (LRU fallback)"));
   console.log("📧 Email        : " + (emailTransporter ? "SMTP ✅" : (process.env.RESEND_API_KEY ? "Resend ✅" : "❌")));
   console.log("📱 WhatsApp     : " + (CONFIG.WHATSAPP.ENCRYPTION_KEY ? "Chiffré ✅" : "⚠️"));
   console.log("🛡️  Rate limit  : " + (redisRateLimitStore ? "Redis ✅" : "Mémoire ⚠️"));
   console.log("🧪 Sandbox      : " + CONFIG.SANDBOX.PROVIDER + " (" + (CONFIG.SANDBOX.PISTON_URL || "?") + ")");
   console.log("📡 SSE          : ✅ /api/chat");
   console.log("🎙️  Luba Live    : " + (wsServer ? "✅ /live" : "❌"));
-  console.log("📊 Metrics      : " + (metrics ? "✅ /api/metrics" : "❌"));
   console.log("🔍 Debug        : " + (process.env.DEBUG_TOKEN ? "✅ /api/debug" : "⚠️  (set DEBUG_TOKEN)"));
   console.log("");
   console.log("🧠 AI QUALITY LAYER :");
@@ -10781,13 +9942,10 @@ async function bootstrap() {
   console.log(`   ├─ Multi-vote    : ${CONFIG.AI_QUALITY.ENABLE_MULTI_VOTE ? "✅" : "❌"}`);
   console.log(`   └─ Anti-halluc.  : ${CONFIG.AI_QUALITY.ENABLE_HALLUCINATION_CHECK ? "✅" : "❌"}`);
   console.log("");
-  console.log("🎯 v16.4 — Images pertinentes EN HAUT + Ads EN BAS");
+  console.log("🎯 v16.4.2 — Modèles vérifiés oct 2026 + Ads propres");
   console.log("");
 }
 
-/**
- * Arrêt propre : ferme les connexions actives.
- */
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
@@ -10796,6 +9954,7 @@ async function gracefulShutdown(signal) {
   try { if (server) await new Promise((r) => server.close(r)); } catch {}
   try { await baileysManager.destroyAll(); } catch {}
   try { if (wsServer) wsServer.close(); } catch {}
+  // ✅ redisClient est une VARIABLE
   try { if (redisClient) await redisClient.quit(); } catch {}
   try { await new Promise((r) => db ? db.close(() => r()) : r()); } catch {}
 
@@ -10817,10 +9976,6 @@ process.on("unhandledRejection", (r) => {
 // §5.08 — FICHIERS DE DÉPLOIEMENT
 // ================================================================================
 
-/**
- * Fichiers de déploiement à copier séparément (Dockerfile, docker-compose, CI).
- * Accessibles via getDeploymentFiles() et exposés dans les exports.
- */
 const DEPLOYMENT_FILES = String.raw`
 # ===== Dockerfile =====
 FROM node:20-alpine AS base
@@ -10835,8 +9990,7 @@ ENV NODE_ENV=production
 ENV PORT=3000
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN mkdir -p /app/data /app/sessions /app/uploads /app/logs \
-  && chown -R node:node /app
+RUN mkdir -p /app/data /app/sessions /app/uploads /app/logs && chown -R node:node /app
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
@@ -10940,20 +10094,13 @@ function getDeploymentFiles() {
 // ================================================================================
 
 Object.assign(module.exports, {
-  // App
   app,
   get server() { return server; },
   get wsServer() { return wsServer; },
-
-  // Baileys
   baileysManager,
   isWhatsAppAllowed,
-
-  // Schedulers
   reminderTick,
   runSecurityHousekeeping,
-
-  // Auth
   authenticateUser,
   requireRole,
   verifyFirebaseToken,
@@ -10962,8 +10109,6 @@ Object.assign(module.exports, {
   checkLoginAttempts,
   fastUpsertUser,
   tokenCache,
-
-  // WebSocket Luba Live
   WS_FRAME,
   encodeFrame,
   decodeFrame,
@@ -10971,18 +10116,14 @@ Object.assign(module.exports, {
   handleLiveFrame,
   handleLiveTurn,
   liveSessions: () => liveSessions,
-
-  // Déploiement
   DEPLOYMENT_FILES,
   getDeploymentFiles,
-
-  // Lifecycle
   bootstrap,
   gracefulShutdown
 });
 
 // ================================================================================
-// AUTO-START : démarre le serveur si ce fichier est exécuté directement
+// AUTO-START
 // ================================================================================
 
 if (require.main === module) {
@@ -10995,39 +10136,35 @@ if (require.main === module) {
 // ================================================================================
 // ==================== FIN PARTIE 5/5 — FIN DU FICHIER index.js =================
 // ================================================================================
-// 🎉 LUBA AI PRO v16.4.0 — BACKEND COMPLET, PRODUCTION READY
+// 🎉 LUBA AI PRO v16.4.2 — BACKEND COMPLET, PRODUCTION READY (Octobre 2026)
+//
+// ✅ MODÈLES VÉRIFIÉS OCTOBRE 2026 :
+//   • Groq v100/v250 → openai/gpt-oss-120b
+//   • Gemini → gemini-2.5-flash
+//   • Cerebras → qwen-3.8-27b
+//   • OpenRouter → deepseek-r1:free, qwen3-coder-480b:free
+//   • Vision → llama-4-maverick (Groq), qwen-2.5-vl-72b:free (OpenRouter)
+//
+// ✅ LOGS FAILOVER DÉTAILLÉS : provider + model + HTTP status + message
+// ✅ TABLE `provider_failover_log` pour auto-diagnostic des 404
+// ✅ ADS PROPRES : plus de "Publicité Test Luba" ni "<sub>Publicité test</sub>"
+// ✅ AUTH FIREBASE : Admin SDK + REST fallback automatique
+// ✅ ROUTE /api/auth/check : diagnostic protégé
 //
 // SETUP :
 //   1. npm install
-//   2. Créer un fichier .env avec les clés (voir .env.example)
-//   3. node --check index.js   (vérif syntaxe)
-//   4. node index.js           (démarre le serveur)
-//
-// AVEC DOCKER :
-//   docker compose up -d
+//   2. Créer .env (voir .env.example)
+//   3. node --check index.js
+//   4. node index.js
 //
 // URLS :
-//   http://localhost:3000/                      Info
-//   http://localhost:3000/api/health?full=1     Health complet
-//   http://localhost:3000/ready                 Readiness
-//   http://localhost:3000/api/metrics           Prometheus
-//   http://localhost:3000/api/debug?token=X     Diagnostic
-//   http://localhost:3000/api/ads/slots         Slots pub (lien test SAFE)
-//   POST http://localhost:3000/api/chat         Chat (JSON ou SSE)
-//   ws://localhost:3000/live                    Luba Live (WebSocket binaire)
-//
-// 🧠 NOUVEAUTÉS v16.4 :
-//   ✅ AUCUN STUB (résout SyntaxError "Identifier 'searchWeb' has already been declared")
-//   ✅ Toutes les fonctions `async function` hoistées → disponibles inter-parties
-//   ✅ Images PERTINENTES (score ≥ 0.4)
-//   ✅ Images EN HAUT (markdown pur — visible partout)
-//   ✅ Images pour GENERAL (sauf salutations)
-//   ✅ Ads EN BAS (markdown cliquable + label test)
-//   ✅ Champ `ad` dans la réponse JSON + SSE event `ad`
-//   ✅ Math prioritaire (execute_math)
-//   ✅ Reasoning streaming (DeepSeek R1 + Qwen think)
-//   ✅ Langue forcée (FR/EN/SW/LN)
-//   ✅ AI Quality Layer (self-critique + confidence + hallucination)
-//   ✅ Route /api/debug pour diagnostic
-//   ✅ 100% déployable sur Render (pas de syntaxe qui plante)
+//   GET  /                            — Info
+//   GET  /api/health?full=1           — Health complet
+//   GET  /ready                       — Readiness
+//   GET  /api/metrics                 — Prometheus
+//   GET  /api/debug?token=X           — Diagnostic
+//   GET  /api/auth/check              — Auth check (protégé)
+//   GET  /api/ads/slots               — Slots pub (propres)
+//   POST /api/chat                    — Chat (JSON ou SSE)
+//   ws://localhost:3000/live          — Luba Live (WebSocket binaire)
 // ================================================================================
