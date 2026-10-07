@@ -4938,8 +4938,11 @@ const imageCache = new LRUCache({
  * Orchestrateur de recherche d'images.
  * 🆕 v16.5 : fallback robuste (retourne les images même si pertinence faible).
  */
-async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARCH_LIMIT) {
-  const cleanQuery = extractEntity(query) || String(query || "").trim();
+async function searchImagesWithFallbackCore(query, limit = CONFIG.LIMITS.IMAGE_SEARCH_LIMIT, opts = {}) {
+  // Requête déjà reformulée par le LLM → on ne la re-découpe pas avec extractEntity
+  const cleanQuery = opts.refined
+    ? String(query || "").trim()
+    : (extractEntity(query) || String(query || "").trim());
   if (!cleanQuery || cleanQuery.length < 2) return { images: [] };
 
   const cacheKey = `img:v165:${cleanQuery.toLowerCase().trim()}`;
@@ -4982,11 +4985,13 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
   }));
 
   let relevant = scored.filter((img) => img._relevance >= CONFIG.IMAGES.MIN_RELEVANCE);
+  let usedRawFallback = false;
 
   // 🆕 Si rien de pertinent, on prend les images disponibles quand même
   if (relevant.length === 0 && all.length > 0) {
     logger.info({ query: cleanQuery, total: all.length }, "[Luba Images] Fallback sur images brutes");
     relevant = scored;
+    usedRawFallback = true;
   }
 
   relevant.sort((a, b) => {
@@ -5010,7 +5015,7 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
       source: img.source || "unknown"
     }));
 
-  const result = { images: unique, query: cleanQuery };
+  const result = { images: unique, query: cleanQuery, rawFallback: usedRawFallback };
   if (unique.length > 0) imageCache.set(cacheKey, result);
 
   logger.info({
@@ -5020,6 +5025,148 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
   }, "[Luba Images] Résultat final");
 
   return result;
+}
+
+// ================================================================================
+// §3.12.b — 🆕 REFORMULATION DE LA REQUÊTE IMAGE PAR LE LLM
+// ================================================================================
+// Le modèle corrige les fautes, identifie le vrai sujet visuel et fournit le
+// mot-clé / la courte phrase à envoyer à Wikimedia Commons (+ 2 variantes).
+// Sécurité : timeout court, cache, désactivable (IMAGE_LLM_QUERY=0), et
+// en cas d'échec on retombe exactement sur l'ancien comportement.
+
+const IMAGE_LLM_QUERY_ENABLED    = process.env.IMAGE_LLM_QUERY !== "0";
+const IMAGE_LLM_QUERY_TIMEOUT_MS = parseInt(process.env.IMAGE_LLM_QUERY_TIMEOUT_MS || "3500", 10);
+
+const imageQueryPlanCache = new LRUCache({
+  max: 500,
+  ttl: CONFIG.IMAGES.CACHE_TTL_MS,
+  updateAgeOnGet: false
+});
+
+const IMAGE_QUERY_SYSTEM_PROMPT = [
+  "Tu es un expert en recherche d'images sur Wikimedia Commons.",
+  "L'utilisateur pose une question (parfois mal orthographiée, familière, en français, anglais, lingala ou swahili).",
+  "Ta mission : trouver le SUJET VISUEL principal et donner le meilleur mot-clé pour trouver de bonnes photos illustratives.",
+  "Règles :",
+  "- Corrige les fautes d'orthographe et reconstitue le vrai nom (personne, lieu, animal, objet, monument, plat, événement…).",
+  "- \"primary\" : 1 à 4 mots, forme canonique (titre Wikipédia), SANS verbes, SANS mots de question (qui, quoi, comment, pourquoi…).",
+  "- \"alternatives\" : 2 variantes maximum (par ex. nom en anglais, nom plus large ou nom scientifique).",
+  "- Garde les noms propres tels qu'ils s'écrivent officiellement.",
+  "- Si la question est abstraite, sans sujet visuel clair, donne le thème concret le plus illustrable.",
+  'Réponds STRICTEMENT en JSON : {"primary":"...","alternatives":["...","..."]}'
+].join("\n");
+
+function sanitizeImageKeyword(v) {
+  return String(v || "")
+    .replace(/[\r\n"{}\[\]<>`]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+/**
+ * @returns {Promise<{queries: string[]}|null>} null = pas de reformulation (fallback ancien comportement)
+ */
+async function refineImageQueryWithLLM(userMessage, fallbackQuery = "") {
+  if (!IMAGE_LLM_QUERY_ENABLED) return null;
+
+  const msg = String(userMessage || "").trim().slice(0, 300);
+  if (msg.length < 2) return null;
+
+  const cacheKey = `iq:v1:${msg.toLowerCase()}`;
+  if (imageQueryPlanCache.has(cacheKey)) return imageQueryPlanCache.get(cacheKey);
+
+  const deadline = Date.now() + IMAGE_LLM_QUERY_TIMEOUT_MS;
+  const providers = (MODEL_TIERS?.v100?.providers || []).slice(0, 2);
+
+  for (const base of providers) {
+    const remaining = deadline - Date.now();
+    if (remaining < 500) break;
+
+    try {
+      const r = await withDeadline(
+        callProviderWithTools({
+          providerConfig: {
+            ...base,
+            timeout: remaining,
+            maxTokens: 400,
+            temperature: 0,
+            reasoningEffort: base.provider === "groq" ? "low" : null
+          },
+          messages: [
+            { role: "system", content: IMAGE_QUERY_SYSTEM_PROMPT },
+            { role: "user", content: `Question : ${msg}` }
+          ],
+          tools: null,
+          jsonMode: true,
+          _meta: { tier: "image_query" }
+        }),
+        remaining,
+        null
+      );
+
+      if (!r || !r.success) continue;
+
+      const content = String(r.message?.content || "");
+      const m = content.match(/\{[\s\S]*\}/);
+      if (!m) continue;
+
+      const parsed = JSON.parse(m[0]);
+      const primary = sanitizeImageKeyword(parsed.primary);
+      if (primary.length < 2) continue;
+
+      const seen = new Set([primary.toLowerCase()]);
+      const queries = [primary];
+      for (const alt of (Array.isArray(parsed.alternatives) ? parsed.alternatives : []).slice(0, 2)) {
+        const a = sanitizeImageKeyword(alt);
+        if (a.length >= 2 && !seen.has(a.toLowerCase())) {
+          seen.add(a.toLowerCase());
+          queries.push(a);
+        }
+      }
+
+      const plan = { queries };
+      imageQueryPlanCache.set(cacheKey, plan);
+      logger.info({ original: msg.slice(0, 80), queries }, "[Luba Images] Requête reformulée par le LLM");
+      return plan;
+    } catch (e) {
+      logger.debug({ err: e.message }, "[Luba Images] Reformulation LLM échouée");
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Orchestrateur public (même nom et même contrat qu'avant).
+ *  1) le LLM reformule la demande en mot-clé Wikimedia (+ variantes)
+ *  2) on cherche avec ce mot-clé, puis les variantes si le résultat est faible
+ *  3) en dernier recours : ancien comportement avec la requête brute
+ *
+ * opts.context : message complet de l'utilisateur (meilleur contexte pour le LLM)
+ * opts.refine  : false pour désactiver la reformulation sur cet appel
+ */
+async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARCH_LIMIT, opts = {}) {
+  const baseQuery = String(query || "").trim();
+  if (!baseQuery) return { images: [] };
+
+  const plan = opts.refine === false
+    ? null
+    : await refineImageQueryWithLLM(opts.context || baseQuery, baseQuery);
+
+  if (!plan) return searchImagesWithFallbackCore(baseQuery, limit);
+
+  let best = null;
+  for (const q of plan.queries) {
+    const r = await searchImagesWithFallbackCore(q, limit, { refined: true });
+    if (r.images?.length && !r.rawFallback) return r;      // résultat pertinent
+    if (r.images?.length && !best) best = r;               // garde le meilleur "brut"
+  }
+
+  const original = await searchImagesWithFallbackCore(baseQuery, limit);
+  if (original.images?.length && !original.rawFallback) return original;
+  return best || original;
 }
 
 // ================================================================================
@@ -5059,7 +5206,7 @@ async function ensureImageForResponse(userMessage, entity = null) {
   logger.info({ query }, "[Luba Images] Recherche garantie déclenchée");
 
   try {
-    const result = await searchImagesWithFallback(query, 3);
+    const result = await searchImagesWithFallback(query, 3, { context: userMessage });
     if (result.images?.length > 0) {
       return { images: result.images, skipped: false, reason: "found" };
     }
@@ -5067,7 +5214,7 @@ async function ensureImageForResponse(userMessage, entity = null) {
     // Fallback : essayer avec la query brute (sans extraction)
     const fallbackQuery = String(userMessage).trim().slice(0, 50);
     if (fallbackQuery !== query) {
-      const fallbackResult = await searchImagesWithFallback(fallbackQuery, 3);
+      const fallbackResult = await searchImagesWithFallback(fallbackQuery, 3, { refine: false });
       if (fallbackResult.images?.length > 0) {
         return { images: fallbackResult.images, skipped: false, reason: "found_fallback" };
       }
