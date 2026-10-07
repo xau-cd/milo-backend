@@ -7723,16 +7723,6 @@ async function handleChat({
   // =================================================================
   let replyForClient = finalText;
 
-  // Images EN HAUT
-  const shouldInlineImages = !sse && collectedImages.length > 0;
-  if (shouldInlineImages) {
-    const imagesMd = collectedImages
-      .slice(0, CONFIG.LIMITS.MAX_IMAGES_DISPLAYED)
-      .map((u, i) => `![Illustration ${i + 1}](${u})`)
-      .join("\n\n");
-    replyForClient = `${imagesMd}\n\n---\n\n${finalText}`;
-  }
-
   // Ad (propre, sans branding test)
   let ad = null;
   if (channel !== "whatsapp" && channel !== "live-ws") {
