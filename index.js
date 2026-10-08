@@ -71,6 +71,8 @@ const IORedis = tryRequire("ioredis");
 const WsLib = tryRequire("ws");
 const firebaseAdmin = tryRequire("firebase-admin");
 const supabaseLib = tryRequire("@supabase/supabase-js");
+// Sources gratuites sans clé (Google News, arXiv, OpenAlex, Deezer…) : actif dès que ./free-sources.js existe.
+const freeSources = /^(1|true|yes|on)$/i.test(process.env.DISABLE_FREE_SOURCES || "") ? null : tryRequire("./free-sources.js");
 
 const sleepRaw = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -2207,8 +2209,10 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
     out = out && typeof out === "object" ? out : { result: out, sourceKeys: [] };
     (out.sourceKeys || []).forEach((k) => sources.add(k));
     const res = out.result;
-    if (name === "search_images" && res?.images?.length) { imagesOut.push(...res.images.map((i) => i.url).filter(Boolean)); emit.images(res.images); }
-    if (name === "search_youtube" && res?.videos?.length) { videosOut.push(...res.videos); emit.videos(res.videos); }
+    const imgs = Array.isArray(res?.images) ? res.images.filter((i) => i && typeof i.url === "string") : [];
+    if (imgs.length) { imagesOut.push(...imgs.map((i) => i.url)); emit.images(imgs); }
+    const vids = Array.isArray(res?.videos) ? res.videos.filter((v) => v && v.videoId) : [];
+    if (vids.length) { videosOut.push(...vids); emit.videos(vids); }
     if (name === "run_code" && (res?.stdout || res?.stderr)) emit.code({ language: args.language, stdout: res.stdout || "", stderr: res.stderr || "", done: true, execution: true });
     toolCache.set(ck, out);
     return out;
@@ -2362,15 +2366,19 @@ const NATIVE_TOOLS = {
 
 function getToolSchemas() {
   const native = Object.values(NATIVE_TOOLS).map((t) => t.schema);
-  if (CONFIG.FAKE_LLM || !legacy?.getToolSchemas) return native;
+  const free = freeSources ? freeSources.schemas() : [];
+  const taken = new Set([...native, ...free].map((t) => t.function.name));
   let extra = [];
-  try { extra = legacy.getToolSchemas("chat").filter((s) => !NATIVE_TOOLS[s.function?.name]); } catch {}
-  return [...native, ...extra];
+  if (!CONFIG.FAKE_LLM && legacy?.getToolSchemas) {
+    try { extra = legacy.getToolSchemas("chat").filter((t) => !taken.has(t.function?.name)); } catch {}
+  }
+  return [...native, ...free, ...extra];
 }
 
 async function executeTool({ toolName, args }, ctx) {
   const nat = NATIVE_TOOLS[toolName];
   if (nat) return { result: await nat.exec(args || {}, ctx), sourceKeys: [] };
+  if (freeSources?.has(toolName)) return freeSources.execute(toolName, args || {}, ctx);
   if (legacy?.executeToolNative) {
     const out = await legacy.executeToolNative(toolName, args, { userId: ctx.userId, googleAccessToken: ctx.googleAccessToken, sessionId: ctx.convId });
     return { result: out.result, sourceKeys: out.sourceKeys || [] };
@@ -2685,6 +2693,7 @@ const SOURCE_LABELS = {
   coingecko: ["CoinGecko", "https://www.coingecko.com"], coinmarketcap: ["CoinMarketCap", "https://coinmarketcap.com"],
   yahoo: ["Yahoo Finance", "https://finance.yahoo.com"], youtube: ["YouTube", "https://youtube.com"], pexels: ["Pexels", "https://pexels.com"]
 };
+if (freeSources?.SOURCES) Object.assign(SOURCE_LABELS, freeSources.SOURCES);
 const sourceList = (keys) => keys.map((k) => SOURCE_LABELS[k]).filter(Boolean).map(([name, url]) => ({ name, url }));
 
 const factSlots = { n: 0, max: 2 };
@@ -2803,6 +2812,10 @@ const chat = {
       // Messages
       const history = ctxRows.filter((r) => r.idx < run.userIdx).slice(-CONFIG.LIMITS.MAX_CONTEXT_MESSAGES).map((r) => ({ role: r.role, content: r.content }));
       let system = LUBA_SYSTEM_PROMPT + `\n\n[LANGUE DÉTECTÉE : ${run.language.toUpperCase()}] → Réponds en ${LANG_NAME[run.language] || "français"}.`;
+      if (freeSources && !hasImages && intent !== "SMALLTALK") {
+        const names = freeSources.schemas().map((t) => t.function.name);
+        if (names.length) system += `\n\n[SOURCES GRATUITES DISPONIBLES : ${names.join(", ")}. Utilise-les selon le sujet : actualités, science, livres, lieux proches, données par pays, musique, archives historiques.]`;
+      }
       if (memoryBlock) system += `\n\n${memoryBlock}`;
       if (intent && intent !== "GENERAL" && intent !== "SMALLTALK") system += `\n\n[DOMAINE DÉTECTÉ : ${intent}]`;
       if (run.outImages.length) system += `\n\n[IMAGES : ${run.outImages.length} image(s) seront affichées automatiquement. Ne mentionne PAS les URLs.]`;
@@ -3470,7 +3483,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
@@ -3592,6 +3605,8 @@ function validateEnvironment() {
   if (!FIREBASE_CONFIG.apiKey && !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) logger.error("Ni FIREBASE_API_KEY ni FIREBASE_SERVICE_ACCOUNT_JSON : l'authentification échouera.");
   if (CONFIG.ENV === "production" && !CONFIG.DEBUG_TOKEN) logger.warn("DEBUG_TOKEN absent : /api/debug et /api/health?full=1 sont désactivés.");
   logger.info({ providers: withKeys, fakeLlm: CONFIG.FAKE_LLM, node: process.version }, "environnement");
+  if (freeSources) logger.info({ tools: freeSources.schemas().length, version: freeSources.VERSION }, "sources gratuites chargées (free-sources.js)");
+  else if (fs.existsSync(path.join(__dirname, "free-sources.js")) && !envBool("DISABLE_FREE_SOURCES", false)) logger.warn("free-sources.js présent mais non chargeable (erreur de syntaxe ?)");
 }
 
 async function bootstrap({ listen = true } = {}) {
