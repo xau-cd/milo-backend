@@ -1,4 +1,3694 @@
 // ================================================================================
+// LUBA AI PRO — BACKEND v17.0.0 « PRO MAX » — Run-Based Architecture + module héritage v16.5
+// HIKLON TECHNOLOGIES · Kinshasa, RDC · 2026
+// ================================================================================
+//
+// POURQUOI UNE v17 ? (causes racines des « Luba n'est pas disponible » en v16.5)
+//   1. Appels LLM NON streamés + timeout fixe de 20-40 s : une question lourde
+//      (raisonnement) dépasse le timeout → compté comme « panne » du provider.
+//   2. Le tracker de santé comptait UN échec PAR CLÉ : une seule requête lente avec
+//      3 clés = 3 échecs = provider désactivé 2 min pour TOUT LE MONDE → cascade.
+//   3. Aucune file d'attente / limite de concurrence : N requêtes lourdes = N appels
+//      simultanés → 429 en chaîne → tout s'effondre.
+//   4. CHAT_GLOBAL_MS jamais appliqué, aucun heartbeat SSE, pas de nginx.conf :
+//      le proxy coupe à 60 s et la réponse est perdue.
+//   5. Le « streaming » était simulé : on attendait la réponse COMPLÈTE puis on la
+//      rejouait token par token (sleep) → latence perçue énorme.
+//   6. Historique lu sur Firestore d'abord (écritures fire-and-forget, erreurs
+//      avalées) → messages manquants / désordonnés / perdus (FK users non créé).
+//   7. 3 écritures SQLite par requête authentifiée, N+1 SQL dans /conversations.
+//
+// ARCHITECTURE v17
+//   HTTP ─► Auth (cache+singleflight) ─► Admission (quota atomique, rate-limit user)
+//        ─► Persist user msg (idempotent, transaction) ─► RunManager (file + lanes)
+//        ─► Orchestrator (streaming réel, failover avant 1er token, outils parallèles)
+//        ─► Persist assistant msg ─► SyncLog ─► Push (SSE /api/sync/stream + WS /ws)
+//   • Un RUN est indépendant de la connexion HTTP : le client peut se reconnecter
+//     (Last-Event-ID) et rejouer les événements ; la réponse est sauvegardée même si
+//     l'utilisateur ferme l'app.
+//   • SQLite = source de vérité (WAL, file d'écriture unique, pool de lecteurs).
+//     Firestore / Supabase = miroirs ASYNCHRONES via outbox durable (jamais lus).
+//   • Sync delta par curseur (sync_log) + messages numérotés (idx) + idempotence.
+//
+// TABLE DES MATIÈRES
+//   §1  Imports & utilitaires        §10 Orchestrateur LLM (streaming, outils)
+//   §2  Configuration                §11 Pont outils legacy (optionnel)
+//   §3  Logger, erreurs, métriques   §12 RunManager (file, lanes, replay)
+//   §4  Caches, EventBus             §13 Service Chat
+//   §5  Base de données              §14 Service Sync (delta, SSE, WS)
+//   §6  Dépôts (repos)               §15 Miroirs Firestore/Supabase
+//   §7  Auth                         §16 Routes HTTP
+//   §8  Rate limit & quotas          §17 Bootstrap & arrêt propre
+//   §9  Providers & santé            §18 Exports / auto-start
+// ================================================================================
+
+"use strict";
+
+// ================================================================================
+// §1 — IMPORTS & UTILITAIRES
+// ================================================================================
+
+function tryRequire(name) { try { return require(name); } catch { return null; } }
+
+const dotenv = tryRequire("dotenv");
+if (dotenv && typeof dotenv.config === "function") dotenv.config();
+
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const crypto = require("crypto");
+const http = require("http");
+const { EventEmitter } = require("events");
+const { monitorEventLoopDelay } = require("perf_hooks");
+
+const express = tryRequire("express");
+const cors = tryRequire("cors");
+const helmet = tryRequire("helmet");
+const multer = tryRequire("multer");
+const pino = tryRequire("pino");
+const PromClient = tryRequire("prom-client");
+const IORedis = tryRequire("ioredis");
+const WsLib = tryRequire("ws");
+const firebaseAdmin = tryRequire("firebase-admin");
+const supabaseLib = tryRequire("@supabase/supabase-js");
+
+const sleepRaw = (ms) => new Promise((r) => setTimeout(r, ms));
+const now = () => Date.now();
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
+const newId = (prefix, bytes = 9) => `${prefix}_${crypto.randomBytes(bytes).toString("base64url")}`;
+const estimateTokens = (s) => Math.ceil(String(s || "").length / 3.6);
+
+function abortError(reason = "aborted") {
+  const e = new Error(reason);
+  e.name = "AbortError";
+  e.code = "ABORTED";
+  return e;
+}
+
+/** sleep annulable via AbortSignal */
+function sleep(ms, signal) {
+  if (!signal) return sleepRaw(ms);
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(abortError());
+    const t = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(t); reject(abortError()); };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function safeJsonParse(s, fallback = null) {
+  if (s === null || s === undefined || s === "") return fallback;
+  if (typeof s !== "string") return s;
+  try { return JSON.parse(s); } catch { return fallback; }
+}
+
+function safeJsonStringify(o, fallback = "{}") {
+  try {
+    const seen = new WeakSet();
+    return JSON.stringify(o, (_k, v) => {
+      if (typeof v === "bigint") return v.toString();
+      if (v && typeof v === "object") {
+        if (seen.has(v)) return "[Circular]";
+        seen.add(v);
+      }
+      return v;
+    });
+  } catch { return fallback; }
+}
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
+/** Combine plusieurs AbortSignal en un seul (Node 20+ a AbortSignal.any, fallback sinon). */
+function anySignal(signals) {
+  const list = signals.filter(Boolean);
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") return AbortSignal.any(list);
+  const c = new AbortController();
+  for (const s of list) {
+    if (s.aborted) { c.abort(s.reason); break; }
+    s.addEventListener("abort", () => c.abort(s.reason), { once: true });
+  }
+  return c.signal;
+}
+
+/** Cache TTL + LRU minimaliste (aucune dépendance). */
+class TTLCache {
+  constructor({ max = 1000, ttlMs = 60000 } = {}) {
+    this.max = max; this.ttlMs = ttlMs; this.map = new Map();
+  }
+  get(key) {
+    const e = this.map.get(key);
+    if (!e) return undefined;
+    if (e.exp <= now()) { this.map.delete(key); return undefined; }
+    this.map.delete(key); this.map.set(key, e); // LRU touch
+    return e.value;
+  }
+  set(key, value, ttlMs = this.ttlMs) {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, { value, exp: now() + ttlMs });
+    while (this.map.size > this.max) this.map.delete(this.map.keys().next().value);
+    return value;
+  }
+  delete(key) { return this.map.delete(key); }
+  clear() { this.map.clear(); }
+  get size() { return this.map.size; }
+  sweep() { const t = now(); for (const [k, e] of this.map) if (e.exp <= t) this.map.delete(k); }
+}
+
+// ----- Détection de langue légère (fr / en / sw / ln) -----
+const LANG_HINTS = {
+  fr: /\b(le|la|les|des|une|un|est|et|pour|avec|dans|que|qui|pas|bonjour|merci|comment|pourquoi|quel|quelle|je|tu|nous|vous)\b/gi,
+  en: /\b(the|and|is|are|for|with|that|this|what|how|why|hello|thanks|please|you|your|can|would)\b/gi,
+  sw: /\b(habari|asante|karibu|tafadhali|nini|jinsi|kwa|na|ya|wa|sana|mimi|wewe|ndiyo|hapana)\b/gi,
+  ln: /\b(mbote|matondi|boni|nini|nakosala|ndenge|mpo|na|ya|te|ee|ndeko|mama|tata|sango)\b/gi
+};
+function detectLanguage(text) {
+  const sample = String(text || "").slice(0, 600);
+  let best = "fr", bestScore = 0;
+  for (const [lang, re] of Object.entries(LANG_HINTS)) {
+    const score = (sample.match(re) || []).length;
+    if (score > bestScore) { best = lang; bestScore = score; }
+  }
+  return bestScore === 0 ? "fr" : best;
+}
+
+// ----- Nettoyage des sorties LLM -----
+function stripThinkTags(input) {
+  if (typeof input !== "string") return { text: "", thinking: "" };
+  const thinks = [];
+  const text = input
+    .replace(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi, (_m, inner) => { thinks.push(inner.trim()); return ""; })
+    .replace(/<think(?:ing)?>[\s\S]*$/i, "")
+    .trim();
+  return { text, thinking: thinks.join("\n---\n") };
+}
+
+function normalizeMath(input) {
+  if (typeof input !== "string" || !input) return "";
+  const parts = [];
+  const re = /```[\s\S]*?```|`[^`\n]*`/g;
+  let last = 0, m;
+  while ((m = re.exec(input)) !== null) {
+    if (m.index > last) parts.push([false, input.slice(last, m.index)]);
+    parts.push([true, m[0]]);
+    last = m.index + m[0].length;
+  }
+  if (last < input.length) parts.push([false, input.slice(last)]);
+  return parts.map(([isCode, c]) => {
+    if (isCode) return c;
+    return c
+      .replace(/\\\(([\s\S]*?)\\\)/g, (_x, i) => `$${i.trim()}$`)
+      .replace(/\\\[([\s\S]*?)\\\]/g, (_x, i) => `$$${i.trim()}$$`);
+  }).join("").trim();
+}
+
+const MOJIBAKE = [
+  [/Ã©/g, "é"], [/Ã¨/g, "è"], [/Ã /g, "à"], [/Ã¹/g, "ù"], [/Ã´/g, "ô"], [/Ã¢/g, "â"],
+  [/Ãª/g, "ê"], [/Ã®/g, "î"], [/Ã¯/g, "ï"], [/Ã§/g, "ç"], [/Â«/g, "«"], [/Â»/g, "»"],
+  [/â€™/g, "'"], [/â€œ/g, "\""], [/â€¦/g, "…"]
+];
+
+function cleanOutput(input) {
+  if (typeof input !== "string" || !input) return "";
+  let t = input
+    .replace(/[\uFEFF\u200B\u200C\u200D\u2060\u180E]/g, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/\r\n?/g, "\n");
+  for (const [re, rep] of MOJIBAKE) t = t.replace(re, rep);
+  t = t.split("\n").map((l) => l.replace(/\s+$/g, "")).join("\n").replace(/\n{3,}/g, "\n\n");
+  return t.trim();
+}
+
+function formatFinalReply(raw) {
+  if (!raw) return "";
+  const { text } = stripThinkTags(raw);
+  return cleanOutput(normalizeMath(text))
+    .replace(/^\s*(assistant|AI|Luba)\s*:\s*/i, "")
+    .trim();
+}
+
+/**
+ * Filtre STREAMING des balises <think>…</think> : sépare en temps réel le
+ * raisonnement (→ canal "reasoning") du texte visible (→ canal "token").
+ * Gère les balises coupées entre deux chunks.
+ */
+class ThinkFilter {
+  constructor() { this.inThink = false; this.buf = ""; }
+  push(chunk) {
+    const out = { text: "", reasoning: "" };
+    this.buf += chunk;
+    for (;;) {
+      if (this.inThink) {
+        const i = this.buf.search(/<\/think(?:ing)?>/i);
+        if (i === -1) {
+          const keep = Math.min(this.buf.length, 10);
+          out.reasoning += this.buf.slice(0, this.buf.length - keep);
+          this.buf = this.buf.slice(this.buf.length - keep);
+          return out;
+        }
+        out.reasoning += this.buf.slice(0, i);
+        this.buf = this.buf.slice(i).replace(/^<\/think(?:ing)?>/i, "");
+        this.inThink = false;
+      } else {
+        const i = this.buf.search(/<think(?:ing)?>/i);
+        if (i === -1) {
+          // garde une éventuelle balise partielle en fin de buffer
+          const lt = this.buf.lastIndexOf("<");
+          const cut = (lt !== -1 && this.buf.length - lt < 10) ? lt : this.buf.length;
+          out.text += this.buf.slice(0, cut);
+          this.buf = this.buf.slice(cut);
+          return out;
+        }
+        out.text += this.buf.slice(0, i);
+        this.buf = this.buf.slice(i).replace(/^<think(?:ing)?>/i, "");
+        this.inThink = true;
+      }
+    }
+  }
+  flush() {
+    const out = { text: this.inThink ? "" : this.buf, reasoning: this.inThink ? this.buf : "" };
+    this.buf = "";
+    return out;
+  }
+}
+
+// ----- Sécurité du texte entrant -----
+function sanitizeForLLM(input, maxLength) {
+  if (input === null || input === undefined) return "";
+  let t = String(input).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+  if (t.length > maxLength) t = t.slice(0, maxLength);
+  return t.trim();
+}
+
+const INJECTION_PATTERNS = [
+  /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions|prompts?)/i,
+  /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions|prompts?)/i,
+  /reveal\s+(your\s+)?(system\s+prompt|hidden\s+instructions)/i,
+  /ignore\s+(toutes?\s+)?(les\s+)?(instructions|consignes)\s+(précédentes|ci-dessus)/i
+];
+function detectPromptInjection(text) {
+  for (const p of INJECTION_PATTERNS) if (p.test(text)) return { detected: true, pattern: p.source.slice(0, 60) };
+  return { detected: false, pattern: null };
+}
+
+const MODERATION_PATTERNS = [
+  /\bhow\s+to\s+(kill|murder|assassinate)\s+(a\s+)?(person|someone|human)/i,
+  /\bhow\s+to\s+make\s+(a\s+)?(bomb|explosive|grenade)\b/i,
+  /\bchild\s+(porn|sexual|abuse)\b/i, /\bcsam\b/i
+];
+const moderateLocal = (text) => ({ safe: !MODERATION_PATTERNS.some((p) => p.test(text)) });
+
+// ================================================================================
+// §2 — CONFIGURATION CENTRALISÉE (gelée)
+// ================================================================================
+
+const envStr = (k, d = null) => (process.env[k] !== undefined && process.env[k] !== "" ? process.env[k] : d);
+const envInt = (k, d) => { const n = parseInt(process.env[k] ?? "", 10); return Number.isFinite(n) ? n : d; };
+const envFloat = (k, d) => { const n = parseFloat(process.env[k] ?? ""); return Number.isFinite(n) ? n : d; };
+const envBool = (k, d = false) => (process.env[k] === undefined ? d : /^(1|true|yes|on)$/i.test(process.env[k]));
+
+function deepFreeze(o) {
+  if (o && typeof o === "object" && !Object.isFrozen(o)) {
+    Object.freeze(o);
+    for (const v of Object.values(o)) deepFreeze(v);
+  }
+  return o;
+}
+
+const CONFIG = deepFreeze({
+  ENV: envStr("NODE_ENV", "production"),
+  VERSION: "17.0.0",
+  AGENT_NAME: "Luba",
+  HOST: envStr("HOST", "0.0.0.0"),
+  PORT: envInt("PORT", 3000),
+  INSTANCE_ID: envStr("INSTANCE_ID", `${os.hostname()}-${process.pid}`),
+  BRAND: { V100: envStr("BRAND_V100", "Mwamba"), V250: envStr("BRAND_V250", "Ngandu") },
+
+  PATHS: {
+    DATA: envStr("DATA_DIR", path.join(__dirname, "data")),
+    DB: envStr("DB_PATH", path.join(__dirname, "data", "luba.db")),
+    LOGS: path.join(__dirname, "logs")
+  },
+
+  LIMITS: {
+    MAX_MESSAGE_LENGTH: envInt("MAX_MESSAGE_LENGTH", 15000),
+    MAX_CONTEXT_MESSAGES: envInt("MAX_CONTEXT_MESSAGES", 24),
+    CONTEXT_TOKEN_BUDGET: envInt("CONTEXT_TOKEN_BUDGET", 14000),
+    MAX_IMAGES_PER_REQUEST: envInt("MAX_IMAGES_PER_REQUEST", 3),
+    MAX_IMAGE_SIZE_MB: envInt("MAX_IMAGE_SIZE_MB", 10),
+    MAX_PAGE_SIZE: envInt("MAX_PAGE_SIZE", 200)
+  },
+
+  // File d'attente / concurrence — le cœur de la stabilité sous charge
+  QUEUE: {
+    GLOBAL_CONCURRENCY: envInt("RUN_GLOBAL_CONCURRENCY", 24),
+    HEAVY_CONCURRENCY: envInt("RUN_HEAVY_CONCURRENCY", 6),
+    PER_USER_CONCURRENCY: envInt("RUN_PER_USER_CONCURRENCY", 2),
+    PER_USER_QUEUED: envInt("RUN_PER_USER_QUEUED", 4),
+    MAX_QUEUE: envInt("RUN_MAX_QUEUE", 400),
+    MAX_WAIT_MS: envInt("RUN_MAX_QUEUE_WAIT_MS", 120000),
+    EVENT_BUFFER: envInt("RUN_EVENT_BUFFER", 4000),
+    KEEP_FINISHED_MS: envInt("RUN_KEEP_FINISHED_MS", 120000),
+    CHECKPOINT_MS: envInt("RUN_CHECKPOINT_MS", 2000)
+  },
+
+  // Timeouts ADAPTATIFS : un modèle de raisonnement peut « réfléchir » longtemps
+  // sans qu'on le considère en panne tant que le flux reste vivant.
+  TIMEOUTS: {
+    LIGHT: {
+      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 25000),
+      IDLE_MS: envInt("LIGHT_IDLE_MS", 20000),
+      TOTAL_MS: envInt("LIGHT_TOTAL_MS", 120000)
+    },
+    HEAVY: {
+      FIRST_TOKEN_MS: envInt("HEAVY_FIRST_TOKEN_MS", 90000),
+      IDLE_MS: envInt("HEAVY_IDLE_MS", 60000),
+      TOTAL_MS: envInt("HEAVY_TOTAL_MS", 300000)
+    },
+    TOOL_MS: envInt("TOOL_TIMEOUT_MS", 15000),
+    HEARTBEAT_MS: envInt("SSE_HEARTBEAT_MS", 12000),
+    SHUTDOWN_DRAIN_MS: envInt("SHUTDOWN_DRAIN_MS", 25000)
+  },
+
+  AGENT: {
+    MAX_ITERATIONS: envInt("AGENT_MAX_ITERATIONS", 5),
+    MAX_TOOL_CALLS_PER_STEP: envInt("AGENT_MAX_TOOL_CALLS_PER_STEP", 6)
+  },
+
+  // Santé des providers — fenêtre glissante, pas de cumul infini
+  HEALTH: {
+    WINDOW: envInt("HEALTH_WINDOW", 20),
+    MIN_SAMPLES: envInt("HEALTH_MIN_SAMPLES", 6),
+    OPEN_FAIL_RATE: envFloat("HEALTH_OPEN_FAIL_RATE", 0.7),
+    COOLDOWN_MS: envInt("HEALTH_COOLDOWN_MS", 20000),
+    MAX_COOLDOWN_MS: envInt("HEALTH_MAX_COOLDOWN_MS", 120000),
+    KEY_COOLDOWN_MS: envInt("KEY_COOLDOWN_MS", 15000),
+    KEY_AUTH_COOLDOWN_MS: envInt("KEY_AUTH_COOLDOWN_MS", 600000)
+  },
+
+  RETRY: { MAX_PER_PROVIDER: envInt("RETRY_MAX_PER_PROVIDER", 1), BASE_MS: envInt("RETRY_BASE_MS", 250) },
+
+  RATE: {
+    IP: { capacity: envInt("RATE_IP_CAPACITY", 900), refillPerSec: envFloat("RATE_IP_REFILL", 60) },
+    CHAT: { capacity: envInt("RATE_CHAT_CAPACITY", 12), refillPerSec: envFloat("RATE_CHAT_REFILL", 0.5) },
+    SYNC: { capacity: envInt("RATE_SYNC_CAPACITY", 120), refillPerSec: envFloat("RATE_SYNC_REFILL", 10) },
+    API: { capacity: envInt("RATE_API_CAPACITY", 80), refillPerSec: envFloat("RATE_API_REFILL", 5) },
+    STRICT: { capacity: envInt("RATE_STRICT_CAPACITY", 10), refillPerSec: envFloat("RATE_STRICT_REFILL", 0.05) }
+  },
+
+  AUTH: {
+    TOKEN_CACHE_MAX_MS: envInt("AUTH_TOKEN_CACHE_MAX_MS", 300000),
+    CHECK_REVOKED: envBool("AUTH_CHECK_REVOKED", false),
+    USER_TOUCH_MS: envInt("AUTH_USER_TOUCH_MS", 600000),
+    MAX_FAILS_PER_IP: envInt("AUTH_MAX_FAILS_PER_IP", 30),
+    IP_BLOCK_MS: envInt("AUTH_IP_BLOCK_MS", 900000),
+    HMAC_SECRET: envStr("HMAC_SECRET", null),
+    HMAC_WINDOW_MS: 5 * 60 * 1000
+  },
+
+  SYNC: {
+    PAGE: envInt("SYNC_PAGE", 300),
+    RETENTION_DAYS: envInt("SYNC_RETENTION_DAYS", 60),
+    PURGE_DELETED_DAYS: envInt("PURGE_DELETED_DAYS", 30)
+  },
+
+  LOAD_SHED: {
+    LOOP_LAG_MS: envInt("LOAD_SHED_LOOP_LAG_MS", 400),
+    RSS_MB: envInt("LOAD_SHED_RSS_MB", 1800)
+  },
+
+  MIRROR: {
+    ENABLED: envBool("MIRROR_ENABLED", true),
+    BATCH: envInt("MIRROR_BATCH", 50),
+    MAX_ATTEMPTS: envInt("MIRROR_MAX_ATTEMPTS", 12)
+  },
+
+  MEMORY_EXTRACT: envBool("MEMORY_EXTRACT", true),
+  DEBUG_TOKEN: envStr("DEBUG_TOKEN", null),
+  METRICS_TOKEN: envStr("METRICS_TOKEN", null),
+  FAKE_LLM: envBool("FAKE_LLM", false)
+});
+
+const FIREBASE_CONFIG = deepFreeze({
+  apiKey: envStr("FIREBASE_API_KEY", null),
+  projectId: envStr("FIREBASE_PROJECT_ID", "luba-ia-636")
+});
+
+const ALLOWED_ORIGINS = (envStr("ALLOWED_ORIGINS", "") || "").split(",").map((s) => s.trim()).filter(Boolean);
+if (ALLOWED_ORIGINS.length === 0) {
+  ALLOWED_ORIGINS.push(
+    "https://luba.web.app", "https://luba-ia-636.web.app", "https://luba-ia-636.firebaseapp.com",
+    "https://milo-backend-sa1y.onrender.com", "http://localhost:3000", "http://localhost:8080",
+    "http://localhost:5173", "http://localhost:4200"
+  );
+}
+
+const USER_QUOTAS = deepFreeze({
+  FREE: { maxMessagesPerDay: 100, maxImagesPerDay: 20 },
+  PREMIUM: { maxMessagesPerDay: 1000, maxImagesPerDay: 200 },
+  ADMIN: { maxMessagesPerDay: 999999, maxImagesPerDay: 999999 }
+});
+
+// ================================================================================
+// §3 — LOGGER, ERREURS TYPÉES, MÉTRIQUES
+// ================================================================================
+
+function makeConsoleLogger() {
+  const levels = { debug: 10, info: 20, warn: 30, error: 40, fatal: 50 };
+  const min = levels[envStr("LOG_LEVEL", "info")] || 20;
+  const mk = (lvl) => (a, b) => {
+    if (levels[lvl] < min) return;
+    const obj = typeof a === "object" && a !== null ? a : {};
+    const msg = typeof a === "string" ? a : b;
+    process.stdout.write(`${JSON.stringify({ level: lvl, time: new Date().toISOString(), msg, ...obj })}\n`);
+  };
+  const l = { debug: mk("debug"), info: mk("info"), warn: mk("warn"), error: mk("error"), fatal: mk("fatal") };
+  l.child = () => l;
+  return l;
+}
+
+const logger = pino
+  ? pino({
+    level: envStr("LOG_LEVEL", "info"),
+    redact: { paths: ["req.headers.authorization", "headers.authorization", "token", "*.token", "*.apiKey", "*.password"], censor: "[redacted]" }
+  })
+  : makeConsoleLogger();
+
+class AppError extends Error {
+  constructor(code, message, { status = 500, retryable = false, retryAfterMs = null, details = null } = {}) {
+    super(message);
+    this.name = "AppError";
+    this.code = code;
+    this.status = status;
+    this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
+    this.details = details;
+  }
+}
+const Errors = {
+  badRequest: (code, msg) => new AppError(code, msg, { status: 400 }),
+  unauthorized: (code = "INVALID_TOKEN", msg = "Session invalide.") => new AppError(code, msg, { status: 401 }),
+  forbidden: (code, msg) => new AppError(code, msg, { status: 403 }),
+  notFound: (code, msg) => new AppError(code, msg, { status: 404 }),
+  conflict: (code, msg) => new AppError(code, msg, { status: 409 }),
+  tooMany: (code, msg, retryAfterMs) => new AppError(code, msg, { status: 429, retryable: true, retryAfterMs }),
+  busy: (msg, retryAfterMs = 5000) => new AppError("SERVER_BUSY", msg, { status: 503, retryable: true, retryAfterMs })
+};
+
+// ----- Métriques (no-op si prom-client absent) -----
+const metrics = (() => {
+  const noop = { inc() {}, set() {}, observe() {} };
+  if (!PromClient) return { enabled: false, registry: null, c: new Proxy({}, { get: () => noop }) };
+  const registry = new PromClient.Registry();
+  PromClient.collectDefaultMetrics({ register: registry });
+  const counter = (name, help, labelNames) => new PromClient.Counter({ name, help, labelNames, registers: [registry] });
+  const gauge = (name, help, labelNames = []) => new PromClient.Gauge({ name, help, labelNames, registers: [registry] });
+  const hist = (name, help, labelNames, buckets) => new PromClient.Histogram({ name, help, labelNames, buckets, registers: [registry] });
+  const mk = (m) => ({
+    inc: (l, v) => (l ? m.labels(...Object.values(l)).inc(v ?? 1) : m.inc(v ?? 1)),
+    set: (l, v) => (v === undefined ? m.set(l) : m.labels(...Object.values(l)).set(v)),
+    observe: (l, v) => (v === undefined ? m.observe(l) : m.labels(...Object.values(l)).observe(v))
+  });
+  const c = {
+    http: mk(counter("luba_http_requests_total", "Requêtes HTTP", ["method", "route", "status"])),
+    httpDur: mk(hist("luba_http_duration_seconds", "Durée HTTP", ["method", "route"], [0.01, 0.05, 0.1, 0.3, 1, 3, 10, 30])),
+    llm: mk(counter("luba_llm_calls_total", "Appels LLM", ["provider", "model", "outcome"])),
+    ttft: mk(hist("luba_llm_ttft_seconds", "Time to first token", ["provider", "model"], [0.3, 0.6, 1, 2, 5, 10, 30, 60, 120])),
+    runs: mk(counter("luba_runs_total", "Runs terminés", ["tier", "status"])),
+    runsActive: mk(gauge("luba_runs_active", "Runs actifs")),
+    queueDepth: mk(gauge("luba_queue_depth", "Profondeur de file")),
+    queueWait: mk(hist("luba_queue_wait_seconds", "Attente en file", [], [0.05, 0.5, 2, 5, 15, 60, 120])),
+    dbQueue: mk(gauge("luba_db_write_queue", "Écritures SQLite en attente")),
+    loopLag: mk(gauge("luba_event_loop_lag_ms", "Lag de la boucle d'événements")),
+    syncPush: mk(counter("luba_sync_push_total", "Événements de sync poussés", ["transport"])),
+    shed: mk(counter("luba_load_shed_total", "Requêtes rejetées (load shedding)", ["reason"]))
+  };
+  return { enabled: true, registry, c };
+})();
+const M = metrics.c;
+
+// ================================================================================
+// §4 — EVENT BUS (local + Redis pub/sub multi-instances)
+// ================================================================================
+
+class EventBus {
+  constructor() {
+    this.em = new EventEmitter();
+    this.em.setMaxListeners(0);
+    this.pub = null;
+    this.sub = null;
+    this.origin = CONFIG.INSTANCE_ID;
+  }
+
+  async attachRedis(url) {
+    if (!IORedis || !url) return false;
+    try {
+      this.pub = new IORedis(url, { maxRetriesPerRequest: null, enableOfflineQueue: false, lazyConnect: false });
+      this.sub = this.pub.duplicate();
+      this.pub.on("error", (e) => logger.warn({ err: e.message }, "redis pub error"));
+      this.sub.on("error", (e) => logger.warn({ err: e.message }, "redis sub error"));
+      await this.sub.subscribe("luba:events");
+      this.sub.on("message", (_ch, raw) => {
+        const m = safeJsonParse(raw);
+        if (!m || m.origin === this.origin) return;
+        this.em.emit(m.topic, m.payload);
+      });
+      logger.info("EventBus : Redis pub/sub actif");
+      return true;
+    } catch (e) {
+      logger.warn({ err: e.message }, "EventBus : Redis indisponible, mode local");
+      this.pub = this.sub = null;
+      return false;
+    }
+  }
+
+  publish(topic, payload, { local = true } = {}) {
+    if (local) this.em.emit(topic, payload);
+    if (this.pub && this.pub.status === "ready") {
+      this.pub.publish("luba:events", JSON.stringify({ origin: this.origin, topic, payload })).catch(() => {});
+    }
+  }
+
+  subscribe(topic, fn) {
+    this.em.on(topic, fn);
+    return () => this.em.off(topic, fn);
+  }
+
+  async close() {
+    try { await this.sub?.quit(); } catch {}
+    try { await this.pub?.quit(); } catch {}
+  }
+}
+const bus = new EventBus();
+
+// ================================================================================
+// §5 — BASE DE DONNÉES (SQLite WAL · file d'écriture unique · pool de lecteurs)
+// ================================================================================
+// Driver : `sqlite3` (déjà dans tes dépendances). Si absent, repli sur `node:sqlite`
+// (intégré à Node ≥ 22.5) — pratique pour les tests sans compilation native.
+
+const normParams = (p) => (p || []).map((v) => (v === undefined ? null : v));
+
+class SqliteConn {
+  constructor(raw, driver) { this.raw = raw; this.driver = driver; }
+
+  static async open(file) {
+    const sqlite3 = tryRequire("sqlite3");
+    if (sqlite3) {
+      const S = typeof sqlite3.verbose === "function" ? sqlite3.verbose() : sqlite3;
+      return new Promise((resolve, reject) => {
+        const raw = new S.Database(file, S.OPEN_READWRITE | S.OPEN_CREATE, (err) => (err ? reject(err) : resolve(new SqliteConn(raw, "sqlite3"))));
+      });
+    }
+    const ns = tryRequire("node:sqlite");
+    if (ns && ns.DatabaseSync) return new SqliteConn(new ns.DatabaseSync(file), "node:sqlite");
+    throw new Error("Aucun driver SQLite disponible (installe `sqlite3` ou utilise Node >= 22.5)");
+  }
+
+  run(sql, params = []) {
+    if (this.driver === "sqlite3") {
+      return new Promise((resolve, reject) => {
+        this.raw.run(sql, normParams(params), function onRun(err) { return err ? reject(err) : resolve({ changes: this.changes, lastID: this.lastID }); });
+      });
+    }
+    try {
+      const r = this.raw.prepare(sql).run(...normParams(params));
+      return Promise.resolve({ changes: Number(r.changes), lastID: Number(r.lastInsertRowid) });
+    } catch (e) { return Promise.reject(e); }
+  }
+
+  get(sql, params = []) {
+    if (this.driver === "sqlite3") {
+      return new Promise((resolve, reject) => this.raw.get(sql, normParams(params), (e, row) => (e ? reject(e) : resolve(row))));
+    }
+    try { return Promise.resolve(this.raw.prepare(sql).get(...normParams(params))); } catch (e) { return Promise.reject(e); }
+  }
+
+  all(sql, params = []) {
+    if (this.driver === "sqlite3") {
+      return new Promise((resolve, reject) => this.raw.all(sql, normParams(params), (e, rows) => (e ? reject(e) : resolve(rows || []))));
+    }
+    try { return Promise.resolve(this.raw.prepare(sql).all(...normParams(params))); } catch (e) { return Promise.reject(e); }
+  }
+
+  exec(sql) {
+    if (this.driver === "sqlite3") return new Promise((resolve, reject) => this.raw.exec(sql, (e) => (e ? reject(e) : resolve())));
+    try { this.raw.exec(sql); return Promise.resolve(); } catch (e) { return Promise.reject(e); }
+  }
+
+  close() {
+    if (this.driver === "sqlite3") return new Promise((resolve) => this.raw.close(() => resolve()));
+    try { this.raw.close(); } catch {}
+    return Promise.resolve();
+  }
+}
+
+class Database {
+  constructor(file, { readers = envInt("DB_READERS", 3) } = {}) {
+    this.file = file;
+    this.readerCount = readers;
+    this.writer = null;
+    this.readers = [];
+    this.rr = 0;
+    this.pending = 0;
+    this._tail = Promise.resolve();
+    this.slowMs = envInt("DB_SLOW_MS", 250);
+    this.closed = false;
+  }
+
+  async open() {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    this.writer = await SqliteConn.open(this.file);
+    await this.writer.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 10000;
+      PRAGMA foreign_keys = ON;
+      PRAGMA temp_store = MEMORY;
+      PRAGMA cache_size = -64000;
+      PRAGMA wal_autocheckpoint = 1000;
+    `);
+    await this.migrate();
+    for (let i = 0; i < this.readerCount; i++) {
+      const r = await SqliteConn.open(this.file);
+      await r.exec("PRAGMA busy_timeout = 10000; PRAGMA query_only = ON; PRAGMA cache_size = -32000;");
+      this.readers.push(r);
+    }
+    logger.info({ driver: this.writer.driver, readers: this.readers.length }, "SQLite prêt (WAL)");
+  }
+
+  /** Toutes les écritures passent par UNE file : zéro SQLITE_BUSY interne, ordre garanti. */
+  write(fn) {
+    this.pending++;
+    M.dbQueue.set(this.pending);
+    const started = now();
+    const run = async () => {
+      try { return await fn(this.writer); }
+      finally {
+        this.pending--;
+        M.dbQueue.set(this.pending);
+        const took = now() - started;
+        if (took > this.slowMs) logger.warn({ tookMs: took, pending: this.pending }, "écriture SQLite lente");
+      }
+    };
+    const result = this._tail.then(run);
+    this._tail = result.then(() => {}, () => {});
+    return result;
+  }
+
+  transaction(fn) {
+    return this.write(async (w) => {
+      await w.exec("BEGIN IMMEDIATE");
+      try {
+        const r = await fn(w);
+        await w.exec("COMMIT");
+        return r;
+      } catch (e) {
+        try { await w.exec("ROLLBACK"); } catch {}
+        throw e;
+      }
+    });
+  }
+
+  run(sql, params) { return this.write((w) => w.run(sql, params)); }
+  _reader() { const r = this.readers[this.rr++ % this.readers.length]; return r || this.writer; }
+  get(sql, params) { return this._reader().get(sql, params); }
+  all(sql, params) { return this._reader().all(sql, params); }
+
+  async health() {
+    const t = now();
+    await this.get("SELECT 1 AS ok");
+    return { ok: true, readMs: now() - t, writeQueue: this.pending };
+  }
+
+  async migrate() {
+    const w = this.writer;
+    await w.exec("CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)");
+    const done = new Set((await w.all("SELECT id FROM schema_migrations")).map((r) => r.id));
+    for (const m of MIGRATIONS) {
+      if (done.has(m.id)) continue;
+      const t = now();
+      logger.info({ migration: m.id }, "migration en cours…");
+      await w.exec("BEGIN IMMEDIATE");
+      try {
+        await m.up(w);
+        await w.run("INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)", [m.id, now()]);
+        await w.exec("COMMIT");
+        logger.info({ migration: m.id, ms: now() - t }, "migration OK");
+      } catch (e) {
+        try { await w.exec("ROLLBACK"); } catch {}
+        logger.fatal({ migration: m.id, err: e.message }, "migration ÉCHOUÉE");
+        throw e;
+      }
+    }
+  }
+
+  async close() {
+    this.closed = true;
+    try { await this._tail; } catch {}
+    try { await this.writer?.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {}
+    for (const r of this.readers) await r.close();
+    await this.writer?.close();
+  }
+}
+
+async function addColumn(w, table, column, ddl) {
+  const cols = await w.all(`PRAGMA table_info(${table})`);
+  if (!cols.some((c) => c.name === column)) await w.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+}
+
+const MIGRATIONS = [
+  // ---- v1 : schéma de base IDENTIQUE à la v16.5 (compatible avec ta base existante) ----
+  {
+    id: "001_baseline",
+    async up(w) {
+      await w.exec(`
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY, firebase_uid TEXT UNIQUE, email TEXT UNIQUE,
+          display_name TEXT, role TEXT DEFAULT 'FREE', email_verified INTEGER DEFAULT 0,
+          whatsapp_connected INTEGER DEFAULT 0, whatsapp_session_id TEXT,
+          preferred_language TEXT DEFAULT 'fr', last_seen_at INTEGER,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+          session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, firebase_uid TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          active_intent TEXT, intent_data TEXT, intent_expires_at INTEGER,
+          metadata TEXT DEFAULT '{}',
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id TEXT,
+          role TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
+          content TEXT NOT NULL, tool_calls TEXT, tool_call_id TEXT,
+          images TEXT DEFAULT '[]', metadata TEXT DEFAULT '{}',
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS user_quotas (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, date TEXT NOT NULL,
+          messages_count INTEGER DEFAULT 0, images_count INTEGER DEFAULT 0,
+          whatsapp_count INTEGER DEFAULT 0, emails_count INTEGER DEFAULT 0,
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          UNIQUE(user_id, date),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, ip_address TEXT,
+          success INTEGER DEFAULT 0, error_message TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        );
+        CREATE TABLE IF NOT EXISTS blocked_ips (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ip_address TEXT UNIQUE, reason TEXT,
+          strike_count INTEGER DEFAULT 1, blocked_until INTEGER,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        );
+        CREATE TABLE IF NOT EXISTS security_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, event_type TEXT NOT NULL,
+          details TEXT, fingerprint TEXT, ip_address TEXT, user_agent TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        );
+        CREATE TABLE IF NOT EXISTS user_memory (
+          user_id TEXT PRIMARY KEY, summary TEXT DEFAULT '',
+          messages_since_update INTEGER DEFAULT 0,
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS user_memory_facts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+          fact TEXT NOT NULL, category TEXT DEFAULT 'general', embedding TEXT,
+          confidence REAL DEFAULT 1.0, source_session TEXT,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000)
+        );
+        CREATE TABLE IF NOT EXISTS user_tasks (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+          title TEXT NOT NULL, notes TEXT, due_at INTEGER,
+          status TEXT DEFAULT 'pending', notified_at INTEGER,
+          created_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER DEFAULT (strftime('%s','now')*1000),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS user_long_term_memory (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+          key TEXT NOT NULL, value TEXT NOT NULL, category TEXT DEFAULT 'general',
+          confidence REAL DEFAULT 0.8, times_mentioned INTEGER DEFAULT 1,
+          first_seen INTEGER DEFAULT (strftime('%s','now')*1000),
+          last_seen INTEGER DEFAULT (strftime('%s','now')*1000),
+          UNIQUE(user_id, key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_firebase ON sessions(firebase_uid);
+        CREATE INDEX IF NOT EXISTS idx_facts_user ON user_memory_facts(user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_user_tasks_user ON user_tasks(user_id, status, due_at);
+        CREATE INDEX IF NOT EXISTS idx_ltm_user ON user_long_term_memory(user_id, last_seen DESC);
+        CREATE INDEX IF NOT EXISTS idx_security_user ON security_logs(user_id, event_type, created_at);
+      `);
+    }
+  },
+
+  // ---- v2 : numérotation des messages (idx), idempotence, état de conversation ----
+  {
+    id: "002_messages_idx_and_conv_state",
+    async up(w) {
+      await addColumn(w, "messages", "idx", "INTEGER");
+      await addColumn(w, "messages", "client_msg_id", "TEXT");
+      await addColumn(w, "messages", "run_id", "TEXT");
+      await addColumn(w, "messages", "status", "TEXT DEFAULT 'final'");
+      await addColumn(w, "messages", "updated_at", "INTEGER");
+      await addColumn(w, "sessions", "title", "TEXT");
+      await addColumn(w, "sessions", "deleted_at", "INTEGER");
+      await addColumn(w, "sessions", "msg_count", "INTEGER DEFAULT 0");
+      await addColumn(w, "sessions", "last_idx", "INTEGER DEFAULT 0");
+      await addColumn(w, "sessions", "last_preview", "TEXT");
+      await addColumn(w, "sessions", "last_role", "TEXT");
+      await addColumn(w, "sessions", "pinned", "INTEGER DEFAULT 0");
+      await addColumn(w, "sessions", "version", "INTEGER DEFAULT 0");
+
+      // Rattrapage des données existantes (une seule fois)
+      await w.exec(`
+        UPDATE messages SET idx = (
+          SELECT COUNT(*) FROM messages m2 WHERE m2.session_id = messages.session_id AND m2.id <= messages.id
+        ) WHERE idx IS NULL;
+        UPDATE messages SET updated_at = created_at WHERE updated_at IS NULL;
+        UPDATE messages SET status = 'final' WHERE status IS NULL;
+        UPDATE sessions SET
+          last_idx = COALESCE((SELECT MAX(idx) FROM messages WHERE messages.session_id = sessions.session_id), 0),
+          msg_count = (SELECT COUNT(*) FROM messages WHERE messages.session_id = sessions.session_id),
+          last_preview = (SELECT substr(content, 1, 160) FROM messages WHERE messages.session_id = sessions.session_id ORDER BY id DESC LIMIT 1),
+          last_role = (SELECT role FROM messages WHERE messages.session_id = sessions.session_id ORDER BY id DESC LIMIT 1),
+          title = COALESCE(title, (SELECT substr(content, 1, 60) FROM messages WHERE messages.session_id = sessions.session_id AND role = 'user' ORDER BY id ASC LIMIT 1));
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_session_idx ON messages(session_id, idx);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_client ON messages(session_id, client_msg_id) WHERE client_msg_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_live ON sessions(user_id, deleted_at, updated_at DESC);
+      `);
+    }
+  },
+
+  // ---- v3 : journal de synchronisation, runs, miroirs durables ----
+  {
+    id: "003_sync_runs_mirror",
+    async up(w) {
+      await w.exec(`
+        CREATE TABLE IF NOT EXISTS sync_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT NOT NULL,
+          ref INTEGER, op TEXT NOT NULL, ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_user_seq ON sync_log(user_id, seq);
+        CREATE TABLE IF NOT EXISTS runs (
+          run_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
+          user_idx INTEGER, assistant_idx INTEGER, tier TEXT, lane TEXT,
+          status TEXT NOT NULL, error_code TEXT, provider TEXT, model TEXT,
+          queued_at INTEGER, started_at INTEGER, finished_at INTEGER,
+          ttft_ms INTEGER, queue_ms INTEGER, tokens_out INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id, queued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+        CREATE TABLE IF NOT EXISTS mirror_queue (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, kind TEXT NOT NULL,
+          key TEXT NOT NULL, payload TEXT NOT NULL, attempts INTEGER DEFAULT 0,
+          next_attempt_at INTEGER NOT NULL, status TEXT DEFAULT 'pending', last_error TEXT,
+          created_at INTEGER NOT NULL, UNIQUE(target, key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mirror_due ON mirror_queue(status, next_attempt_at);
+        CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+      `);
+    }
+  }
+];
+
+const db = new Database(CONFIG.PATHS.DB);
+
+// ================================================================================
+// §6 — DÉPÔTS (accès données) — chaque écriture est transactionnelle
+// ================================================================================
+
+const mirrorState = { firestore: false, supabase: false };
+
+const preview = (s, n = 160) => String(s || "").replace(/\s+/g, " ").trim().slice(0, n);
+const msgKey = (convId, idx) => `${convId}:${idx}`;
+
+function rowToMessage(r) {
+  if (!r) return null;
+  return {
+    id: msgKey(r.session_id, r.idx),
+    dbId: r.id,
+    conversationId: r.session_id,
+    idx: r.idx,
+    role: r.role,
+    content: r.content,
+    status: r.status || "final",
+    runId: r.run_id || null,
+    clientMsgId: r.client_msg_id || null,
+    metadata: safeJsonParse(r.metadata, {}),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at || r.created_at
+  };
+}
+
+function rowToConversation(r) {
+  return {
+    conversationId: r.session_id,
+    title: r.title || null,
+    createdAt: new Date(r.created_at).toISOString(),
+    updatedAt: new Date(r.updated_at).toISOString(),
+    updatedAtMs: r.updated_at,
+    lastMessageRole: r.last_role || null,
+    lastMessagePreview: r.last_preview || null,
+    messageCount: r.msg_count || 0,
+    lastIdx: r.last_idx || 0,
+    pinned: Boolean(r.pinned),
+    version: r.version || 0
+  };
+}
+
+async function logSync(w, userId, convId, idx, op = "upsert") {
+  const ts = now();
+  if (idx !== null && idx !== undefined) {
+    await w.run("INSERT INTO sync_log (user_id, kind, session_id, ref, op, ts) VALUES (?, 'msg', ?, ?, ?, ?)", [userId, convId, idx, op, ts]);
+  }
+  const r = await w.run("INSERT INTO sync_log (user_id, kind, session_id, ref, op, ts) VALUES (?, 'conv', ?, NULL, ?, ?)", [userId, convId, op, ts]);
+  return r.lastID;
+}
+
+async function enqueueMirror(w, kind, key, doc) {
+  if (!CONFIG.MIRROR.ENABLED) return;
+  const targets = [];
+  if (mirrorState.firestore) targets.push("firestore");
+  if (mirrorState.supabase) targets.push("supabase");
+  const ts = now();
+  for (const target of targets) {
+    await w.run(
+      `INSERT INTO mirror_queue (target, kind, key, payload, next_attempt_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(target, key) DO UPDATE SET payload = excluded.payload, kind = excluded.kind,
+         attempts = 0, status = 'pending', next_attempt_at = excluded.next_attempt_at, last_error = NULL`,
+      [target, kind, key, safeJsonStringify(doc), ts, ts]
+    );
+  }
+}
+
+const repo = {
+  // ---------- Utilisateurs ----------
+  async ensureUser(uid, { email = null, displayName = null, emailVerified = false, role = null } = {}) {
+    const ts = now();
+    const upsert = (mail) => db.run(
+      `INSERT INTO users (id, firebase_uid, email, display_name, role, email_verified, last_seen_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         email = COALESCE(excluded.email, users.email),
+         display_name = COALESCE(excluded.display_name, users.display_name),
+         email_verified = excluded.email_verified,
+         last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at`,
+      [uid, uid, mail, displayName, role || "FREE", emailVerified ? 1 : 0, ts, ts, ts]
+    );
+    try { await upsert(email); }
+    catch (e) {
+      // Conflit UNIQUE(email) avec une ancienne ligne : on réessaie sans l'e-mail plutôt que de perdre l'utilisateur.
+      if (/UNIQUE|constraint/i.test(e.message)) await upsert(null);
+      else throw e;
+    }
+  },
+
+  async getUser(uid) { return db.get("SELECT * FROM users WHERE id = ?", [uid]); },
+
+  async setRole(uid, role) {
+    await db.run("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", [role, now(), uid]);
+  },
+
+  // ---------- Conversations ----------
+  /** Crée la conversation si besoin ; lève 403 si elle appartient à quelqu'un d'autre. */
+  async ensureConversation(userId, convId, { firebaseUid = null, title = null } = {}) {
+    const ts = now();
+    const ins = await db.run(
+      `INSERT OR IGNORE INTO sessions (session_id, user_id, firebase_uid, created_at, updated_at, title, last_idx, msg_count, version)
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)`,
+      [convId, userId, firebaseUid || userId, ts, ts, title]
+    );
+    const row = await db.writerGet("SELECT * FROM sessions WHERE session_id = ?", [convId]);
+    if (!row) throw Errors.notFound("CONVERSATION_NOT_FOUND", "Conversation introuvable.");
+    if (row.user_id !== userId && row.firebase_uid !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
+    if (row.deleted_at) throw Errors.notFound("CONVERSATION_DELETED", "Conversation supprimée.");
+    return { session: row, created: ins.changes > 0 };
+  },
+
+  async getConversation(userId, convId) {
+    const row = await db.get("SELECT * FROM sessions WHERE session_id = ?", [convId]);
+    if (!row) return null;
+    if (row.user_id !== userId && row.firebase_uid !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
+    return row;
+  },
+
+  async listConversations(userId, { limit = 50, beforeMs = null } = {}) {
+    const lim = clamp(limit, 1, CONFIG.LIMITS.MAX_PAGE_SIZE);
+    const rows = beforeMs
+      ? await db.all(
+        `SELECT * FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND updated_at < ? ORDER BY updated_at DESC LIMIT ?`,
+        [userId, beforeMs, lim])
+      : await db.all(
+        `SELECT * FROM sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT ?`,
+        [userId, lim]);
+    return rows.map(rowToConversation);
+  },
+
+  async renameConversation(userId, convId, { title = undefined, pinned = undefined }) {
+    return db.transaction(async (w) => {
+      const s = await w.get("SELECT user_id, deleted_at FROM sessions WHERE session_id = ?", [convId]);
+      if (!s || s.deleted_at) throw Errors.notFound("CONVERSATION_NOT_FOUND", "Conversation introuvable.");
+      if (s.user_id !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
+      const sets = ["version = version + 1", "updated_at = ?"];
+      const params = [now()];
+      if (title !== undefined) { sets.push("title = ?"); params.push(String(title).slice(0, 120)); }
+      if (pinned !== undefined) { sets.push("pinned = ?"); params.push(pinned ? 1 : 0); }
+      params.push(convId);
+      await w.run(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id = ?`, params);
+      return logSync(w, userId, convId, null);
+    });
+  },
+
+  async deleteConversation(userId, convId) {
+    return db.transaction(async (w) => {
+      const s = await w.get("SELECT user_id, deleted_at FROM sessions WHERE session_id = ?", [convId]);
+      if (!s) throw Errors.notFound("CONVERSATION_NOT_FOUND", "Conversation introuvable.");
+      if (s.user_id !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
+      if (!s.deleted_at) await w.run("UPDATE sessions SET deleted_at = ?, version = version + 1 WHERE session_id = ?", [now(), convId]);
+      const seq = await logSync(w, userId, convId, null, "delete");
+      await enqueueMirror(w, "session_delete", `s:${convId}`, { session_id: convId, user_id: userId });
+      return seq;
+    });
+  },
+
+  // ---------- Messages ----------
+  async appendMessage({ userId, convId, role, content, clientMsgId = null, runId = null, status = "final", metadata = null }) {
+    const out = await db.transaction(async (w) => {
+      if (clientMsgId) {
+        const dup = await w.get("SELECT * FROM messages WHERE session_id = ? AND client_msg_id = ?", [convId, clientMsgId]);
+        if (dup) return { message: rowToMessage(dup), duplicate: true, seq: null };
+      }
+      const s = await w.get("SELECT user_id, last_idx, deleted_at, title FROM sessions WHERE session_id = ?", [convId]);
+      if (!s || s.deleted_at) throw Errors.notFound("CONVERSATION_NOT_FOUND", "Conversation introuvable.");
+      if (s.user_id !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
+      const idx = (s.last_idx || 0) + 1;
+      const ts = now();
+      const r = await w.run(
+        `INSERT INTO messages (session_id, user_id, role, content, metadata, created_at, updated_at, idx, client_msg_id, run_id, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [convId, userId, role, content, safeJsonStringify(metadata || {}), ts, ts, idx, clientMsgId, runId, status]
+      );
+      const newTitle = !s.title && role === "user" ? preview(content, 60) : null;
+      await w.run(
+        `UPDATE sessions SET last_idx = ?, msg_count = msg_count + 1, last_preview = ?, last_role = ?,
+           updated_at = ?, version = version + 1, title = COALESCE(title, ?) WHERE session_id = ?`,
+        [idx, preview(content), role, ts, newTitle, convId]
+      );
+      const seq = await logSync(w, userId, convId, idx);
+      const message = rowToMessage({
+        id: r.lastID, session_id: convId, idx, role, content, status, run_id: runId,
+        client_msg_id: clientMsgId, metadata: safeJsonStringify(metadata || {}), created_at: ts, updated_at: ts
+      });
+      if (status === "final") {
+        await enqueueMirror(w, "message", msgKey(convId, idx), { ...message, user_id: userId });
+        await enqueueMirror(w, "session", `s:${convId}`, { session_id: convId, user_id: userId, updated_at: ts, title: s.title || newTitle });
+      }
+      return { message, duplicate: false, seq };
+    });
+    if (out.seq) bus.publish(`user:${userId}`, { type: "sync", seq: out.seq, conversationId: convId });
+    return out;
+  },
+
+  /** Mise à jour finale d'un message (fin de génération) : journalisée + miroir. */
+  async finalizeMessage({ userId, convId, idx, content, status = "final", metadata = null }) {
+    const seq = await db.transaction(async (w) => {
+      const ts = now();
+      const r = await w.run(
+        `UPDATE messages SET content = ?, status = ?, updated_at = ?, metadata = COALESCE(?, metadata)
+         WHERE session_id = ? AND idx = ? AND user_id = ?`,
+        [content, status, ts, metadata ? safeJsonStringify(metadata) : null, convId, idx, userId]
+      );
+      if (r.changes === 0) throw Errors.notFound("MESSAGE_NOT_FOUND", "Message introuvable.");
+      await w.run(
+        `UPDATE sessions SET last_preview = CASE WHEN last_idx = ? THEN ? ELSE last_preview END,
+           updated_at = ?, version = version + 1 WHERE session_id = ?`,
+        [idx, preview(content), ts, convId]
+      );
+      const s = await logSync(w, userId, convId, idx);
+      const row = await w.get("SELECT * FROM messages WHERE session_id = ? AND idx = ?", [convId, idx]);
+      await enqueueMirror(w, "message", msgKey(convId, idx), { ...rowToMessage(row), user_id: userId });
+      return s;
+    });
+    bus.publish(`user:${userId}`, { type: "sync", seq, conversationId: convId });
+    return seq;
+  },
+
+  /** Point de contrôle léger (sans journal ni miroir) pour survivre à un crash. */
+  async checkpointMessage(convId, idx, content) {
+    await db.run("UPDATE messages SET content = ?, updated_at = ? WHERE session_id = ? AND idx = ? AND status = 'streaming'", [content, now(), convId, idx]);
+  },
+
+  async getMessages(userId, convId, { afterIdx = 0, beforeIdx = null, limit = 100 } = {}) {
+    const s = await repo.getConversation(userId, convId);
+    if (!s) return { messages: [], hasMore: false, lastIdx: 0 };
+    const lim = clamp(limit, 1, CONFIG.LIMITS.MAX_PAGE_SIZE * 2);
+    let rows;
+    if (beforeIdx) {
+      rows = await db.all("SELECT * FROM messages WHERE session_id = ? AND idx < ? ORDER BY idx DESC LIMIT ?", [convId, beforeIdx, lim + 1]);
+      const hasMore = rows.length > lim;
+      return { messages: rows.slice(0, lim).reverse().map(rowToMessage), hasMore, lastIdx: s.last_idx || 0 };
+    }
+    if (afterIdx) {
+      rows = await db.all("SELECT * FROM messages WHERE session_id = ? AND idx > ? ORDER BY idx ASC LIMIT ?", [convId, afterIdx, lim + 1]);
+      return { messages: rows.slice(0, lim).map(rowToMessage), hasMore: rows.length > lim, lastIdx: s.last_idx || 0 };
+    }
+    rows = await db.all("SELECT * FROM messages WHERE session_id = ? ORDER BY idx DESC LIMIT ?", [convId, lim + 1]);
+    return { messages: rows.slice(0, lim).reverse().map(rowToMessage), hasMore: rows.length > lim, lastIdx: s.last_idx || 0 };
+  },
+
+  /** Contexte LLM : derniers messages « finaux », dans l'ordre idx. */
+  async getContext(convId, limit) {
+    const rows = await db.all(
+      `SELECT role, content, idx FROM messages
+       WHERE session_id = ? AND status IN ('final','interrupted') AND role IN ('user','assistant') AND content <> ''
+       ORDER BY idx DESC LIMIT ?`, [convId, limit]);
+    return rows.reverse();
+  },
+
+  // ---------- Sync ----------
+  async currentSeq(userId) {
+    const r = await db.get("SELECT COALESCE(MAX(seq), 0) AS m FROM sync_log WHERE user_id = ?", [userId]);
+    return r?.m || 0;
+  },
+
+  async syncDelta(userId, since, limit) {
+    const prunedRow = await db.get("SELECT value FROM kv WHERE key = 'sync_pruned_upto'");
+    const prunedUpTo = parseInt(prunedRow?.value || "0", 10);
+    if (since < prunedUpTo) return { resyncRequired: true };
+    const rows = await db.all(
+      "SELECT seq, kind, session_id, ref, op FROM sync_log WHERE user_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+      [userId, since, limit + 1]
+    );
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const cursor = page.length ? page[page.length - 1].seq : since;
+    if (page.length === 0) return { cursor, hasMore: false, conversations: [], messages: [], deletedConversations: [] };
+
+    const convIds = new Set(); const deleted = new Set(); const msgRefs = new Map();
+    for (const r of page) {
+      if (r.kind === "conv") { if (r.op === "delete") deleted.add(r.session_id); else convIds.add(r.session_id); }
+      else if (r.kind === "msg" && r.op === "upsert") {
+        if (!msgRefs.has(r.session_id)) msgRefs.set(r.session_id, new Set());
+        msgRefs.get(r.session_id).add(r.ref);
+      }
+    }
+    for (const id of deleted) { convIds.delete(id); msgRefs.delete(id); }
+
+    const conversations = [];
+    const ids = [...convIds];
+    for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      const q = await db.all(
+        `SELECT * FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND session_id IN (${chunk.map(() => "?").join(",")})`,
+        [userId, ...chunk]);
+      conversations.push(...q.map(rowToConversation));
+    }
+    const messages = [];
+    for (const [sid, set] of msgRefs) {
+      const refs = [...set];
+      for (let i = 0; i < refs.length; i += 400) {
+        const chunk = refs.slice(i, i + 400);
+        const q = await db.all(
+          `SELECT * FROM messages WHERE session_id = ? AND user_id = ? AND idx IN (${chunk.map(() => "?").join(",")}) ORDER BY idx ASC`,
+          [sid, userId, ...chunk]);
+        messages.push(...q.map(rowToMessage));
+      }
+    }
+    return { cursor, hasMore, conversations, messages, deletedConversations: [...deleted] };
+  },
+
+  // ---------- Quotas ATOMIQUES (plus de course check-puis-incrément) ----------
+  async reserveQuota(userId, action, role = "FREE") {
+    const col = { message: "messages_count", image: "images_count" }[action];
+    if (!col) return { allowed: true };
+    const limits = USER_QUOTAS[role] || USER_QUOTAS.FREE;
+    const max = action === "message" ? limits.maxMessagesPerDay : limits.maxImagesPerDay;
+    const date = todayKey();
+    return db.transaction(async (w) => {
+      await w.run("INSERT INTO user_quotas (user_id, date, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id, date) DO NOTHING", [userId, date, now()]);
+      const r = await w.run(`UPDATE user_quotas SET ${col} = ${col} + 1, updated_at = ? WHERE user_id = ? AND date = ? AND ${col} < ?`, [now(), userId, date, max]);
+      const row = await w.get(`SELECT ${col} AS c FROM user_quotas WHERE user_id = ? AND date = ?`, [userId, date]);
+      if (r.changes === 0) return { allowed: false, current: row?.c || 0, max, message: `Limite quotidienne atteinte (${max}). Réessayez demain ou passez Premium.` };
+      return { allowed: true, current: row?.c || 0, max, remaining: max - (row?.c || 0) };
+    });
+  },
+
+  async refundQuota(userId, action) {
+    const col = { message: "messages_count", image: "images_count" }[action];
+    if (!col) return;
+    await db.run(`UPDATE user_quotas SET ${col} = MAX(${col} - 1, 0) WHERE user_id = ? AND date = ?`, [userId, todayKey()]);
+  },
+
+  async getQuota(userId) {
+    return (await db.get("SELECT * FROM user_quotas WHERE user_id = ? AND date = ?", [userId, todayKey()]))
+      || { messages_count: 0, images_count: 0, whatsapp_count: 0, emails_count: 0 };
+  },
+
+  // ---------- Mémoire utilisateur ----------
+  async memoryBlock(userId) {
+    const [summary, facts, ltm] = await Promise.all([
+      db.get("SELECT summary FROM user_memory WHERE user_id = ?", [userId]).catch(() => null),
+      db.all("SELECT fact, category FROM user_memory_facts WHERE user_id = ? ORDER BY confidence DESC, updated_at DESC LIMIT 15", [userId]).catch(() => []),
+      db.all("SELECT key, value FROM user_long_term_memory WHERE user_id = ? ORDER BY times_mentioned DESC, last_seen DESC LIMIT 15", [userId]).catch(() => [])
+    ]);
+    const lines = [];
+    if (summary?.summary) lines.push(`Résumé : ${summary.summary.slice(0, 800)}`);
+    for (const f of facts) lines.push(`- (${f.category}) ${f.fact}`);
+    for (const f of ltm) lines.push(`- ${f.key} : ${f.value}`);
+    return lines.length ? `[MÉMOIRE SUR CET UTILISATEUR]\n${lines.join("\n")}` : "";
+  },
+
+  async listFacts(userId) {
+    const rows = await db.all("SELECT id, fact, category, confidence, created_at FROM user_memory_facts WHERE user_id = ? ORDER BY created_at DESC LIMIT 200", [userId]);
+    const grouped = {};
+    for (const r of rows) (grouped[r.category || "general"] ||= []).push(r);
+    return { facts: rows, grouped, total: rows.length };
+  },
+
+  async addFact(userId, fact, category = "general", sourceSession = null) {
+    const f = String(fact || "").trim().slice(0, 300);
+    if (!f) return false;
+    const exists = await db.get("SELECT id FROM user_memory_facts WHERE user_id = ? AND fact = ?", [userId, f]);
+    if (exists) { await db.run("UPDATE user_memory_facts SET updated_at = ? WHERE id = ?", [now(), exists.id]); return false; }
+    await db.run("INSERT INTO user_memory_facts (user_id, fact, category, source_session, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [userId, f, category, sourceSession, now(), now()]);
+    return true;
+  },
+
+  async deleteFact(userId, id) { return (await db.run("DELETE FROM user_memory_facts WHERE id = ? AND user_id = ?", [id, userId])).changes > 0; },
+  async clearFacts(userId) {
+    await db.run("DELETE FROM user_memory_facts WHERE user_id = ?", [userId]);
+    await db.run("DELETE FROM user_memory WHERE user_id = ?", [userId]);
+  },
+
+  // ---------- Tâches ----------
+  async listTasks(userId, status = null) {
+    return status
+      ? db.all("SELECT * FROM user_tasks WHERE user_id = ? AND status = ? ORDER BY COALESCE(due_at, 9e15) ASC LIMIT 200", [userId, status])
+      : db.all("SELECT * FROM user_tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT 200", [userId]);
+  },
+  async createTask(userId, { title, notes = null, dueAt = null }) {
+    const id = newId("task");
+    await db.run("INSERT INTO user_tasks (id, user_id, title, notes, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [id, userId, String(title).slice(0, 300), notes ? String(notes).slice(0, 2000) : null, dueAt, now(), now()]);
+    return db.get("SELECT * FROM user_tasks WHERE id = ?", [id]);
+  },
+  async setTaskStatus(userId, id, status) { return (await db.run("UPDATE user_tasks SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?", [status, now(), id, userId])).changes > 0; },
+  async deleteTask(userId, id) { return (await db.run("DELETE FROM user_tasks WHERE id = ? AND user_id = ?", [id, userId])).changes > 0; },
+
+  // ---------- Runs ----------
+  async insertRun(r) {
+    await db.run(
+      `INSERT INTO runs (run_id, user_id, session_id, user_idx, assistant_idx, tier, lane, status, queued_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.runId, r.userId, r.convId, r.userIdx, r.assistantIdx, r.tier, r.lane, "queued", now()]);
+  },
+  async updateRun(runId, patch) {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    await db.run(`UPDATE runs SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE run_id = ?`, [...keys.map((k) => patch[k]), runId]);
+  },
+
+  // ---------- Récupération après crash ----------
+  async recoverOrphans() {
+    const orphans = await db.all("SELECT session_id, idx, user_id FROM messages WHERE status = 'streaming'");
+    for (const o of orphans) {
+      await db.transaction(async (w) => {
+        await w.run("UPDATE messages SET status = 'interrupted', updated_at = ? WHERE session_id = ? AND idx = ?", [now(), o.session_id, o.idx]);
+        await logSync(w, o.user_id, o.session_id, o.idx);
+      });
+    }
+    const r = await db.run("UPDATE runs SET status = 'interrupted', finished_at = ? WHERE status IN ('queued','running')", [now()]);
+    if (orphans.length || r.changes) logger.warn({ messages: orphans.length, runs: r.changes }, "récupération après arrêt brutal");
+  },
+
+  // ---------- Entretien ----------
+  async housekeeping() {
+    const t = now();
+    const pruneBefore = t - CONFIG.SYNC.RETENTION_DAYS * 86400000;
+    const maxPruned = await db.get("SELECT COALESCE(MAX(seq), 0) AS m FROM sync_log WHERE ts < ?", [pruneBefore]);
+    if (maxPruned?.m) {
+      await db.run("DELETE FROM sync_log WHERE seq <= ?", [maxPruned.m]);
+      await db.run("INSERT INTO kv (key, value) VALUES ('sync_pruned_upto', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [String(maxPruned.m)]);
+    }
+    await db.run("DELETE FROM sessions WHERE deleted_at IS NOT NULL AND deleted_at < ?", [t - CONFIG.SYNC.PURGE_DELETED_DAYS * 86400000]);
+    await db.run("DELETE FROM login_attempts WHERE created_at < ?", [t - 7 * 86400000]);
+    await db.run("DELETE FROM security_logs WHERE created_at < ?", [t - 90 * 86400000]);
+    await db.run("DELETE FROM runs WHERE queued_at < ?", [t - 14 * 86400000]);
+    await db.run("DELETE FROM mirror_queue WHERE status = 'dead' AND created_at < ?", [t - 7 * 86400000]);
+    await db.write((w) => w.exec("PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;"));
+  }
+};
+
+// lecture « read-your-writes » : passe par la connexion d'écriture (file ordonnée)
+Database.prototype.writerGet = function writerGet(sql, params) { return this.write((w) => w.get(sql, params)); };
+
+// ================================================================================
+// §7 — AUTHENTIFICATION (cache borné par `exp`, single-flight, zéro écriture/req)
+// ================================================================================
+
+let firebaseApp = null;
+let firestoreDb = null;
+let supabaseClient = null;
+
+function parseServiceAccount(raw) {
+  if (!raw) return null;
+  let txt = String(raw).trim();
+  if (!txt.startsWith("{")) { try { txt = Buffer.from(txt, "base64").toString("utf8"); } catch {} }
+  const sa = safeJsonParse(txt);
+  if (sa?.private_key) sa.private_key = String(sa.private_key).replace(/\\n/g, "\n");
+  return sa;
+}
+
+function initFirebase() {
+  if (!firebaseAdmin) { logger.warn("firebase-admin absent : vérification REST uniquement"); return; }
+  const sa = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  if (!sa) { logger.warn("FIREBASE_SERVICE_ACCOUNT_JSON absent : vérification REST uniquement"); return; }
+  try {
+    firebaseApp = (firebaseAdmin.apps && firebaseAdmin.apps.length)
+      ? firebaseAdmin.app()
+      : firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert(sa), projectId: sa.project_id || FIREBASE_CONFIG.projectId });
+    firestoreDb = firebaseAdmin.firestore(firebaseApp);
+    mirrorState.firestore = envBool("MIRROR_FIRESTORE", true);
+    logger.info("Firebase Admin initialisé");
+  } catch (e) {
+    firebaseApp = null; firestoreDb = null;
+    logger.error({ err: e.message }, "Init Firebase échouée");
+  }
+}
+
+function initSupabase() {
+  if (!supabaseLib || !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) return;
+  try {
+    supabaseClient = supabaseLib.createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, { auth: { persistSession: false } });
+    mirrorState.supabase = envBool("MIRROR_SUPABASE", false);
+    logger.info("Supabase initialisé (miroir)");
+  } catch (e) { logger.error({ err: e.message }, "Init Supabase échouée"); }
+}
+
+const ROLE_RANK = { FREE: 0, PREMIUM: 1, ADMIN: 2 };
+const higherRole = (a, b) => ((ROLE_RANK[a] ?? 0) >= (ROLE_RANK[b] ?? 0) ? a : b);
+const normRole = (r) => (ROLE_RANK[String(r || "").toUpperCase()] !== undefined ? String(r).toUpperCase() : "FREE");
+
+function jwtExpMs(token) {
+  try {
+    const p = JSON.parse(Buffer.from(String(token).split(".")[1], "base64url").toString("utf8"));
+    return p.exp ? p.exp * 1000 : null;
+  } catch { return null; }
+}
+
+const tokenCache = new TTLCache({ max: 10000, ttlMs: CONFIG.AUTH.TOKEN_CACHE_MAX_MS });
+const inflightVerify = new Map();
+
+async function verifyTokenUncached(token) {
+  let adminErr = null;
+  if (firebaseApp && firebaseAdmin) {
+    try {
+      const d = await firebaseAdmin.auth(firebaseApp).verifyIdToken(token, CONFIG.AUTH.CHECK_REVOKED);
+      return { uid: d.uid, email: d.email || null, displayName: d.name || null, emailVerified: Boolean(d.email_verified), role: normRole(d.role), source: "admin_sdk" };
+    } catch (e) {
+      adminErr = e;
+      const code = e?.code || "";
+      if (code === "auth/id-token-expired") throw Errors.unauthorized("TOKEN_EXPIRED", "Session expirée, reconnectez-vous.");
+      if (["auth/id-token-revoked", "auth/argument-error", "auth/invalid-id-token"].includes(code)) throw Errors.unauthorized("INVALID_TOKEN", "Session invalide.");
+      logger.warn({ code }, "Admin SDK indisponible → repli REST");
+    }
+  }
+  if (!FIREBASE_CONFIG.apiKey) {
+    throw new AppError("AUTH_UNAVAILABLE", "Service d'authentification indisponible.", { status: 503, retryable: true, retryAfterMs: 3000 });
+  }
+  try {
+    const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_CONFIG.apiKey}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idToken: token }), signal: AbortSignal.timeout(8000)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.users?.length) {
+      const u = data.users[0];
+      return { uid: u.localId, email: u.email || null, displayName: u.displayName || null, emailVerified: Boolean(u.emailVerified), role: "FREE", source: "rest" };
+    }
+    const msg = data?.error?.message || "";
+    if (/EXPIRED/i.test(msg)) throw Errors.unauthorized("TOKEN_EXPIRED", "Session expirée, reconnectez-vous.");
+    if (res.status >= 500) throw new Error(`identitytoolkit ${res.status}`);
+    throw Errors.unauthorized("INVALID_TOKEN", "Session invalide.");
+  } catch (e) {
+    if (e instanceof AppError) throw e;
+    // PANNE d'infrastructure ≠ token invalide : on renvoie 503 (le client réessaie) et non 401 (qui déconnecte).
+    logger.error({ err: e.message, adminErr: adminErr?.message }, "vérification de token impossible (infra)");
+    throw new AppError("AUTH_UNAVAILABLE", "Service d'authentification momentanément indisponible.", { status: 503, retryable: true, retryAfterMs: 3000 });
+  }
+}
+
+async function verifyToken(token) {
+  const key = sha256(token);
+  const hit = tokenCache.get(key);
+  if (hit) return hit;
+  if (inflightVerify.has(key)) return inflightVerify.get(key);
+  const p = (async () => {
+    const user = await verifyTokenUncached(token);
+    const exp = jwtExpMs(token);
+    let ttl = CONFIG.AUTH.TOKEN_CACHE_MAX_MS;
+    if (exp) ttl = Math.min(ttl, exp - now() - 30000);   // ne JAMAIS garder un token au-delà de son expiration
+    if (ttl > 1000) tokenCache.set(key, user, ttl);
+    return user;
+  })().finally(() => inflightVerify.delete(key));
+  inflightVerify.set(key, p);
+  return p;
+}
+
+// ----- IP : blocage en mémoire (chargé depuis SQLite au démarrage) -----
+const blockedIps = new TTLCache({ max: 10000, ttlMs: CONFIG.AUTH.IP_BLOCK_MS });
+const authFails = new TTLCache({ max: 50000, ttlMs: 15 * 60 * 1000 });
+
+async function loadBlockedIps() {
+  const rows = await db.all("SELECT ip_address, blocked_until FROM blocked_ips WHERE blocked_until > ?", [now()]).catch(() => []);
+  for (const r of rows) blockedIps.set(r.ip_address, true, r.blocked_until - now());
+}
+
+function noteAuthFailure(ip, err) {
+  if (!(err instanceof AppError) || err.code === "TOKEN_EXPIRED" || err.status >= 500) return; // expirations / pannes ≠ attaque
+  const n = (authFails.get(ip) || 0) + 1;
+  authFails.set(ip, n);
+  if (n >= CONFIG.AUTH.MAX_FAILS_PER_IP && !blockedIps.get(ip)) {
+    blockedIps.set(ip, true, CONFIG.AUTH.IP_BLOCK_MS);
+    db.run(
+      `INSERT INTO blocked_ips (ip_address, reason, strike_count, blocked_until, created_at) VALUES (?, 'auth_failures', 1, ?, ?)
+       ON CONFLICT(ip_address) DO UPDATE SET strike_count = strike_count + 1, blocked_until = excluded.blocked_until`,
+      [ip, now() + CONFIG.AUTH.IP_BLOCK_MS, now()]).catch(() => {});
+    logSecurity(null, "IP_BLOCKED", { ip, fails: n }, ip);
+  }
+}
+
+function logSecurity(userId, type, details = {}, ip = null, ua = null) {
+  db.run("INSERT INTO security_logs (user_id, event_type, details, ip_address, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [userId, type, safeJsonStringify(details), ip, ua, now()]).catch(() => {});
+}
+
+// ----- Profil utilisateur : créé AVANT la requête (corrige la FK qui perdait le 1er message) -----
+const userProfiles = new TTLCache({ max: 20000, ttlMs: CONFIG.AUTH.USER_TOUCH_MS });
+const inflightTouch = new Map();
+
+async function touchUser(user) {
+  const hit = userProfiles.get(user.uid);
+  if (hit) return hit;
+  if (inflightTouch.has(user.uid)) return inflightTouch.get(user.uid);
+  const p = (async () => {
+    await repo.ensureUser(user.uid, { email: user.email, displayName: user.displayName, emailVerified: user.emailVerified, role: user.role });
+    const row = await repo.getUser(user.uid);
+    const profile = { role: higherRole(normRole(row?.role), normRole(user.role)), displayName: row?.display_name || user.displayName };
+    userProfiles.set(user.uid, profile);
+    return profile;
+  })().finally(() => inflightTouch.delete(user.uid));
+  inflightTouch.set(user.uid, p);
+  return p;
+}
+
+function authenticate({ allowQueryToken = false } = {}) {
+  return async (req, res, next) => {
+    try {
+      if (blockedIps.get(req.ip)) throw Errors.forbidden("IP_BLOCKED", "Accès refusé.");
+      const h = req.headers.authorization || "";
+      let token = h.startsWith("Bearer ") ? h.slice(7).trim() : null;
+      if (!token && allowQueryToken && typeof req.query.access_token === "string") token = req.query.access_token;
+      if (!token) throw Errors.unauthorized("MISSING_TOKEN", "Authentification requise.");
+      let user;
+      try { user = await verifyToken(token); } catch (e) { noteAuthFailure(req.ip, e); throw e; }
+      const profile = await touchUser(user);
+      req.userId = user.uid;
+      req.firebaseUid = user.uid;
+      req.userRole = profile.role;
+      req.userEmail = user.email;
+      req.displayName = profile.displayName;
+      return next();
+    } catch (e) { return sendError(req, res, e); }
+  };
+}
+
+const requireRole = (...roles) => (req, res, next) => (
+  roles.includes(req.userRole) ? next() : sendError(req, res, Errors.forbidden("FORBIDDEN", "Accès réservé."))
+);
+
+function verifyHmac(req) {
+  const secret = CONFIG.AUTH.HMAC_SECRET;
+  if (!secret) return true;
+  const sig = String(req.headers["x-luba-signature"] || "");
+  const ts = parseInt(req.headers["x-luba-timestamp"] || "", 10);
+  if (!sig || !Number.isFinite(ts) || Math.abs(now() - ts) > CONFIG.AUTH.HMAC_WINDOW_MS) return false;
+  const payload = `${ts}.${req.method}.${req.originalUrl}.${safeJsonStringify(req.body || {})}`;
+  const hex = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  const b64 = crypto.createHmac("sha256", secret).update(payload).digest("base64");
+  const eq = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  return eq(sig, hex) || eq(sig, b64);
+}
+
+// ================================================================================
+// §8 — RATE LIMIT PAR UTILISATEUR (token bucket) + LOAD SHEDDING
+// ================================================================================
+
+class TokenBucketLimiter {
+  constructor({ capacity, refillPerSec }) {
+    this.cap = capacity; this.refill = refillPerSec;
+    this.buckets = new TTLCache({ max: 100000, ttlMs: 10 * 60 * 1000 });
+  }
+  take(key, cost = 1) {
+    const t = now();
+    const b = this.buckets.get(key) || { tokens: this.cap, ts: t };
+    b.tokens = Math.min(this.cap, b.tokens + ((t - b.ts) / 1000) * this.refill);
+    b.ts = t;
+    const ok = b.tokens >= cost;
+    if (ok) b.tokens -= cost;
+    this.buckets.set(key, b);
+    return { ok, remaining: Math.floor(b.tokens), retryAfterMs: ok ? 0 : Math.ceil(((cost - b.tokens) / this.refill) * 1000) };
+  }
+}
+
+const limiters = Object.fromEntries(Object.entries(CONFIG.RATE).map(([k, v]) => [k, new TokenBucketLimiter(v)]));
+
+/** `scope` = IP (avant auth) ou user (après auth) : derrière un NAT mobile, l'IP est partagée → on limite par compte. */
+function rateLimit(name, { by = "user" } = {}) {
+  const lim = limiters[name];
+  return (req, res, next) => {
+    const key = `${name}:${by === "ip" ? req.ip : (req.userId || req.ip)}`;
+    const r = lim.take(key);
+    res.setHeader("RateLimit-Remaining", String(r.remaining));
+    if (r.ok) return next();
+    res.setHeader("Retry-After", String(Math.ceil(r.retryAfterMs / 1000)));
+    return sendError(req, res, Errors.tooMany("RATE_LIMIT", "Trop de requêtes, patientez un instant.", r.retryAfterMs));
+  };
+}
+
+const loadState = { lagMs: 0, rssMb: 0, shedding: false };
+const loopHist = monitorEventLoopDelay({ resolution: 20 });
+
+function startLoadMonitor() {
+  loopHist.enable();
+  const t = setInterval(() => {
+    loadState.lagMs = Math.round(loopHist.mean / 1e6);
+    loopHist.reset();
+    loadState.rssMb = Math.round(process.memoryUsage().rss / 1048576);
+    loadState.shedding = loadState.lagMs > CONFIG.LOAD_SHED.LOOP_LAG_MS || loadState.rssMb > CONFIG.LOAD_SHED.RSS_MB;
+    M.loopLag.set(loadState.lagMs);
+  }, 1000);
+  t.unref();
+  return t;
+}
+
+/** Rejette tôt (503 + Retry-After) les requêtes lourdes quand le process sature, plutôt que de tout faire ramer. */
+function shedHeavy(req, res, next) {
+  if (loadState.shedding) {
+    M.shed.inc({ reason: loadState.lagMs > CONFIG.LOAD_SHED.LOOP_LAG_MS ? "event_loop" : "memory" });
+    res.setHeader("Retry-After", "5");
+    return sendError(req, res, Errors.busy("Luba est très sollicitée, réessayez dans quelques secondes.", 5000));
+  }
+  return next();
+}
+
+// ================================================================================
+// §9 — PROVIDERS LLM + SANTÉ (fenêtre glissante, half-open, clés indépendantes)
+// ================================================================================
+
+const keyPool = (names) => names.map((n) => process.env[n]).filter((k) => typeof k === "string" && k.trim()).map((k, i) => ({ apiKey: k.trim(), label: `k${i + 1}` }));
+
+const PROVIDERS = {
+  groq: { kind: "openai", baseURL: "https://api.groq.com/openai/v1", usage: true, keys: keyPool(["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"]) },
+  openrouter: { kind: "openai", baseURL: "https://openrouter.ai/api/v1", usage: true, keys: keyPool(["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2", "OPENROUTER_API_KEY_3"]) },
+  cerebras: { kind: "openai", baseURL: "https://api.cerebras.ai/v1", usage: false, keys: keyPool(["CEREBRAS_API_KEY", "CEREBRAS_API_KEY_2"]) },
+  gemini: { kind: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta", keys: keyPool(["GEMINI_API_KEY", "GEMINI_API_KEY_2"]) },
+  fake: { kind: "fake", keys: [{ apiKey: "fake", label: "fake" }] }
+};
+
+function orModel(model) {
+  if (!model) return model;
+  const known = ["openai/", "qwen/", "meta-llama/", "deepseek/", "microsoft/", "anthropic/", "google/", "mistralai/", "cohere/", "nvidia/", "z-ai/"];
+  if (known.some((p) => model.includes(p)) && !/:(free|paid|beta)$/.test(model)) return `${model}:free`;
+  return model;
+}
+
+const mk = (provider, model, extra = {}) => ({ provider, model: provider === "openrouter" ? orModel(model) : model, maxTokens: 4000, temperature: 0.7, ...extra });
+
+const TIERS = {
+  v100: {
+    lane: "light",
+    chain: [
+      mk("groq", envStr("GROQ_MODEL_V100", "openai/gpt-oss-120b")),
+      mk("gemini", envStr("GEMINI_MODEL_V100", "gemini-2.5-flash"), { maxTokens: 8000 }),
+      mk("cerebras", envStr("CEREBRAS_MODEL_V100", "qwen-3.8-27b")),
+      mk("openrouter", envStr("OPENROUTER_MODEL_V100_FALLBACK_1", "meta-llama/llama-3.3-70b-instruct:free")),
+      mk("openrouter", envStr("OPENROUTER_MODEL_V100_FALLBACK_2", "qwen/qwen-2.5-72b-instruct:free"))
+    ]
+  },
+  v250: {
+    lane: "heavy",
+    chain: [
+      mk("groq", envStr("GROQ_MODEL_V250_REASONING", "openai/gpt-oss-120b"), { maxTokens: 8000, temperature: 0.6, reasoningEffort: "high" }),
+      mk("openrouter", envStr("OPENROUTER_MODEL_V250_REASONING", "deepseek/deepseek-r1:free"), { maxTokens: 8000, temperature: 0.6 }),
+      mk("gemini", envStr("GEMINI_MODEL_V250_REASONING", "gemini-2.5-flash"), { maxTokens: 8000, temperature: 0.3 })
+    ],
+    code: [
+      mk("groq", envStr("GROQ_MODEL_V250_CODE", "openai/gpt-oss-120b"), { maxTokens: 8000, temperature: 0.4 }),
+      mk("cerebras", envStr("CEREBRAS_MODEL_V250_CODE", "qwen-3.8-27b"), { maxTokens: 8000, temperature: 0.4 }),
+      mk("openrouter", envStr("OPENROUTER_MODEL_V250_CODE", "qwen/qwen3-coder-480b:free"), { maxTokens: 8000, temperature: 0.4 })
+    ]
+  },
+  vision: {
+    lane: "light",
+    chain: [
+      mk("groq", envStr("VISION_MODEL_GROQ", "meta-llama/llama-4-maverick-17b-128e-instruct")),
+      mk("gemini", envStr("VISION_MODEL_GEMINI", "gemini-2.5-flash")),
+      mk("openrouter", envStr("VISION_MODEL_OPENROUTER", "qwen/qwen-2.5-vl-72b-instruct:free"))
+    ]
+  }
+};
+
+function tierChain(tier, { hasImages = false, code = false } = {}) {
+  if (CONFIG.FAKE_LLM) return [{ provider: "fake", model: "fake-1", maxTokens: 2000, temperature: 0.7 }];
+  const base = hasImages ? TIERS.vision.chain : (tier === "v250" ? (code ? TIERS.v250.code : TIERS.v250.chain) : TIERS.v100.chain);
+  return base.filter((p) => PROVIDERS[p.provider]?.keys.length > 0);
+}
+const laneOf = (tier, hasImages) => (tier === "v250" && !hasImages ? "heavy" : "light");
+
+// ----- Erreurs provider typées -----
+class ProviderError extends Error {
+  constructor(kind, message, { status = null, retryAfterMs = null } = {}) {
+    super(message);
+    this.name = "ProviderError";
+    this.kind = kind;            // rate_limit | server | network | auth | client | context | model | empty | timeout_first | timeout_idle | timeout_total
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function classifyHttp(status, body, retryAfterHeader) {
+  const retryAfterMs = retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? parseInt(retryAfterHeader, 10) * 1000 : null;
+  const text = String(body || "").slice(0, 300);
+  if (status === 429) return new ProviderError("rate_limit", `HTTP 429 ${text}`, { status, retryAfterMs });
+  if (status === 401 || status === 403 || status === 402) return new ProviderError("auth", `HTTP ${status} ${text}`, { status });
+  if (status === 404) return new ProviderError("model", `HTTP 404 ${text}`, { status });
+  if (status === 413 || (status === 400 && /context|too long|maximum|max_tokens|token limit/i.test(text))) return new ProviderError("context", `HTTP ${status} ${text}`, { status });
+  if (status === 408 || status >= 500) return new ProviderError("server", `HTTP ${status} ${text}`, { status, retryAfterMs });
+  return new ProviderError("client", `HTTP ${status} ${text}`, { status });
+}
+
+/**
+ * Santé par (provider, modèle) — CORRECTIONS vs v16.5 :
+ *   • un échec = UNE requête (plus un par clé) ;
+ *   • les 429 / erreurs « client » / timeouts de raisonnement pèsent peu ou pas du tout ;
+ *   • fenêtre glissante (les anciens succès ne masquent plus une panne récente) ;
+ *   • disjoncteur half-open : UN seul essai de sonde, cooldown exponentiel ;
+ *   • jamais « tout indisponible » : les modèles ouverts restent en dernier recours.
+ */
+const FAIL_WEIGHT = { rate_limit: 0.2, server: 1, network: 1, auth: 0.5, model: 1, empty: 1, timeout_first: 0.6, timeout_idle: 1, timeout_total: 0.6, context: 0, client: 0 };
+
+class ProviderHealth {
+  constructor() { this.nodes = new Map(); }
+  _n(pc) {
+    const k = `${pc.provider}:${pc.model}`;
+    let n = this.nodes.get(k);
+    if (!n) { n = { key: k, samples: [], state: "closed", openUntil: 0, opens: 0, probing: false, hardStreak: 0, ewmaTtft: null, ewmaLatency: null, lastError: null, total: 0, failures: 0 }; this.nodes.set(k, n); }
+    return n;
+  }
+  failRate(n) {
+    if (!n.samples.length) return 0;
+    return n.samples.reduce((a, s) => a + s.w, 0) / n.samples.length;
+  }
+  /** Sans effet de bord : ce provider vaut-il le coup d'être essayé maintenant ? */
+  canTry(pc) {
+    const n = this._n(pc);
+    if (n.state === "closed") return true;
+    if (n.state === "open") return now() >= n.openUntil;
+    return !n.probing;
+  }
+  acquire(pc) {
+    const n = this._n(pc);
+    if (n.state === "open" && now() >= n.openUntil) { n.state = "half"; n.probing = false; }
+    if (n.state === "half") { if (n.probing) return false; n.probing = true; }
+    return n.state !== "open";
+  }
+  record(pc, kind, { latencyMs = null, ttftMs = null } = {}) {
+    const n = this._n(pc);
+    n.total++;
+    const wasHalf = n.state === "half";
+    n.probing = false;
+    if (kind === "ok") {
+      n.samples.push({ w: 0 }); n.hardStreak = 0;
+      if (ttftMs !== null) n.ewmaTtft = n.ewmaTtft === null ? ttftMs : n.ewmaTtft * 0.8 + ttftMs * 0.2;
+      if (latencyMs !== null) n.ewmaLatency = n.ewmaLatency === null ? latencyMs : n.ewmaLatency * 0.8 + latencyMs * 0.2;
+      if (wasHalf || n.state === "open") { n.state = "closed"; n.opens = 0; n.samples = []; logger.info({ provider: n.key }, "disjoncteur FERMÉ (provider rétabli)"); }
+    } else {
+      const w = FAIL_WEIGHT[kind] ?? 1;
+      n.samples.push({ w }); n.failures += w > 0 ? 1 : 0;
+      n.lastError = { kind, at: now() };
+      n.hardStreak = (kind === "server" || kind === "network" || kind === "model") ? n.hardStreak + 1 : 0;
+      const trip = wasHalf ? w > 0
+        : (n.samples.length >= CONFIG.HEALTH.MIN_SAMPLES && this.failRate(n) >= CONFIG.HEALTH.OPEN_FAIL_RATE) || n.hardStreak >= 4;
+      if (trip) this._open(n, kind);
+    }
+    if (n.samples.length > CONFIG.HEALTH.WINDOW) n.samples.shift();
+  }
+  _open(n, kind) {
+    n.opens++;
+    const cd = Math.min(CONFIG.HEALTH.MAX_COOLDOWN_MS, CONFIG.HEALTH.COOLDOWN_MS * 2 ** (n.opens - 1));
+    n.state = "open"; n.openUntil = now() + cd; n.hardStreak = 0;
+    logger.warn({ provider: n.key, kind, cooldownMs: cd, failRate: +this.failRate(n).toFixed(2) }, "disjoncteur OUVERT");
+  }
+  /** Ordre d'essai : sains triés par (priorité + pénalités), puis ouverts en dernier recours. */
+  rank(chain) {
+    const scored = chain.map((pc, i) => {
+      const n = this._n(pc);
+      const slow = n.ewmaTtft && n.ewmaTtft > 8000 ? 0.8 : 0;
+      return { pc, ok: this.canTry(pc), score: i + this.failRate(n) * 4 + slow, openUntil: n.openUntil };
+    });
+    const healthy = scored.filter((s) => s.ok).sort((a, b) => a.score - b.score).map((s) => s.pc);
+    const rest = scored.filter((s) => !s.ok).sort((a, b) => a.openUntil - b.openUntil).map((s) => s.pc);
+    return { healthy, lastResort: rest };
+  }
+  snapshot() {
+    const out = {};
+    for (const [k, n] of this.nodes) {
+      out[k] = { state: n.state, failRate: +this.failRate(n).toFixed(2), samples: n.samples.length, openUntilMs: n.openUntil > now() ? n.openUntil - now() : 0, ewmaTtftMs: n.ewmaTtft ? Math.round(n.ewmaTtft) : null, lastError: n.lastError, total: n.total };
+    }
+    return out;
+  }
+  reset() { this.nodes.clear(); }
+}
+const health = new ProviderHealth();
+
+/** Clés d'un provider : cooldown INDIVIDUEL (un 429 met une clé de côté, pas tout le provider). */
+class KeyPool {
+  constructor(name, keys) { this.name = name; this.keys = keys.map((k) => ({ ...k, until: 0 })); this.rr = 0; }
+  pick() {
+    const t = now();
+    for (let i = 0; i < this.keys.length; i++) {
+      const k = this.keys[(this.rr + i) % this.keys.length];
+      if (k.until <= t) { this.rr = (this.rr + i + 1) % this.keys.length; return k; }
+    }
+    return null;
+  }
+  minWaitMs() { return this.keys.length ? Math.max(0, Math.min(...this.keys.map((k) => k.until)) - now()) : Infinity; }
+  cool(label, ms) { const k = this.keys.find((x) => x.label === label); if (k) k.until = Math.max(k.until, now() + ms); }
+}
+const keyPools = Object.fromEntries(Object.entries(PROVIDERS).map(([n, p]) => [n, new KeyPool(n, p.keys)]));
+
+// ----- Flux SSE -----
+async function* readSSE(body) {
+  const reader = body.getReader();
+  const dec = new TextDecoder("utf-8");
+  let buf = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      yield { activity: true };
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, i).replace(/\r$/, "");
+        buf = buf.slice(i + 1);
+        if (line.startsWith("data:")) yield { data: line.slice(5).trimStart() };
+      }
+    }
+    buf += dec.decode();
+    const rest = buf.trim();
+    if (rest.startsWith("data:")) yield { data: rest.slice(5).trimStart() };
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
+}
+
+/** Chien de garde : délai avant 1er signe de vie, inactivité entre chunks, durée totale. */
+function makeWatchdog({ firstMs, idleMs, totalMs, parent }) {
+  const ctl = new AbortController();
+  let reason = null, timer = null, started = false;
+  const fire = (r) => { if (!ctl.signal.aborted) { reason = r; ctl.abort(abortError(r)); } };
+  const arm = (ms, r) => { clearTimeout(timer); timer = setTimeout(() => fire(r), Math.max(1, ms)); };
+  const total = setTimeout(() => fire("timeout_total"), Math.max(1, totalMs));
+  arm(firstMs, "timeout_first");
+  const onParent = () => fire("aborted");
+  if (parent) { if (parent.aborted) fire("aborted"); else parent.addEventListener("abort", onParent, { once: true }); }
+  return {
+    signal: ctl.signal,
+    get reason() { return reason; },
+    get started() { return started; },
+    beat() { started = true; arm(idleMs, "timeout_idle"); },
+    stop() { clearTimeout(timer); clearTimeout(total); parent?.removeEventListener("abort", onParent); }
+  };
+}
+
+// ----- Conversion de messages -----
+function toOpenAIMessages(messages, images) {
+  const out = messages.map((m) => {
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      return { role: "assistant", content: m.content || null, tool_calls: m.tool_calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } })) };
+    }
+    if (m.role === "tool") return { role: "tool", tool_call_id: m.tool_call_id, content: m.content };
+    return { role: m.role, content: m.content };
+  });
+  if (images?.length) {
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (out[i].role === "user" && typeof out[i].content === "string") {
+        out[i] = { role: "user", content: [{ type: "text", text: out[i].content }, ...images.map((im) => ({ type: "image_url", image_url: { url: im.dataUrl } }))] };
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+function toGeminiPayload(messages, images, tools, { maxTokens, temperature, model }) {
+  const sys = [];
+  const contents = [];
+  for (const m of messages) {
+    if (m.role === "system") { sys.push(typeof m.content === "string" ? m.content : safeJsonStringify(m.content)); continue; }
+    if (m.role === "tool") {
+      const parsed = safeJsonParse(m.content, { raw: m.content });
+      const part = { functionResponse: { name: m.name || "tool", response: typeof parsed === "object" && parsed ? parsed : { value: parsed } } };
+      const last = contents[contents.length - 1];
+      if (last && last.role === "user" && last.parts.every((p) => p.functionResponse)) last.parts.push(part);  // regroupe les réponses d'outils
+      else contents.push({ role: "user", parts: [part] });
+      continue;
+    }
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      const parts = [];
+      if (m.content) parts.push({ text: m.content });
+      for (const c of m.tool_calls) {
+        const p = { functionCall: { name: c.function.name, args: safeJsonParse(c.function.arguments, {}) } };
+        if (c._sig) p.thoughtSignature = c._sig;
+        parts.push(p);
+      }
+      contents.push({ role: "model", parts });
+      continue;
+    }
+    if (m.content) contents.push({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: String(m.content) }] });
+  }
+  if (images?.length) {
+    for (let i = contents.length - 1; i >= 0; i--) {
+      if (contents[i].role === "user" && contents[i].parts.some((p) => p.text)) {
+        for (const im of images) contents[i].parts.push({ inlineData: { mimeType: im.mimetype || "image/jpeg", data: im.base64 } });
+        break;
+      }
+    }
+  }
+  const body = { contents, generationConfig: { temperature, maxOutputTokens: maxTokens || 8000 } };
+  if (/gemini-(2\.5|3)/.test(model || "")) body.generationConfig.thinkingConfig = { includeThoughts: true };   // refusé (400) par les anciens modèles
+  if (sys.length) body.systemInstruction = { parts: [{ text: sys.join("\n\n") }] };
+  if (tools?.length) body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters })) }];
+  return body;
+}
+
+/**
+ * Appel STREAMÉ OpenAI-compatible (Groq / OpenRouter / Cerebras).
+ * `h` = { onText, onReasoning, onBeat } ; retourne { text, reasoning, toolCalls, usage }.
+ */
+async function streamOpenAI({ pc, cfg, key, messages, tools, images, wd, h }) {
+  const payload = { model: pc.model, messages: toOpenAIMessages(messages, images), temperature: pc.temperature, max_tokens: pc.maxTokens, stream: true };
+  if (cfg.usage) payload.stream_options = { include_usage: true };
+  if (pc.reasoningEffort) payload.reasoning_effort = pc.reasoningEffort;
+  if (tools?.length) { payload.tools = tools; payload.tool_choice = "auto"; }
+  const headers = { Authorization: `Bearer ${key.apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream" };
+  if (pc.provider === "openrouter") { headers["HTTP-Referer"] = envStr("HOSTING_DOMAIN", "https://luba.web.app"); headers["X-Title"] = "Luba AI"; }
+
+  let res;
+  try { res = await fetch(`${cfg.baseURL}/chat/completions`, { method: "POST", headers, body: JSON.stringify(payload), signal: wd.signal }); }
+  catch (e) { throw wd.signal.aborted ? e : new ProviderError("network", `réseau: ${e.message}`); }
+  if (!res.ok) throw classifyHttp(res.status, await res.text().catch(() => ""), res.headers.get("retry-after"));
+
+  let text = "", reasoning = "", usage = null;
+  const calls = new Map();
+  try {
+    for await (const ev of readSSE(res.body)) {
+      if (ev.activity) { if (wd.started) wd.beat(); continue; }
+      if (ev.data === "[DONE]") break;
+      const chunk = safeJsonParse(ev.data);
+      if (!chunk) continue;
+      if (chunk.error) throw classifyHttp(chunk.error.code && Number.isInteger(+chunk.error.code) ? +chunk.error.code : 500, chunk.error.message, null);
+      if (chunk.usage) usage = chunk.usage;
+      const d = chunk.choices?.[0]?.delta;
+      if (!d) continue;
+      const r = d.reasoning_content ?? d.reasoning;
+      if (r) { wd.beat(); reasoning += r; h.onReasoning(r); }
+      if (d.content) { wd.beat(); text += d.content; h.onText(d.content); }
+      if (d.tool_calls) {
+        wd.beat();
+        for (const tc of d.tool_calls) {
+          const i = tc.index ?? 0;
+          const cur = calls.get(i) || { id: tc.id || `call_${crypto.randomUUID()}`, type: "function", function: { name: "", arguments: "" } };
+          if (tc.id) cur.id = tc.id;
+          if (tc.function?.name) cur.function.name += tc.function.name;
+          if (tc.function?.arguments) cur.function.arguments += tc.function.arguments;
+          calls.set(i, cur);
+        }
+      }
+    }
+  } catch (e) {
+    if (e instanceof ProviderError || wd.signal.aborted) throw e;
+    throw new ProviderError("network", `flux interrompu: ${e.message}`);
+  }
+  return { text, reasoning, toolCalls: [...calls.values()].filter((c) => c.function.name), usage };
+}
+
+async function streamGemini({ pc, cfg, key, messages, tools, images, wd, h }) {
+  const body = toGeminiPayload(messages, images, tools, pc);
+  let res;
+  try {
+    res = await fetch(`${cfg.baseURL}/models/${encodeURIComponent(pc.model)}:streamGenerateContent?alt=sse`, {
+      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key.apiKey }, body: JSON.stringify(body), signal: wd.signal
+    });
+  } catch (e) { throw wd.signal.aborted ? e : new ProviderError("network", `réseau: ${e.message}`); }
+  if (!res.ok) throw classifyHttp(res.status, await res.text().catch(() => ""), res.headers.get("retry-after"));
+
+  let text = "", reasoning = "", usage = null;
+  const toolCalls = [];
+  try {
+    for await (const ev of readSSE(res.body)) {
+      if (ev.activity) { if (wd.started) wd.beat(); continue; }
+      const chunk = safeJsonParse(ev.data);
+      if (!chunk) continue;
+      if (chunk.error) throw classifyHttp(chunk.error.code || 500, chunk.error.message, null);
+      if (chunk.usageMetadata) usage = chunk.usageMetadata;
+      for (const part of chunk.candidates?.[0]?.content?.parts || []) {
+        wd.beat();
+        if (part.functionCall) {
+          toolCalls.push({ id: `call_${crypto.randomUUID()}`, type: "function", _sig: part.thoughtSignature || null, function: { name: part.functionCall.name, arguments: safeJsonStringify(part.functionCall.args || {}) } });
+        } else if (part.text) {
+          if (part.thought === true) { reasoning += part.text; h.onReasoning(part.text); }
+          else { text += part.text; h.onText(part.text); }
+        }
+      }
+    }
+  } catch (e) {
+    if (e instanceof ProviderError || wd.signal.aborted) throw e;
+    throw new ProviderError("network", `flux interrompu: ${e.message}`);
+  }
+  return { text, reasoning, toolCalls, usage };
+}
+
+/** Faux LLM déterministe (FAKE_LLM=1) : tests de charge / auto-test sans clé ni réseau. */
+async function streamFake({ messages, wd, h }) {
+  const last = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+  const lastText = typeof last === "string" ? last : "";
+  const delay = (ms) => sleep(ms, wd.signal);
+  if (/\[slow\]/.test(lastText)) await delay(+envInt("FAKE_SLOW_MS", 1500));
+  if (/\[fail\]/.test(lastText)) throw new ProviderError("server", "HTTP 500 fake failure", { status: 500 });
+  const sawTool = messages.some((m) => m.role === "tool");
+  if (/\[tool\]/.test(lastText) && !sawTool) {
+    wd.beat();
+    return { text: "", reasoning: "", usage: null, toolCalls: [{ id: "call_fake1", type: "function", function: { name: "get_current_time", arguments: "{}" } }] };
+  }
+  wd.beat();
+  h.onReasoning("Je réfléchis à la question… ");
+  const words = `Réponse simulée de Luba pour : ${lastText.replace(/\[[a-z]+\]/g, "").slice(0, 80)}. Ceci est un flux de test déterministe.`.split(" ");
+  let text = "";
+  for (const w of words) { await delay(envInt("FAKE_TOKEN_MS", 8)); wd.beat(); const piece = `${w} `; text += piece; h.onText(piece); }
+  return { text, reasoning: "", toolCalls: [], usage: { prompt_tokens: 10, completion_tokens: words.length } };
+}
+
+ProviderHealth.prototype.release = function release(pc) { this._n(pc).probing = false; };
+
+// ================================================================================
+// §10 — ORCHESTRATEUR LLM (streaming réel · failover · outils parallèles)
+// ================================================================================
+
+function withTimeout(promise, ms, signal, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { cleanup(); reject(new Error(`${label} : délai dépassé`)); }, ms);
+    const onAbort = () => { cleanup(); reject(abortError()); };
+    const cleanup = () => { clearTimeout(t); signal?.removeEventListener("abort", onAbort); };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
+  });
+}
+
+/** Résout toujours (jamais ne rejette) : pour les enrichissements facultatifs. */
+const settle = (promise, ms, fallback) => withTimeout(promise, ms, null, "optionnel").catch(() => fallback);
+
+const CONTINUE_PROMPT = "Ta réponse précédente a été interrompue. Continue EXACTEMENT là où tu t'es arrêté, sans répéter ce qui est déjà écrit.";
+
+/** Tronque milieu-sortie un message trop long (garde début + fin). */
+function clipMiddle(text, maxTokens) {
+  const maxChars = Math.floor(maxTokens * 3.6);
+  if (typeof text !== "string" || text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.6), tail = maxChars - head;
+  return `${text.slice(0, head)}\n[… ${text.length - maxChars} caractères omis …]\n${text.slice(-tail)}`;
+}
+
+/** Garde le prompt sous le budget : système + dernier message toujours conservés, historique rogné par l'ancien. */
+function fitContext(messages, budgetTokens) {
+  const tok = (m) => estimateTokens(typeof m.content === "string" ? m.content : safeJsonStringify(m.content)) + 6;
+  const sys = messages.filter((m) => m.role === "system");
+  const rest = messages.filter((m) => m.role !== "system");
+  if (!rest.length) return { messages, dropped: 0 };
+  const last = rest[rest.length - 1];
+  const lastClipped = typeof last.content === "string" && last.role === "user" ? { ...last, content: clipMiddle(last.content, Math.floor(budgetTokens * 0.5)) } : last;
+  let used = sys.reduce((a, m) => a + tok(m), 0) + tok(lastClipped);
+  const kept = [];
+  for (let i = rest.length - 2; i >= 0; i--) {
+    const m = typeof rest[i].content === "string" ? { ...rest[i], content: clipMiddle(rest[i].content, 3000) } : rest[i];
+    const t = tok(m);
+    if (used + t > budgetTokens) break;
+    used += t; kept.unshift(m);
+  }
+  while (kept.length && kept[0].role !== "user") kept.shift();   // Gemini/OpenAI : on commence par un tour utilisateur
+  return { messages: [...sys, ...kept, lastClipped], dropped: rest.length - 1 - kept.length };
+}
+
+const FRIENDLY = {
+  rate_limit: "Luba est très sollicitée en ce moment. Réessaie dans quelques secondes.",
+  timeout_first: "La réflexion a pris trop de temps. Réessaie, ou pose la question en plus court.",
+  timeout_idle: "La connexion au modèle s'est interrompue. Réessaie dans un instant.",
+  timeout_total: "La réponse a pris trop de temps. Réessaie avec une question plus ciblée.",
+  context: "Le message est trop long pour être traité. Raccourcis-le ou découpe-le.",
+  default: "Je n'arrive pas à répondre pour le moment. Réessaie dans un instant."
+};
+const friendlyMessage = (err) => FRIENDLY[err?.kind] || FRIENDLY.default;
+
+/**
+ * UN appel LLM avec basculement entre providers.
+ * Règles :
+ *   • le client voit les tokens en direct ; si un provider tombe EN PLEIN flux, on continue
+ *     chez le suivant avec le texte déjà émis (« continuation ») au lieu de tout rejouer ;
+ *   • un 429 met la CLÉ de côté, pas le provider ; un timeout de raisonnement pèse peu ;
+ *   • on essaie d'abord les providers sains, puis (dernier recours) ceux au disjoncteur ouvert.
+ */
+async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit }) {
+  const T = lane === "heavy" ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT;
+  const { healthy, lastResort } = health.rank(chain);
+  const order = [...healthy, ...lastResort];
+  if (!order.length) throw new AppError("NO_PROVIDER", "Aucun modèle n'est configuré sur ce serveur.", { status: 503 });
+
+  let committed = "";
+  let lastErr = null;
+  let work = messages;
+
+  for (const pc of order) {
+    const cfg = PROVIDERS[pc.provider];
+    const pool = keyPools[pc.provider];
+    let attempt = 0;
+    while (attempt <= CONFIG.RETRY.MAX_PER_PROVIDER) {
+      if (signal.aborted) throw abortError();
+      const remaining = deadlineAt - now();
+      if (remaining < 2500) { lastErr = lastErr || new ProviderError("timeout_total", "délai global dépassé"); break; }
+
+      const key = pool.pick();
+      if (!key) {
+        const wait = pool.minWaitMs();
+        if (wait <= 2000 && remaining > wait + 8000) { await sleep(wait + 20, signal); continue; }   // toutes les clés refroidissent peu : on patiente
+        lastErr = lastErr || new ProviderError("rate_limit", "toutes les clés sont en cooldown");
+        break;
+      }
+      if (!health.acquire(pc)) break;
+
+      const wd = makeWatchdog({ firstMs: T.FIRST_TOKEN_MS, idleMs: T.IDLE_MS, totalMs: Math.min(T.TOTAL_MS, remaining - 500), parent: signal });
+      const startedAt = now();
+      let ttft = null;
+      const filter = new ThinkFilter();
+      let visible = "";
+      const h = {
+        onText: (t) => {
+          if (ttft === null) ttft = now() - startedAt;
+          const o = filter.push(t);
+          if (o.reasoning) emit.reasoning(o.reasoning);
+          if (o.text) { visible += o.text; emit.token(o.text); }
+        },
+        onReasoning: (t) => { if (ttft === null) ttft = now() - startedAt; emit.reasoning(t); }
+      };
+      const sendMessages = committed
+        ? [...work, { role: "assistant", content: committed }, { role: "user", content: CONTINUE_PROMPT }]
+        : work;
+
+      try {
+        emit.status("generating", { provider: pc.provider, model: pc.model, attempt: attempt + 1 });
+        const streamer = cfg.kind === "gemini" ? streamGemini : cfg.kind === "fake" ? streamFake : streamOpenAI;
+        const r = await streamer({ pc, cfg, key, messages: sendMessages, tools, images, wd, h });
+        const tail = filter.flush();
+        if (tail.text) { visible += tail.text; emit.token(tail.text); }
+        if (tail.reasoning) emit.reasoning(tail.reasoning);
+        wd.stop();
+        if (!visible && !r.toolCalls.length && !committed) throw new ProviderError("empty", "réponse vide");
+        health.record(pc, "ok", { latencyMs: now() - startedAt, ttftMs: ttft ?? now() - startedAt });
+        M.llm.inc({ provider: pc.provider, model: pc.model, outcome: "ok" });
+        M.ttft.observe({ provider: pc.provider, model: pc.model }, (ttft ?? 0) / 1000);
+        return { text: committed + visible, toolCalls: r.toolCalls, reasoning: r.reasoning || "", usage: r.usage, provider: pc.provider, model: pc.model, ttftMs: ttft, partial: false };
+      } catch (e) {
+        wd.stop();
+        const tail = filter.flush();
+        if (tail.text) { visible += tail.text; emit.token(tail.text); }
+        if (signal.aborted) { health.release(pc); throw abortError(); }
+        let err = e;
+        if (!(e instanceof ProviderError)) {
+          err = wd.signal.aborted ? new ProviderError(wd.reason || "timeout_total", `timeout (${wd.reason})`) : new ProviderError("network", String(e.message || e));
+        }
+        health.record(pc, err.kind);
+        M.llm.inc({ provider: pc.provider, model: pc.model, outcome: err.kind });
+        lastErr = err;
+        logger.warn({ provider: pc.provider, model: pc.model, kind: err.kind, status: err.status, attempt, msg: String(err.message).slice(0, 200) }, "appel LLM échoué");
+        if (visible) committed += visible;     // déjà vu par l'utilisateur → on continuera, sans rejouer
+
+        if (err.kind === "rate_limit") pool.cool(key.label, err.retryAfterMs ?? CONFIG.HEALTH.KEY_COOLDOWN_MS);
+        if (err.kind === "auth") pool.cool(key.label, CONFIG.HEALTH.KEY_AUTH_COOLDOWN_MS);
+
+        if (err.kind === "context") { work = fitContext(work, Math.floor(CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET / 2)).messages; attempt++; continue; }
+        if (err.kind === "rate_limit" && pool.pick()) { attempt++; continue; }       // une autre clé est libre
+        if ((err.kind === "server" || err.kind === "network") && attempt < CONFIG.RETRY.MAX_PER_PROVIDER) {
+          await sleep(CONFIG.RETRY.BASE_MS * 2 ** attempt + Math.floor(Math.random() * 150), signal);
+          attempt++; continue;
+        }
+        break;   // → provider suivant
+      }
+    }
+  }
+
+  if (committed.trim()) return { text: committed, toolCalls: [], reasoning: "", usage: null, provider: order[0].provider, model: order[0].model, ttftMs: null, partial: true, error: lastErr };
+  throw lastErr || new ProviderError("server", "aucun provider disponible");
+}
+
+const stableStringify = (o) => safeJsonStringify(o, "{}");
+
+async function orchestrate({ chain, lane, messages, images, tools, executeTool, signal, deadlineAt, emit }) {
+  const working = [...messages];
+  const sources = new Set(), imagesOut = [], videosOut = [], trace = [], segments = [];
+  const toolCache = new Map();
+  const usage = { prompt: 0, completion: 0 };
+  let provider = null, model = null, ttftMs = null, reasoning = "", partial = false, error = null;
+
+  const addUsage = (u) => {
+    if (!u) return;
+    usage.prompt += u.prompt_tokens || u.promptTokenCount || 0;
+    usage.completion += u.completion_tokens || u.candidatesTokenCount || 0;
+  };
+
+  const runTool = async (call) => {
+    const name = call.function.name;
+    const args = safeJsonParse(call.function.arguments, {}) || {};
+    const ck = `${name}:${stableStringify(args)}`;
+    if (toolCache.has(ck)) return toolCache.get(ck);
+    emit.status("tool", { name });
+    trace.push({ name, args });
+    let out;
+    try { out = await withTimeout(executeTool({ toolName: name, args }), CONFIG.TIMEOUTS.TOOL_MS, signal, `outil ${name}`); }
+    catch (e) {
+      if (signal.aborted) throw e;
+      out = { result: { success: false, error: String(e.message || e).slice(0, 300) }, sourceKeys: [] };
+    }
+    out = out && typeof out === "object" ? out : { result: out, sourceKeys: [] };
+    (out.sourceKeys || []).forEach((k) => sources.add(k));
+    const res = out.result;
+    if (name === "search_images" && res?.images?.length) { imagesOut.push(...res.images.map((i) => i.url).filter(Boolean)); emit.images(res.images); }
+    if (name === "search_youtube" && res?.videos?.length) { videosOut.push(...res.videos); emit.videos(res.videos); }
+    if (name === "run_code" && (res?.stdout || res?.stderr)) emit.code({ language: args.language, stdout: res.stdout || "", stderr: res.stderr || "", done: true, execution: true });
+    toolCache.set(ck, out);
+    return out;
+  };
+
+  for (let it = 1; it <= CONFIG.AGENT.MAX_ITERATIONS; it++) {
+    emit.status(it === 1 ? "thinking" : "reasoning", { iteration: it });
+    const fitted = fitContext(working, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET);
+    const r = await callLLM({ chain, messages: fitted.messages, tools, images, lane, signal, deadlineAt, emit });
+    provider = r.provider; model = r.model; ttftMs = ttftMs ?? r.ttftMs; reasoning += r.reasoning || ""; addUsage(r.usage);
+    if (r.text.trim()) segments.push(r.text);
+    if (r.partial) { partial = true; error = r.error; break; }
+    if (!r.toolCalls.length) break;
+
+    working.push({ role: "assistant", content: r.text || "", tool_calls: r.toolCalls });
+    const bounded = r.toolCalls.slice(0, CONFIG.AGENT.MAX_TOOL_CALLS_PER_STEP);
+    const outs = await Promise.all(bounded.map(runTool));          // outils EN PARALLÈLE (avant : séquentiel)
+    bounded.forEach((call, i) => working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: safeJsonStringify(outs[i].result).slice(0, 8000) }));
+    // CORRECTIF : chaque tool_call DOIT recevoir une réponse, sinon l'API rejette (400) — v16.5 oubliait ceux au-delà de la limite.
+    for (const call of r.toolCalls.slice(CONFIG.AGENT.MAX_TOOL_CALLS_PER_STEP)) {
+      working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: safeJsonStringify({ success: false, error: "Limite d'appels d'outils atteinte pour cette étape." }) });
+    }
+    if (r.text.trim()) emit.token("\n\n");
+
+    if (it === CONFIG.AGENT.MAX_ITERATIONS) {
+      working.push({ role: "system", content: "Synthétise ta réponse finale MAINTENANT. Pas de nouvel appel d'outil." });
+      const f = await callLLM({ chain, messages: fitContext(working, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET).messages, tools: [], images, lane, signal, deadlineAt, emit });
+      provider = f.provider; model = f.model; addUsage(f.usage);
+      if (f.text.trim()) segments.push(f.text);
+      partial = f.partial; error = f.error || null;
+    }
+  }
+
+  return {
+    text: segments.join("\n\n"), reasoning, sources: [...sources], images: [...new Set(imagesOut)], videos: dedupeVideos(videosOut),
+    trace, provider, model, ttftMs, usage, partial, error
+  };
+}
+
+function dedupeVideos(list) {
+  const seen = new Set();
+  return list.filter((v) => { if (!v?.videoId || seen.has(v.videoId)) return false; seen.add(v.videoId); return true; });
+}
+
+// ================================================================================
+// §11 — OUTILS : natifs (sans dépendance) + pont OPTIONNEL vers ton ancien code
+// ================================================================================
+// Place l'ancien fichier à côté sous le nom `legacy.js` : ses 19 outils (météo, crypto,
+// actualités, images, YouTube, sandbox…) restent utilisables, mais s'exécutent désormais
+// dans la file de runs avec timeout, parallélisme et annulation.
+
+let legacy = null;
+
+function loadLegacy() {
+  if (envBool("DISABLE_LEGACY", false)) return null;
+  const external = envStr("LEGACY_MODULE", null);                   // facultatif : ancien fichier externe
+  const evts = ["SIGINT", "SIGTERM", "uncaughtException", "unhandledRejection"];
+  const before = Object.fromEntries(evts.map((e) => [e, new Set(process.listeners(e))]));
+  const strip = () => { for (const e of evts) for (const l of process.listeners(e)) if (!before[e].has(l)) process.off(e, l); };
+  try {
+    const m = external && fs.existsSync(external) ? require(path.resolve(external)) : createLegacyModule(v17Api);
+    // L'héritage installe ses propres handlers d'arrêt (process.exit) : on les retire, sinon ils court-circuitent notre arrêt propre.
+    strip();
+    logger.info({ embedded: !(external && fs.existsSync(external)), tools: typeof m.getToolSchemas === "function" }, "module héritage v16.5 chargé (voix, WhatsApp, outils, pubs…)");
+    return m;
+  } catch (e) {
+    strip();
+    logger.warn({ err: e.message }, "module héritage indisponible (non bloquant : le cœur v17 continue sans voix/WhatsApp/outils externes)");
+    return null;
+  }
+}
+
+/** API que le cœur v17 expose à l'héritage (le pipeline de chat v16.5 est remplacé par v17). */
+const v17Api = {
+  chat: (args) => legacyChatBridge(args),
+  authenticate: (req, res, next) => authenticate()(req, res, next)
+};
+
+function pipeRunToSse(run, sse) {
+  const handle = (ev) => {
+    try {
+      const d = ev.data || {};
+      switch (ev.type) {
+        case "status": { const { stage, ...rest } = d; sse.status?.(stage, rest); break; }
+        case "token": sse.token?.(d.text); break;
+        case "reasoning": sse.reasoning?.(d.text); break;
+        case "images": sse.images?.(d.images); break;
+        case "videos": sse.videos?.(d.videos); break;
+        case "code": sse.codeBlock?.(d); break;
+        case "suggestions": sse.suggestions?.(d.suggestions); break;
+        case "sources": sse.sources?.(d.sources); break;
+        case "ad": sse.ad?.(d); break;
+        case "error": sse.error?.(d); break;
+        case "done": sse.done?.(d); break;
+        default: break;
+      }
+    } catch (e) { logger.debug({ err: e.message }, "adaptateur SSE héritage"); }
+  };
+  for (const ev of run.replayFrom(0)) handle(ev);
+  return run.subscribe(handle);
+}
+
+/**
+ * Remplace `handleChat` de la v16.5 : WhatsApp et Luba Live (voix) passent désormais par
+ * le même pipeline v17 (file d'attente, failover, streaming réel, sauvegarde idempotente).
+ */
+async function legacyChatBridge({ conversationId, userId, firebaseUid = null, message, googleAccessToken = null, channel = "web", modelTier = "v100", images = null, sse = null }) {
+  const text = sanitizeForLLM(message, CONFIG.LIMITS.MAX_MESSAGE_LENGTH);
+  if (!text) throw Errors.badRequest("INVALID_MESSAGE", "Message vide.");
+  let user = await repo.getUser(userId).catch(() => null);
+  if (!user) { await repo.ensureUser(userId, {}); user = await repo.getUser(userId).catch(() => null); }
+  const s = await chat.start({
+    userId, role: normRole(user?.role), firebaseUid: firebaseUid || userId, convId: conversationId, message: text,
+    tier: modelTier === "v250" ? "v250" : "v100", images, googleAccessToken, channel, skipQuota: true
+  });
+  if (!s.run) return { reply: "", error: false, duplicate: true, conversationId, userId };
+  const off = sse ? pipeRunToSse(s.run, sse) : null;
+  const r = await s.run.finished;
+  if (off) off();
+  try { sse?.end?.(); } catch {}
+  return { ...r, images: r.media?.images || [], media: r.media, userId, conversationId, isNewConversation: Boolean(s.run.isNew) };
+}
+
+const parseDue = (v) => { if (!v) return null; const t = Date.parse(v); return Number.isFinite(t) ? t : null; };
+const NATIVE_TOOLS = {
+  get_current_time: {
+    schema: { type: "function", function: { name: "get_current_time", description: "Donne la date et l'heure actuelles (fuseau optionnel, défaut Africa/Kinshasa).", parameters: { type: "object", properties: { timezone: { type: "string", description: "Fuseau IANA, ex. Africa/Kinshasa" } }, required: [] } } },
+    async exec(args) {
+      let tz = args.timezone || "Africa/Kinshasa";
+      try { new Intl.DateTimeFormat("fr-FR", { timeZone: tz }); } catch { tz = "Africa/Kinshasa"; }
+      return { success: true, iso: new Date().toISOString(), local: new Date().toLocaleString("fr-FR", { timeZone: tz }), timezone: tz };
+    }
+  },
+  create_task: {
+    schema: { type: "function", function: { name: "create_task", description: "Crée une tâche / un rappel pour l'utilisateur.", parameters: { type: "object", properties: { title: { type: "string" }, notes: { type: "string" }, due_at: { type: "string", description: "Date ISO 8601 optionnelle" } }, required: ["title"] } } },
+    async exec(args, ctx) { const t = await repo.createTask(ctx.userId, { title: args.title, notes: args.notes, dueAt: parseDue(args.due_at) }); return { success: true, task: t }; }
+  },
+  list_tasks: {
+    schema: { type: "function", function: { name: "list_tasks", description: "Liste les tâches de l'utilisateur.", parameters: { type: "object", properties: { status: { type: "string", enum: ["pending", "done"] } }, required: [] } } },
+    async exec(args, ctx) { return { success: true, tasks: await repo.listTasks(ctx.userId, args.status || null) }; }
+  },
+  complete_task: {
+    schema: { type: "function", function: { name: "complete_task", description: "Marque une tâche comme terminée.", parameters: { type: "object", properties: { task_id: { type: "string" } }, required: ["task_id"] } } },
+    async exec(args, ctx) { return { success: await repo.setTaskStatus(ctx.userId, args.task_id, "done") }; }
+  },
+  delete_task: {
+    schema: { type: "function", function: { name: "delete_task", description: "Supprime une tâche.", parameters: { type: "object", properties: { task_id: { type: "string" } }, required: ["task_id"] } } },
+    async exec(args, ctx) { return { success: await repo.deleteTask(ctx.userId, args.task_id) }; }
+  }
+};
+
+function getToolSchemas() {
+  const native = Object.values(NATIVE_TOOLS).map((t) => t.schema);
+  if (CONFIG.FAKE_LLM || !legacy?.getToolSchemas) return native;
+  let extra = [];
+  try { extra = legacy.getToolSchemas("chat").filter((s) => !NATIVE_TOOLS[s.function?.name]); } catch {}
+  return [...native, ...extra];
+}
+
+async function executeTool({ toolName, args }, ctx) {
+  const nat = NATIVE_TOOLS[toolName];
+  if (nat) return { result: await nat.exec(args || {}, ctx), sourceKeys: [] };
+  if (legacy?.executeToolNative) {
+    const out = await legacy.executeToolNative(toolName, args, { userId: ctx.userId, googleAccessToken: ctx.googleAccessToken, sessionId: ctx.convId });
+    return { result: out.result, sourceKeys: out.sourceKeys || [] };
+  }
+  return { result: { success: false, error: "Outil indisponible" }, sourceKeys: [] };
+}
+
+// ----- Prompt système (identique v16.5, enrichi dynamiquement) -----
+const LUBA_SYSTEM_PROMPT = [
+  "Tu es LUBA (Luba.ia), une intelligence artificielle créée par HIKLON Technology, startup à Kinshasa, fondée en 2026.",
+  "",
+  "LANGUE — RÈGLE #1 ABSOLUE :",
+  "- Tu réponds TOUJOURS dans la langue du DERNIER message utilisateur.",
+  "- Français → français. English → English. Kiswahili → Kiswahili. Lingala → Lingala.",
+  "- Si l'utilisateur écrit en français, tu ne réponds JAMAIS en chinois, anglais ou autre.",
+  "- En cas de doute, utilise le français (langue par défaut de Luba).",
+  "",
+  "IDENTITÉ :",
+  "- Tu t'appelles Luba. Ton ton est chaleureux, direct, utile.",
+  "- Tu es un vrai agent IA (façon Jarvis), pas un chatbot passif.",
+  "",
+  "FORMAT DE RÉPONSE — RÈGLES STRICTES :",
+  "- Réponds en Markdown propre et lisible. Utilise **gras**, listes, titres ## / ### quand c'est pertinent.",
+  "- N'utilise JAMAIS de caractères de contrôle ou symboles bizarres.",
+  "- N'inclus PAS de balises HTML sauf si explicitement demandé. N'écris PAS de JSON brut sauf demande.",
+  "- Ne mets JAMAIS ton raisonnement interne dans la réponse finale.",
+  "",
+  "DONNÉES — RÈGLE ABSOLUE :",
+  "- N'invente JAMAIS un chiffre, un score, une date, un nom, une URL.",
+  "- Si un outil échoue, dis-le clairement. Mieux vaut dire « je ne sais pas » que d'inventer.",
+  "",
+  "ROUTAGE DES OUTILS :",
+  "▸ MATHS → `execute_math` (jamais run_code). ▸ CODE → `run_code`. ▸ MÉTÉO → `get_weather`.",
+  "▸ CRYPTO → `get_crypto_price`. ▸ ACTIONS → `get_stock_price`. ▸ ACTUALITÉS → `search_news`.",
+  "▸ SPORT → `search_sports_scores`. ▸ IMAGES → `search_images`. ▸ VIDÉOS → `search_youtube`. ▸ WEB → `search_web`.",
+  "▸ HEURE → `get_current_time`. ▸ TÂCHES → `create_task`, `list_tasks`, `complete_task`, `delete_task`.",
+  "",
+  "MATHÉMATIQUES — FORMAT : formules en LaTeX ($inline$ ou $$display$$), jamais \\( … \\) ni \\[ … \\].",
+  "",
+  "SUGGESTIONS : à la fin, si pertinent : <!--SUGGESTIONS:[\"Q1 ?\",\"Q2 ?\",\"Q3 ?\"]--> sinon n'ajoute rien."
+].join("\n");
+
+const LANG_NAME = { fr: "français", en: "anglais", sw: "kiswahili", ln: "lingala" };
+
+function extractSuggestions(text) {
+  const m = text.match(/<!--\s*SUGGESTIONS\s*:\s*(\[[\s\S]*?\])\s*-->/i);
+  if (!m) return { text, suggestions: [] };
+  const arr = safeJsonParse(m[1], []);
+  return {
+    text: text.replace(m[0], "").trim(),
+    suggestions: Array.isArray(arr) ? arr.filter((s) => typeof s === "string").map((s) => s.slice(0, 120)).slice(0, 3) : []
+  };
+}
+
+const GREETING_RE = /^\s*(salut|bonjour|bonsoir|coucou|hello|hi|hey|yo|mbote|habari|ça va|merci|thanks|ok|d'accord)\b[\s!.?,]*$/i;
+const CODE_RE = /```|\b(function|class|bug|stack\s?trace|exception|compile|script|python|javascript|typescript|node\.?js|react|sql|regex|api|algorithme|code)\b/i;
+const quickIntent = (msg) => (CODE_RE.test(msg) ? "CODE" : GREETING_RE.test(msg) ? "SMALLTALK" : "GENERAL");
+
+// ================================================================================
+// §12 — RUN MANAGER : file d'attente, lanes, concurrence, replay d'événements
+// ================================================================================
+// Un RUN = une génération de réponse. Il vit INDÉPENDAMMENT de la connexion HTTP :
+//   • le client peut se déconnecter/reconnecter (Last-Event-ID) sans perdre un token ;
+//   • la réponse est toujours sauvegardée, même si l'app est fermée ;
+//   • la charge est LISSÉE par une file (au lieu de N appels LLM simultanés → 429 en chaîne).
+
+const RUN_FINAL = new Set(["done", "failed", "cancelled", "interrupted"]);
+
+class Run {
+  constructor(spec) {
+    Object.assign(this, spec);
+    this.status = "queued";
+    this.controller = new AbortController();
+    this.events = [];
+    this.seq = 0;
+    this.subs = new Set();
+    this.queuedAt = now();
+    this.startedAt = null;
+    this.finishedAt = null;
+    this.queueMs = 0;
+    this.rawText = "";
+    this.outImages = [];   // images produites (≠ this.images = pièces jointes de l'utilisateur)
+    this.outVideos = [];
+    this.result = null;
+    this.lastPos = 0;
+    this._tok = ""; this._rea = ""; this._timer = null;
+    this.finished = new Promise((resolve) => { this._resolve = resolve; });
+  }
+  get isFinal() { return RUN_FINAL.has(this.status); }
+
+  _push(type, data) {
+    const ev = { seq: ++this.seq, type, data, ts: now() };
+    this.events.push(ev);
+    if (this.events.length > CONFIG.QUEUE.EVENT_BUFFER) this.events.splice(0, this.events.length - CONFIG.QUEUE.EVENT_BUFFER);
+    for (const fn of this.subs) { try { fn(ev); } catch {} }
+    return ev;
+  }
+  _flush() {
+    clearTimeout(this._timer); this._timer = null;
+    if (this._rea) { const t = this._rea; this._rea = ""; this._push("reasoning", { text: t }); }
+    if (this._tok) { const t = this._tok; this._tok = ""; this._push("token", { text: t }); }
+  }
+  push(type, data) { this._flush(); return this._push(type, data); }
+  /** Les tokens sont regroupés (≈30 ms) : moins d'événements, moins de bytes, rendu aussi fluide. */
+  token(text) {
+    if (!text) return;
+    this.rawText += text; this._tok += text;
+    if (this._tok.length >= 160) return this._flush();
+    if (!this._timer) this._timer = setTimeout(() => this._flush(), 30);
+  }
+  reasoning(text) {
+    if (!text) return;
+    this._rea += text;
+    if (this._rea.length >= 240) return this._flush();
+    if (!this._timer) this._timer = setTimeout(() => this._flush(), 30);
+  }
+  subscribe(fn) { this.subs.add(fn); return () => this.subs.delete(fn); }
+
+  /** Événements à rejouer après `afterSeq` ; si le tampon a été rogné → instantané complet. */
+  replayFrom(afterSeq) {
+    this._flush();
+    const first = this.events.length ? this.events[0].seq : this.seq + 1;
+    if (afterSeq + 1 < first) {
+      return [{ seq: this.seq, type: "snapshot", data: { text: this.rawText, images: this.outImages, videos: this.outVideos, status: this.status } }];
+    }
+    return this.events.filter((e) => e.seq > afterSeq);
+  }
+  finish(status, result = null) {
+    this._flush();
+    this.status = status; this.finishedAt = now(); this.result = result;
+    this._resolve(result);
+  }
+  summary() {
+    return { runId: this.id, status: this.status, conversationId: this.convId, userIdx: this.userIdx, assistantIdx: this.assistantIdx, tier: this.tier, queuedAt: this.queuedAt, startedAt: this.startedAt, finishedAt: this.finishedAt };
+  }
+}
+
+class RunManager {
+  constructor() {
+    this.executor = null;
+    this.failHandler = null;
+    this.runs = new Map();
+    this.byMsg = new Map();
+    this.queue = [];
+    this.active = 0;
+    this.activeHeavy = 0;
+    this.userActive = new Map();
+    this.userQueued = new Map();
+    this.activeConv = new Set();
+    this.draining = false;
+    this.ticker = null;
+  }
+
+  start(executor, failHandler) {
+    this.executor = executor; this.failHandler = failHandler;
+    this.ticker = setInterval(() => this._tick(), 1000);
+    this.ticker.unref();
+  }
+
+  stats() {
+    return { active: this.active, activeHeavy: this.activeHeavy, queued: this.queue.length, draining: this.draining, tracked: this.runs.size, limits: { global: CONFIG.QUEUE.GLOBAL_CONCURRENCY, heavy: CONFIG.QUEUE.HEAVY_CONCURRENCY, perUser: CONFIG.QUEUE.PER_USER_CONCURRENCY } };
+  }
+  get(id) { return this.runs.get(id) || null; }
+  findByMessage(convId, userIdx) { const id = this.byMsg.get(`${convId}:${userIdx}`); return id ? this.runs.get(id) || null : null; }
+
+  /** Contrôle d'admission AVANT toute écriture : on refuse tôt et proprement. */
+  assertCanAccept(userId) {
+    if (this.draining) throw Errors.busy("Le serveur redémarre, réessayez dans quelques secondes.", 5000);
+    if (this.queue.length >= CONFIG.QUEUE.MAX_QUEUE) { M.shed.inc({ reason: "queue_full" }); throw Errors.busy("Luba est très sollicitée, réessayez dans quelques secondes.", 8000); }
+    if ((this.userQueued.get(userId) || 0) >= CONFIG.QUEUE.PER_USER_QUEUED) throw Errors.tooMany("TOO_MANY_PENDING", "Vous avez déjà plusieurs réponses en attente. Patientez un instant.", 3000);
+  }
+
+  submit(spec) {
+    this.assertCanAccept(spec.userId);
+    const run = new Run(spec);
+    this.runs.set(run.id, run);
+    this.byMsg.set(`${run.convId}:${run.userIdx}`, run.id);
+    this.queue.push(run);
+    this.userQueued.set(run.userId, (this.userQueued.get(run.userId) || 0) + 1);
+    run.lastPos = this.queue.length;
+    run.push("status", { stage: "queued", position: this.queue.length });
+    M.queueDepth.set(this.queue.length);
+    this._pump();
+    return run;
+  }
+
+  _canStart(run) {
+    const Q = CONFIG.QUEUE;
+    if (this.active >= Q.GLOBAL_CONCURRENCY) return false;
+    if (run.lane === "heavy" && this.activeHeavy >= Q.HEAVY_CONCURRENCY) return false;
+    if ((this.userActive.get(run.userId) || 0) >= Q.PER_USER_CONCURRENCY) return false;
+    if (this.activeConv.has(run.convId)) return false;      // une seule génération à la fois par conversation (ordre garanti)
+    return true;
+  }
+
+  _pump() {
+    for (let i = 0; i < this.queue.length;) {
+      const run = this.queue[i];
+      if (this._canStart(run)) { this.queue.splice(i, 1); this._start(run); } else i++;
+    }
+    M.queueDepth.set(this.queue.length);
+  }
+
+  _dec(map, key) { const n = (map.get(key) || 0) - 1; if (n <= 0) map.delete(key); else map.set(key, n); }
+
+  _start(run) {
+    this.active++; if (run.lane === "heavy") this.activeHeavy++;
+    this.userActive.set(run.userId, (this.userActive.get(run.userId) || 0) + 1);
+    this._dec(this.userQueued, run.userId);
+    this.activeConv.add(run.convId);
+    run.status = "running"; run.startedAt = now(); run.queueMs = run.startedAt - run.queuedAt;
+    M.queueWait.observe(run.queueMs / 1000);
+    M.runsActive.set(this.active);
+    run.push("status", { stage: "started", queueMs: run.queueMs });
+    repo.updateRun(run.id, { status: "running", started_at: run.startedAt, queue_ms: run.queueMs }).catch(() => {});
+    Promise.resolve()
+      .then(() => this.executor(run))
+      .catch((e) => logger.error({ err: e?.message, stack: e?.stack, runId: run.id }, "executor a levé une exception"))
+      .finally(() => this._release(run));
+  }
+
+  _release(run) {
+    this.active--; if (run.lane === "heavy") this.activeHeavy--;
+    this._dec(this.userActive, run.userId);
+    this.activeConv.delete(run.convId);
+    if (!run.isFinal) run.finish("failed", { error: true, code: "RUN_LOST" });
+    M.runsActive.set(this.active);
+    M.runs.inc({ tier: run.tier, status: run.status });
+    const t = setTimeout(() => { this.runs.delete(run.id); this.byMsg.delete(`${run.convId}:${run.userIdx}`); }, CONFIG.QUEUE.KEEP_FINISHED_MS);
+    t.unref();
+    this._pump();
+  }
+
+  _removeQueued(run) {
+    const i = this.queue.indexOf(run);
+    if (i === -1) return false;
+    this.queue.splice(i, 1);
+    this._dec(this.userQueued, run.userId);
+    M.queueDepth.set(this.queue.length);
+    return true;
+  }
+
+  _tick() {
+    const t = now();
+    this.queue.forEach((run, i) => {
+      const pos = i + 1;
+      if (pos !== run.lastPos) { run.lastPos = pos; run.push("status", { stage: "queued", position: pos }); }
+    });
+    for (const run of [...this.queue]) {
+      if (t - run.queuedAt > CONFIG.QUEUE.MAX_WAIT_MS && this._removeQueued(run)) {
+        this.failHandler(run, "failed", new AppError("QUEUE_TIMEOUT", "Luba est trop sollicitée, réessayez dans un instant.", { status: 503, retryable: true })).catch(() => {});
+      }
+    }
+    this._pump();
+  }
+
+  async cancel(runId, userId) {
+    const run = this.runs.get(runId);
+    if (!run) throw Errors.notFound("RUN_NOT_FOUND", "Génération introuvable ou déjà terminée.");
+    if (run.userId !== userId) throw Errors.forbidden("RUN_OWNERSHIP", "Cette génération ne vous appartient pas.");
+    if (run.isFinal) return run.status;
+    if (this._removeQueued(run)) { await this.failHandler(run, "cancelled", null); return "cancelled"; }
+    run.cancelReason = "user_cancel";
+    run.controller.abort(abortError("user_cancel"));
+    return "cancelling";
+  }
+
+  /** Arrêt propre : on laisse finir les runs en cours, puis on interrompt proprement (partiel sauvegardé). */
+  async drain(timeoutMs) {
+    this.draining = true;
+    const end = now() + timeoutMs;
+    while ((this.active > 0 || this.queue.length > 0) && now() < end) await sleepRaw(200);
+    for (const run of [...this.queue]) { if (this._removeQueued(run)) await this.failHandler(run, "interrupted", new AppError("SHUTDOWN", "Le serveur redémarre.", { status: 503, retryable: true })).catch(() => {}); }
+    for (const run of this.runs.values()) if (run.status === "running") { run.cancelReason = "shutdown"; run.controller.abort(abortError("shutdown")); }
+    const end2 = now() + 4000;
+    while (this.active > 0 && now() < end2) await sleepRaw(100);
+  }
+}
+
+const runManager = new RunManager();
+
+// ================================================================================
+// §13 — SERVICE CHAT
+// ================================================================================
+
+const NOOP_EMIT = { status() {}, token() {}, reasoning() {}, images() {}, videos() {}, code() {} };
+
+async function moderateRemote(text) {
+  const local = moderateLocal(text);
+  if (!local.safe) return local;
+  const key = process.env.GROQ_API_KEY;
+  if (!key || !envBool("MODERATION_REMOTE", true)) return local;
+  try {
+    const res = await fetch(envStr("MODERATION_URL", "https://api.groq.com/openai/v1/chat/completions"), {
+      method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "llama-guard-3-8b", messages: [{ role: "user", content: text.slice(0, 4000) }], max_tokens: 20, temperature: 0 }),
+      signal: AbortSignal.timeout(2500)
+    });
+    if (!res.ok) return local;
+    const data = await res.json();
+    const verdict = data?.choices?.[0]?.message?.content || "";
+    return { safe: !/^\s*unsafe/i.test(verdict) };
+  } catch { return local; }        // fail-open : la modération ne doit jamais bloquer le service
+}
+
+const SOURCE_LABELS = {
+  wikipedia: ["Wikipédia", "https://fr.wikipedia.org"], wikimediacommons: ["Wikimedia Commons", "https://commons.wikimedia.org"],
+  googlenews: ["Google News", "https://news.google.com"], gdelt: ["GDELT", "https://www.gdeltproject.org"],
+  tavily: ["Tavily", "https://tavily.com"], serper: ["Google Search", "https://google.com"],
+  duckduckgo: ["DuckDuckGo", "https://duckduckgo.com"], hackernews: ["Hacker News", "https://news.ycombinator.com"],
+  arxiv: ["arXiv", "https://arxiv.org"], reddit: ["Reddit", "https://reddit.com"], openmeteo: ["Open-Meteo", "https://open-meteo.com"],
+  coingecko: ["CoinGecko", "https://www.coingecko.com"], coinmarketcap: ["CoinMarketCap", "https://coinmarketcap.com"],
+  yahoo: ["Yahoo Finance", "https://finance.yahoo.com"], youtube: ["YouTube", "https://youtube.com"], pexels: ["Pexels", "https://pexels.com"]
+};
+const sourceList = (keys) => keys.map((k) => SOURCE_LABELS[k]).filter(Boolean).map(([name, url]) => ({ name, url }));
+
+const factSlots = { n: 0, max: 2 };
+
+const chat = {
+  /** Admission + persistance idempotente + mise en file. Retourne immédiatement (aucun appel LLM ici). */
+  async start({ userId, role, firebaseUid, convId, message, clientMsgId = null, tier = "v100", images = null, googleAccessToken = null, channel = "web", skipQuota = false }) {
+    const { created } = await repo.ensureConversation(userId, convId, { firebaseUid });
+
+    if (clientMsgId) {   // un retry réseau du client ne crée NI doublon NI nouvelle facturation
+      const dup = await db.get("SELECT idx FROM messages WHERE session_id = ? AND client_msg_id = ?", [convId, clientMsgId]);
+      if (dup) {
+        const existing = runManager.findByMessage(convId, dup.idx);
+        return { duplicate: true, run: existing, userIdx: dup.idx, created: false };
+      }
+    }
+
+    runManager.assertCanAccept(userId);
+
+    const hasImages = Boolean(images && images.length);
+    if (!skipQuota) {
+      const q = await repo.reserveQuota(userId, "message", role);
+      if (!q.allowed) throw new AppError("QUOTA_EXCEEDED", q.message, { status: 429 });
+    }
+    if (hasImages && !skipQuota) {
+      const qi = await repo.reserveQuota(userId, "image", role);
+      if (!qi.allowed) { await repo.refundQuota(userId, "message"); throw new AppError("QUOTA_EXCEEDED", qi.message, { status: 429 }); }
+    }
+
+    let userMsg = null, asst = null;
+    try {
+      const runId = newId("run");
+      userMsg = (await repo.appendMessage({ userId, convId, role: "user", content: message, clientMsgId, status: "final" })).message;
+      asst = (await repo.appendMessage({ userId, convId, role: "assistant", content: "", runId, status: "streaming" })).message;
+      const lane = laneOf(tier, hasImages);
+      await repo.insertRun({ runId, userId, convId, userIdx: userMsg.idx, assistantIdx: asst.idx, tier, lane });
+      const run = runManager.submit({
+        id: runId, userId, firebaseUid, role, convId, userIdx: userMsg.idx, assistantIdx: asst.idx,
+        tier, lane, message, images, googleAccessToken, channel, skipQuota, language: detectLanguage(message), isNew: created
+      });
+      return { duplicate: false, run, userMessage: userMsg, assistantMessage: asst, created };
+    } catch (e) {
+      if (!skipQuota) {
+        await repo.refundQuota(userId, "message").catch(() => {});
+        if (hasImages) await repo.refundQuota(userId, "image").catch(() => {});
+      }
+      if (asst) await repo.finalizeMessage({ userId, convId, idx: asst.idx, content: "", status: "failed" }).catch(() => {});
+      throw e;
+    }
+  },
+
+  /** Termine un run qui n'a pas pu (ou plus) s'exécuter normalement (file pleine, annulation, arrêt…). */
+  async failRun(run, status, err) {
+    if (run.isFinal) return;
+    const partial = formatFinalReply(run.rawText);
+    try {
+      await repo.finalizeMessage({ userId: run.userId, convId: run.convId, idx: run.assistantIdx, content: partial, status: partial ? (status === "failed" ? "interrupted" : status) : status });
+    } catch (e) { logger.error({ err: e.message, runId: run.id }, "finalisation du message échouée"); }
+    if (!partial && !run.skipQuota) await repo.refundQuota(run.userId, "message").catch(() => {});
+    if (err) run.push("error", { code: err.code, reply: err.message, retryable: Boolean(err.retryable) });
+    const result = { conversationId: run.convId, runId: run.id, error: status === "failed", cancelled: status === "cancelled", interrupted: status === "interrupted", reply: partial || err?.message || "", degraded: Boolean(partial), code: err?.code || null };
+    run.push("done", result);
+    run.finish(status === "cancelled" ? "cancelled" : status === "interrupted" ? "interrupted" : "failed", result);
+    repo.updateRun(run.id, { status: run.status, finished_at: now(), error_code: err?.code || null }).catch(() => {});
+  },
+
+  async execute(run) {
+    const T = run.lane === "heavy" ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT;
+    const deadlineAt = now() + T.TOTAL_MS;
+    const signal = run.controller.signal;
+    const startedAt = now();
+    const emit = {
+      status: (stage, extra) => run.push("status", { stage, ...extra }),
+      token: (t) => run.token(t),
+      reasoning: (t) => run.reasoning(t),
+      images: (list) => { if (list?.length) { run.outImages.push(...list); run.push("images", { images: list }); } },
+      videos: (list) => { if (list?.length) { run.outVideos.push(...list); run.push("videos", { videos: list }); } },
+      code: (p) => run.push("code", p)
+    };
+
+    let lastLen = 0;
+    const checkpoint = setInterval(() => {
+      if (run.rawText.length !== lastLen) { lastLen = run.rawText.length; repo.checkpointMessage(run.convId, run.assistantIdx, run.rawText).catch(() => {}); }
+    }, CONFIG.QUEUE.CHECKPOINT_MS);
+
+    try {
+      emit.status("preparing", { language: run.language });
+      const hasImages = Boolean(run.images && run.images.length);
+      const pre = legacy?.preRouteIntent ? (() => { try { return legacy.preRouteIntent(run.message); } catch { return null; } })() : null;
+      const intent = pre?.intent && pre.intent !== "GENERAL" ? pre.intent : quickIntent(run.message);
+      const entity = pre?.entity ?? null;
+      const wantsEnrich = intent !== "SMALLTALK" && intent !== "CODE" && intent !== "GENERAL" && legacy?.enrichContextWithIntent;
+
+      // Tout ce qui est facultatif est BORNÉ dans le temps et ne peut jamais bloquer la réponse.
+      const [ctxRows, memoryBlock, mod, enrichment] = await Promise.all([
+        repo.getContext(run.convId, CONFIG.LIMITS.MAX_CONTEXT_MESSAGES + 4),
+        settle(repo.memoryBlock(run.userId), 1500, ""),
+        settle(moderateRemote(run.message), 2500, { safe: true }),
+        wantsEnrich ? settle(legacy.enrichContextWithIntent(intent, run.message, entity, new Map()), 4500, null) : Promise.resolve(null)
+      ]);
+      if (signal.aborted) throw abortError(run.cancelReason || "aborted");
+      if (!mod.safe) {
+        logSecurity(run.userId, "CONTENT_BLOCKED", { runId: run.id });
+        throw new AppError("CONTENT_BLOCKED", "Contenu non autorisé.", { status: 400 });
+      }
+
+      const sources = new Set(enrichment?.sourceKeys || []);
+      if (enrichment?.media?.images?.length) emit.images(enrichment.media.images);
+      if (enrichment?.media?.videos?.length) emit.videos(enrichment.media.videos);
+
+      // Image « garantie » : lancée en parallèle du LLM (avant : bloquait la réponse).
+      let imagePromise = null;
+      const skipImage = hasImages || intent === "SMALLTALK" || enrichment?.media?.images?.length || (legacy?.isIdentityOrSelfQuestion && legacy.isIdentityOrSelfQuestion(run.message));
+      if (!skipImage && legacy?.ensureImageForResponse) imagePromise = settle(legacy.ensureImageForResponse(run.message, entity), 6000, null);
+
+      // Messages
+      const history = ctxRows.filter((r) => r.idx < run.userIdx).slice(-CONFIG.LIMITS.MAX_CONTEXT_MESSAGES).map((r) => ({ role: r.role, content: r.content }));
+      let system = LUBA_SYSTEM_PROMPT + `\n\n[LANGUE DÉTECTÉE : ${run.language.toUpperCase()}] → Réponds en ${LANG_NAME[run.language] || "français"}.`;
+      if (memoryBlock) system += `\n\n${memoryBlock}`;
+      if (intent && intent !== "GENERAL" && intent !== "SMALLTALK") system += `\n\n[DOMAINE DÉTECTÉ : ${intent}]`;
+      if (run.outImages.length) system += `\n\n[IMAGES : ${run.outImages.length} image(s) seront affichées automatiquement. Ne mentionne PAS les URLs.]`;
+      const userContent = enrichment?.contextData ? `${run.message}\n\n[CONTEXTE ENRICHI — NE PAS CITER CES SOURCES]\n${enrichment.contextData}` : run.message;
+      const messages = [{ role: "system", content: system }, ...history, { role: "user", content: userContent }];
+
+      const chain = tierChain(run.tier, { hasImages, code: run.tier === "v250" && intent === "CODE" });
+      const tools = hasImages || intent === "SMALLTALK" ? [] : getToolSchemas();
+      const ctx = { userId: run.userId, googleAccessToken: run.googleAccessToken, convId: run.convId };
+
+      const out = await orchestrate({
+        chain, lane: run.lane, messages, images: run.images && run.images.length ? run.images : null, tools,
+        executeTool: (call) => executeTool(call, ctx), signal, deadlineAt, emit
+      });
+      out.sources.forEach((k) => sources.add(k));
+
+      let finalText = formatFinalReply(out.text);
+      const sug = extractSuggestions(finalText);
+      finalText = sug.text;
+      if (!finalText) throw new ProviderError("empty", "réponse vide");
+
+      let guaranteed = null;
+      if (imagePromise) {
+        guaranteed = await settle(imagePromise, Math.max(500, Math.min(3000, deadlineAt - now())), null);
+        if (guaranteed?.images?.length) emit.images(guaranteed.images);
+      }
+      const imageUrls = [...new Set(run.outImages.map((i) => i?.url || i).filter((u) => typeof u === "string"))].slice(0, 3);
+
+      // Publicité (facultative, 1,5 s max) — même comportement qu'en v16.5
+      let ad = null;
+      if (legacy?.getAd && run.channel !== "whatsapp" && run.channel !== "live-ws") ad = await settle(legacy.getAd({ slot: "chat_below", userId: run.userId }), 1500, null);
+      const srcList = sourceList([...sources]);
+      let footer = "";
+      if (ad?.imageUrl) {
+        const title = String(ad.title || "Sponsorisé").replace(/[[\]]/g, "");
+        footer += `\n\n${ad.clickUrl ? `[![${title}](${ad.imageUrl})](${ad.clickUrl})` : `![${title}](${ad.imageUrl})`}`;
+        run.push("ad", { ad });
+      }
+      if (srcList.length) footer += `\n\n---\n\n**Sources :** ${srcList.map((s) => `[${s.name}](${s.url})`).join(" · ")}`;
+      if (srcList.length) run.push("sources", { sources: srcList });
+      if (sug.suggestions.length) run.push("suggestions", { suggestions: sug.suggestions });
+      if (footer) run.token(footer);
+
+      const status = out.partial ? "interrupted" : "final";
+      const elapsedMs = now() - startedAt;
+      await repo.finalizeMessage({
+        userId: run.userId, convId: run.convId, idx: run.assistantIdx, content: finalText, status,
+        metadata: { providerUsed: out.provider, model: out.model, tier: run.tier, intent, language: run.language, elapsedMs, ttftMs: out.ttftMs, media: { images: [...imageUrls, ...(guaranteed?.images || []).map((i) => i.url)].filter(Boolean).slice(0, 3), videos: dedupeVideos(out.videos.concat(run.outVideos)).slice(0, 6) }, sources: srcList, suggestions: sug.suggestions, partial: out.partial }
+      });
+
+      const result = {
+        conversationId: run.convId, runId: run.id, messageId: msgKey(run.convId, run.assistantIdx), isNewConversation: Boolean(run.isNew),
+        reply: finalText + footer, text: finalText, error: false, degraded: out.partial, providerUsed: out.provider, model: out.model,
+        modelTier: run.tier, visionEnabled: hasImages, intent, language: run.language, contextLength: history.length,
+        elapsedMs, ttftMs: out.ttftMs, queueMs: run.queueMs, adIncluded: Boolean(ad), imagesGuaranteed: Boolean(guaranteed?.images?.length),
+        suggestions: sug.suggestions, sources: srcList, toolCallTrace: out.trace, usage: out.usage,
+        media: { images: imageUrls, videos: out.videos }
+      };
+      run.push("done", result);
+      run.finish(out.partial ? "interrupted" : "done", result);
+      repo.updateRun(run.id, { status: run.status, finished_at: now(), provider: out.provider, model: out.model, ttft_ms: out.ttftMs, tokens_out: out.usage.completion }).catch(() => {});
+      chat.afterRun(run, finalText);
+    } catch (e) {
+      const cancelled = signal.aborted;
+      if (cancelled) {
+        const status = run.cancelReason === "shutdown" ? "interrupted" : "cancelled";
+        return chat.failRun(run, status, status === "interrupted" ? new AppError("SHUTDOWN", "Le serveur redémarre, réessayez.", { status: 503, retryable: true }) : null);
+      }
+      const err = e instanceof AppError ? e : new AppError(e instanceof ProviderError ? "LLM_UNAVAILABLE" : "RUN_FAILED", e instanceof ProviderError ? friendlyMessage(e) : "Une erreur interne est survenue.", { status: 503, retryable: true });
+      if (!(e instanceof AppError) && !(e instanceof ProviderError)) logger.error({ err: e?.message, stack: e?.stack, runId: run.id }, "run échoué");
+      return chat.failRun(run, "failed", err);
+    } finally {
+      clearInterval(checkpoint);
+    }
+  },
+
+  /** Tâches de fond : mémoire utilisateur (jamais bloquantes, jamais dans le chemin critique). */
+  afterRun(run, answer) {
+    // Basse priorité : uniquement quand le serveur a de la marge (jamais au détriment des vraies réponses).
+    if (!CONFIG.MEMORY_EXTRACT || CONFIG.FAKE_LLM || run.userIdx % 6 !== 1 || factSlots.n >= factSlots.max) return;
+    if (runManager.queue.length > 0 || runManager.active >= Math.ceil(CONFIG.QUEUE.GLOBAL_CONCURRENCY / 2)) return;
+    factSlots.n++;
+    (async () => {
+      const chain = tierChain("v100");
+      if (!chain.length) return;
+      const r = await callLLM({
+        chain, lane: "light", signal: AbortSignal.timeout(20000), deadlineAt: now() + 20000, emit: NOOP_EMIT, tools: [], images: null,
+        messages: [
+          { role: "system", content: "Extrais au plus 3 faits DURABLES et utiles sur l'utilisateur (prénom, métier, ville, préférences, projets). Réponds UNIQUEMENT par un tableau JSON: [{\"fact\":\"...\",\"category\":\"identity|work|preferences|projects|general\"}]. Si rien de durable: []." },
+          { role: "user", content: `Message utilisateur : ${run.message.slice(0, 800)}\n\nRéponse de l'assistant : ${answer.slice(0, 400)}` }
+        ]
+      });
+      const m = r.text.match(/\[[\s\S]*\]/);
+      const arr = m ? safeJsonParse(m[0], []) : [];
+      for (const f of (Array.isArray(arr) ? arr : []).slice(0, 3)) if (f?.fact) await repo.addFact(run.userId, f.fact, String(f.category || "general").slice(0, 30), run.convId);
+    })().catch((e) => logger.debug({ err: e.message }, "extraction de faits ignorée")).finally(() => { factSlots.n--; });
+  }
+};
+
+runManager.start((run) => chat.execute(run), (run, status, err) => chat.failRun(run, status, err));
+
+// ================================================================================
+// §14 — SSE + SERVICE DE SYNCHRONISATION (delta par curseur, push SSE / WebSocket)
+// ================================================================================
+
+class SSEStream {
+  constructor(req, res, { heartbeatMs = CONFIG.TIMEOUTS.HEARTBEAT_MS } = {}) {
+    this.res = res;
+    this.closed = false;
+    this.onClose = null;
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
+    try { req.socket.setTimeout(0); req.socket.setNoDelay(true); req.socket.setKeepAlive(true, 30000); } catch {}
+    res.write("retry: 2000\n\n");
+    // Heartbeat : empêche nginx / les opérateurs mobiles de couper une réflexion longue.
+    this.hb = setInterval(() => this.comment("hb"), heartbeatMs);
+    res.on("close", () => this.close());
+    res.on("error", () => this.close());
+  }
+
+  _write(chunk) {
+    if (this.closed) return false;
+    try {
+      const ok = this.res.write(chunk);
+      // Client trop lent : on coupe (il reprendra via Last-Event-ID) au lieu de gonfler la RAM du serveur.
+      if (!ok && this.res.writableLength > 2_000_000) { this.end(); return false; }
+      return true;
+    } catch { this.close(); return false; }
+  }
+
+  send(event, data, id = null) {
+    const payload = typeof data === "string" ? data : safeJsonStringify(data ?? {});
+    return this._write(`${id !== null && id !== undefined ? `id: ${id}\n` : ""}event: ${event}\ndata: ${payload}\n\n`);
+  }
+  comment(text) { return this._write(`: ${text}\n\n`); }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    clearInterval(this.hb);
+    try { this.onClose?.(); } catch {}
+  }
+  end() {
+    if (this.closed) return;
+    const res = this.res;
+    this.close();
+    try { res.end(); } catch {}
+  }
+}
+
+/** Branche une connexion HTTP sur un run : rejoue ce qui a été manqué puis suit en direct. */
+function attachRunStream(req, res, run, afterSeq = 0, { preface = null } = {}) {
+  const sse = new SSEStream(req, res);
+  let off = null;
+  if (preface) preface(sse);
+  const emitEv = (ev) => {
+    sse.send(ev.type, ev.data, ev.seq);
+    if (ev.type === "done") setImmediate(() => sse.end());
+  };
+  for (const ev of run.replayFrom(afterSeq)) emitEv(ev);
+  if (!sse.closed && !run.isFinal) off = run.subscribe(emitEv);
+  else if (run.isFinal) setImmediate(() => sse.end());
+  sse.onClose = () => { if (off) off(); };
+  return sse;
+}
+
+class SyncHub {
+  constructor() {
+    this.conns = new Map();    // userId → Set<conn>
+    this.unsubs = new Map();
+    this.MAX_CONN_PER_USER = envInt("SYNC_MAX_CONN_PER_USER", 8);
+  }
+
+  add(conn) {
+    let set = this.conns.get(conn.userId);
+    if (!set) {
+      set = new Set();
+      this.conns.set(conn.userId, set);
+      this.unsubs.set(conn.userId, bus.subscribe(`user:${conn.userId}`, () => this._notify(conn.userId)));
+    }
+    if (set.size >= this.MAX_CONN_PER_USER) { const oldest = set.values().next().value; this.remove(oldest); try { oldest.close(); } catch {} }
+    set.add(conn);
+  }
+
+  remove(conn) {
+    const set = this.conns.get(conn.userId);
+    if (!set) return;
+    clearTimeout(conn.timer);
+    set.delete(conn);
+    if (set.size === 0) {
+      this.conns.delete(conn.userId);
+      this.unsubs.get(conn.userId)?.();
+      this.unsubs.delete(conn.userId);
+    }
+  }
+
+  _notify(userId) { for (const c of this.conns.get(userId) || []) this.schedule(c); }
+
+  /** Coalescence 40 ms : une rafale d'écritures = un seul delta poussé. */
+  schedule(conn) {
+    if (conn.timer) return;
+    conn.timer = setTimeout(() => { conn.timer = null; this.flush(conn).catch((e) => logger.warn({ err: e.message }, "sync flush")); }, 40);
+  }
+
+  async flush(conn) {
+    if (conn.flushing) { conn.again = true; return; }
+    conn.flushing = true;
+    try {
+      for (let guard = 0; guard < 20; guard++) {
+        const d = await repo.syncDelta(conn.userId, conn.cursor, CONFIG.SYNC.PAGE);
+        if (d.resyncRequired) { conn.send("resync", { reason: "cursor_too_old" }); break; }
+        const changed = d.conversations.length || d.messages.length || d.deletedConversations.length;
+        if (d.cursor !== conn.cursor) conn.cursor = d.cursor;
+        if (changed) { conn.send("delta", d, d.cursor); M.syncPush.inc({ transport: conn.transport || "sse" }); }
+        if (!d.hasMore) break;
+      }
+    } finally {
+      conn.flushing = false;
+      if (conn.again) { conn.again = false; this.schedule(conn); }
+    }
+  }
+
+  stats() { let n = 0; for (const s of this.conns.values()) n += s.size; return { users: this.conns.size, connections: n }; }
+  closeAll() { for (const set of this.conns.values()) for (const c of set) { try { c.close(); } catch {} } }
+}
+const syncHub = new SyncHub();
+
+// ----- WebSocket (optionnel : actif si le paquet `ws` est installé) -----
+// UN SEUL routeur d'upgrade : /ws (sync v17) et /live (voix v16.5). Avec `ws`, deux serveurs en mode
+// `server+path` se rejettent mutuellement (400) : on passe tout en `noServer` et on aiguille ici.
+let wss = null;
+function setupWebSocket(server) {
+  const WSS = WsLib ? (WsLib.WebSocketServer || WsLib.Server) : null;
+  if (WSS) wss = new WSS({ noServer: true, maxPayload: 64 * 1024 });
+  else logger.info("WebSocket désactivé (paquet `ws` absent) — SSE /api/sync/stream reste disponible");
+  const reject = (socket, code, msg) => { try { socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`); } catch {} socket.destroy(); };
+
+  server.on("upgrade", async (req, socket, head) => {
+    try {
+      const url = new URL(req.url, "http://x");
+      if (url.pathname === "/live") {                       // Luba Live (voix) — authentification gérée par l'héritage (trame AUTH)
+        const live = legacy?.__liveWss;
+        if (!live) return reject(socket, 404, "Not Found");
+        return live.handleUpgrade(req, socket, head, (ws) => live.emit("connection", ws, req));
+      }
+      if (url.pathname !== "/ws" || !wss) return reject(socket, 404, "Not Found");
+      const origin = req.headers.origin;
+      if (origin && !ALLOWED_ORIGINS.includes(origin)) return reject(socket, 403, "Forbidden");
+      const h = req.headers.authorization || "";
+      const token = (h.startsWith("Bearer ") ? h.slice(7) : null) || url.searchParams.get("access_token");
+      if (!token) return reject(socket, 401, "Unauthorized");
+      const user = await verifyToken(token);
+      await touchUser(user);
+      const since = parseInt(url.searchParams.get("cursor") || "0", 10) || 0;
+      wss.handleUpgrade(req, socket, head, (ws) => onWsConnection(ws, user.uid, since));
+    } catch (e) { reject(socket, e?.status === 503 ? 503 : 401, "Unauthorized"); }
+  });
+
+  if (wss) {
+    const beat = setInterval(() => {
+      for (const ws of wss.clients) {
+        if (ws.isAlive === false) { ws.terminate(); continue; }
+        ws.isAlive = false;
+        try { ws.ping(); } catch {}
+      }
+    }, 25000);
+    beat.unref();
+    wss.on("close", () => clearInterval(beat));
+    logger.info("WebSocket /ws prêt");
+  }
+}
+
+function onWsConnection(ws, userId, since) {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+  const conn = {
+    userId, cursor: since, transport: "ws",
+    send: (event, data, id) => {
+      if (ws.readyState !== 1) return;
+      if (ws.bufferedAmount > 2_000_000) { ws.terminate(); return; }
+      ws.send(safeJsonStringify({ event, data, id: id ?? null }));
+    },
+    close: () => { try { ws.close(1001, "closing"); } catch {} }
+  };
+  syncHub.add(conn);
+  ws.on("close", () => syncHub.remove(conn));
+  ws.on("error", () => syncHub.remove(conn));
+  ws.on("message", (raw) => {
+    const m = safeJsonParse(String(raw), null);
+    if (!m) return;
+    if (m.type === "ping") conn.send("pong", { t: now() });
+    if (m.type === "subscribe" && Number.isFinite(+m.cursor)) { conn.cursor = +m.cursor; syncHub.schedule(conn); }
+  });
+  repo.currentSeq(userId).then((cur) => {
+    if (since === 0) conn.cursor = cur;
+    conn.send("hello", { cursor: conn.cursor, snapshot: since === 0 }, conn.cursor);
+    if (since > 0) syncHub.schedule(conn);
+  }).catch(() => {});
+}
+
+// ================================================================================
+// §15 — MIROIRS FIRESTORE / SUPABASE (outbox durable · asynchrone · jamais lus)
+// ================================================================================
+// SQLite est la source de vérité. Les miroirs sont alimentés par `mirror_queue`, écrite
+// DANS LA MÊME TRANSACTION que le message : rien n'est perdu même si Firestore est en
+// panne ; retries exponentiels ; plus de lecture Firestore sur le chemin du chat.
+
+class MirrorWorker {
+  constructor() { this.timer = null; this.busy = false; this.stats = { ok: 0, failed: 0, dead: 0 }; }
+
+  start() {
+    if (!CONFIG.MIRROR.ENABLED || (!mirrorState.firestore && !mirrorState.supabase)) { logger.info("miroirs désactivés"); return; }
+    this.timer = setInterval(() => this.tick().catch((e) => logger.warn({ err: e.message }, "mirror tick")), 2000);
+    this.timer.unref();
+    logger.info({ firestore: mirrorState.firestore, supabase: mirrorState.supabase }, "miroirs actifs (outbox durable)");
+  }
+  stop() { clearInterval(this.timer); }
+
+  async tick() {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const rows = await db.all("SELECT * FROM mirror_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id ASC LIMIT ?", [now(), CONFIG.MIRROR.BATCH]);
+      if (!rows.length) return;
+      for (const target of ["firestore", "supabase"]) {
+        const batch = rows.filter((r) => r.target === target);
+        if (!batch.length) continue;
+        let err = null;
+        try {
+          if (target === "firestore" && firestoreDb) await this._firestore(batch);
+          else if (target === "supabase" && supabaseClient) await this._supabase(batch);
+          else err = new Error("cible indisponible");
+        } catch (e) { err = e; }
+        await this._settle(batch, err);
+      }
+    } finally { this.busy = false; }
+  }
+
+  async _firestore(batch) {
+    const col = (n) => firestoreDb.collection(n);
+    const wb = firestoreDb.batch();
+    for (const r of batch) {
+      const p = safeJsonParse(r.payload, {});
+      if (r.kind === "message") {
+        wb.set(col("messages").doc(r.key.replace(/[:/]/g, "_")), {
+          session_id: p.conversationId, user_id: p.user_id, firebase_uid: p.user_id, idx: p.idx, role: p.role, content: p.content,
+          status: p.status, metadata: p.metadata || {}, created_at: p.createdAt, updated_at: p.updatedAt
+        }, { merge: true });
+      } else if (r.kind === "session") {
+        wb.set(col("sessions").doc(p.session_id), { session_id: p.session_id, user_id: p.user_id, firebase_uid: p.user_id, updated_at: p.updated_at, title: p.title || null }, { merge: true });
+      } else if (r.kind === "session_delete") {
+        wb.delete(col("sessions").doc(p.session_id));
+      }
+    }
+    await wb.commit();
+  }
+
+  async _supabase(batch) {
+    const msgs = [], sess = [];
+    for (const r of batch) {
+      const p = safeJsonParse(r.payload, {});
+      if (r.kind === "message") msgs.push({ session_id: p.conversationId, idx: p.idx, user_id: p.user_id, firebase_uid: p.user_id, role: p.role, content: p.content, status: p.status, metadata: p.metadata || {}, created_at: new Date(p.createdAt).toISOString(), updated_at: new Date(p.updatedAt).toISOString() });
+      else if (r.kind === "session") sess.push({ session_id: p.session_id, user_id: p.user_id, firebase_uid: p.user_id, title: p.title || null, updated_at: new Date(p.updated_at).toISOString() });
+    }
+    if (sess.length) { const { error } = await supabaseClient.from("sessions").upsert(sess, { onConflict: "session_id" }); if (error) throw new Error(error.message); }
+    if (msgs.length) { const { error } = await supabaseClient.from("messages").upsert(msgs, { onConflict: "session_id,idx" }); if (error) throw new Error(error.message); }
+  }
+
+  async _settle(batch, err) {
+    await db.transaction(async (w) => {
+      for (const r of batch) {
+        if (!err) {
+          // ne supprime que si le payload n'a pas été remplacé entre-temps (sinon il sera renvoyé)
+          await w.run("DELETE FROM mirror_queue WHERE id = ? AND payload = ?", [r.id, r.payload]);
+          this.stats.ok++;
+        } else {
+          const attempts = r.attempts + 1;
+          const dead = attempts >= CONFIG.MIRROR.MAX_ATTEMPTS;
+          await w.run("UPDATE mirror_queue SET attempts = ?, status = ?, next_attempt_at = ?, last_error = ? WHERE id = ?",
+            [attempts, dead ? "dead" : "pending", now() + Math.min(600000, 2000 * 2 ** attempts), String(err.message).slice(0, 300), r.id]);
+          this.stats[dead ? "dead" : "failed"]++;
+        }
+      }
+    });
+    if (err) logger.warn({ err: err.message, n: batch.length, target: batch[0].target }, "miroir : échec (retry planifié)");
+  }
+}
+const mirrorWorker = new MirrorWorker();
+
+// ================================================================================
+// §16 — APPLICATION HTTP + ROUTES
+// ================================================================================
+
+function sendError(req, res, e) {
+  let err = e;
+  if (!(e instanceof AppError)) {
+    if (e?.code === "LIMIT_FILE_SIZE") err = Errors.badRequest("IMAGE_TOO_LARGE", `Image trop lourde (max ${CONFIG.LIMITS.MAX_IMAGE_SIZE_MB} Mo).`);
+    else if (e?.type === "entity.too.large") err = new AppError("PAYLOAD_TOO_LARGE", "Requête trop volumineuse.", { status: 413 });
+    else if (e?.type === "entity.parse.failed") err = Errors.badRequest("INVALID_JSON", "JSON invalide.");
+    else if (e instanceof ProviderError) err = new AppError("LLM_UNAVAILABLE", friendlyMessage(e), { status: 503, retryable: true });
+    else {
+      logger.error({ err: e?.message, stack: e?.stack, path: req.path, requestId: req.requestId }, "erreur non gérée");
+      err = new AppError("INTERNAL_ERROR", "Erreur interne.", { status: 500 });
+    }
+  }
+  if (res.headersSent) { try { res.end(); } catch {} return; }
+  if (err.retryAfterMs) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(err.retryAfterMs / 1000))));
+  res.status(err.status).json({ success: false, error: true, code: err.code, reply: err.message, message: err.message, retryable: err.retryable, requestId: req.requestId });
+}
+
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((e) => sendError(req, res, e));
+
+const timingSafeStr = (a, b) => { const x = Buffer.from(String(a)); const y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+
+function isValidImageSignature(buf) {
+  if (!buf || buf.length < 12) return false;
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return true;
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) return true;
+  if (buf.subarray(0, 4).toString("ascii") === "GIF8") return true;
+  return buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP";
+}
+const toImageObj = (f) => { const b64 = f.buffer.toString("base64"); return { dataUrl: `data:${f.mimetype};base64,${b64}`, base64: b64, mimetype: f.mimetype }; };
+
+const upload = multer ? multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CONFIG.LIMITS.MAX_IMAGE_SIZE_MB * 1024 * 1024, files: CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST },
+  fileFilter: (_req, file, cb) => (["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype) ? cb(null, true) : cb(Errors.badRequest("UNSUPPORTED_IMAGE", "Type d'image non supporté.")))
+}) : null;
+const chatUpload = (req, res, next) => (upload ? upload.array("images", CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST)(req, res, (err) => (err ? sendError(req, res, err) : next())) : next());
+
+const wantsStreaming = (req) => String(req.headers.accept || "").toLowerCase().includes("text/event-stream") || req.body?.stream === true || req.body?.stream === "true" || req.query.stream === "true";
+const CONV_ID_RE = /^[a-zA-Z0-9_-]{6,80}$/;
+const CLIENT_ID_RE = /^[\w:.-]{6,100}$/;
+
+// ---------- POST /api/chat ----------
+async function chatHandler(req, res) {
+  const stream = wantsStreaming(req);
+  const raw = req.body?.message;
+  if (!raw || typeof raw !== "string") throw Errors.badRequest("MISSING_MESSAGE", "Le message est obligatoire.");
+  const message = sanitizeForLLM(raw, CONFIG.LIMITS.MAX_MESSAGE_LENGTH);
+  if (!message) throw Errors.badRequest("INVALID_MESSAGE", "Message vide.");
+  if (detectPromptInjection(message).detected) { logSecurity(req.userId, "PROMPT_INJECTION_BLOCKED", {}, req.ip, req.headers["user-agent"]); throw Errors.badRequest("PROMPT_INJECTION", "Requête bloquée."); }
+  if (!moderateLocal(message).safe) { logSecurity(req.userId, "CONTENT_BLOCKED", {}, req.ip, req.headers["user-agent"]); throw Errors.badRequest("CONTENT_BLOCKED", "Contenu non autorisé."); }
+  if (!verifyHmac(req)) throw Errors.unauthorized("INVALID_SIGNATURE", "Signature invalide.");
+
+  let convId = req.body?.conversationId || req.body?.conversation_id;
+  if (convId && !CONV_ID_RE.test(convId)) throw Errors.badRequest("INVALID_CONVERSATION_ID", "ID de conversation invalide.");
+  const isNewRequest = !convId;
+  if (!convId) convId = newId("conv");
+  const clientMsgId = req.body?.clientMessageId || req.body?.client_message_id || req.headers["idempotency-key"] || null;
+  if (clientMsgId && !CLIENT_ID_RE.test(clientMsgId)) throw Errors.badRequest("INVALID_CLIENT_MESSAGE_ID", "clientMessageId invalide.");
+
+  let images = null;
+  if (req.files?.length) {
+    if (req.files.some((f) => !isValidImageSignature(f.buffer))) throw Errors.badRequest("INVALID_IMAGE_CONTENT", "Image invalide.");
+    images = req.files.map(toImageObj);
+  }
+
+  const started = await chat.start({
+    userId: req.userId, role: req.userRole, firebaseUid: req.firebaseUid, convId, message, clientMsgId,
+    tier: req.body?.modelTier === "v250" ? "v250" : "v100", images,
+    googleAccessToken: req.headers["x-google-access-token"] || null, channel: stream ? "web-sse" : "web"
+  });
+  const { run, duplicate } = started;
+  const accepted = {
+    conversationId: convId, isNewConversation: isNewRequest || Boolean(started.created), runId: run?.id || null, duplicate: Boolean(duplicate),
+    userMessage: started.userMessage || null, assistantMessageId: run ? msgKey(convId, run.assistantIdx) : null, assistantIdx: run?.assistantIdx ?? null
+  };
+
+  if (stream) {
+    if (!run) {
+      const sse = new SSEStream(req, res);
+      sse.send("accepted", accepted);
+      sse.send("done", { conversationId: convId, duplicate: true, error: false });
+      return sse.end();
+    }
+    const sse = attachRunStream(req, res, run, 0, { preface: (s) => s.send("accepted", accepted) });
+    if (req.query.cancelOnDisconnect === "true") {
+      res.on("close", () => setTimeout(() => { if (!run.isFinal && run.subs.size === 0) runManager.cancel(run.id, req.userId).catch(() => {}); }, 5000).unref());
+    }
+    return sse;
+  }
+
+  if (!run) return res.json({ success: true, error: false, ...accepted });
+  const waitMs = envInt("NONSTREAM_WAIT_MS", 55000);
+  const result = await Promise.race([run.finished, sleepRaw(waitMs).then(() => null)]);
+  if (!result) return res.status(202).json({ success: true, accepted: true, status: run.status, ...accepted, pollUrl: `/api/runs/${run.id}` });
+  return res.status(200).json({ success: !result.error, ...result, conversationId: convId, isNewConversation: accepted.isNewConversation, duplicate: Boolean(duplicate) });
+}
+
+// ---------- Runs ----------
+async function runStatusHandler(req, res) {
+  const run = runManager.get(req.params.runId);
+  if (run) {
+    if (run.userId !== req.userId) throw Errors.forbidden("RUN_OWNERSHIP", "Cette génération ne vous appartient pas.");
+    return res.json({ success: true, ...run.summary(), result: run.isFinal ? run.result : null, partialText: run.isFinal ? undefined : run.rawText });
+  }
+  const row = await db.get("SELECT * FROM runs WHERE run_id = ? AND user_id = ?", [req.params.runId, req.userId]);
+  if (!row) throw Errors.notFound("RUN_NOT_FOUND", "Génération introuvable.");
+  const m = await db.get("SELECT content, status FROM messages WHERE session_id = ? AND idx = ?", [row.session_id, row.assistant_idx]);
+  return res.json({ success: true, runId: row.run_id, status: row.status, conversationId: row.session_id, assistantIdx: row.assistant_idx, result: m ? { reply: m.content, status: m.status } : null });
+}
+
+async function runStreamHandler(req, res) {
+  const after = parseInt(req.headers["last-event-id"] || req.query.after || "0", 10) || 0;
+  const run = runManager.get(req.params.runId);
+  if (run) {
+    if (run.userId !== req.userId) throw Errors.forbidden("RUN_OWNERSHIP", "Cette génération ne vous appartient pas.");
+    attachRunStream(req, res, run, after);
+    return;
+  }
+  // run déjà terminé et purgé de la mémoire : on rend l'état final depuis SQLite
+  const row = await db.get("SELECT * FROM runs WHERE run_id = ? AND user_id = ?", [req.params.runId, req.userId]);
+  if (!row) throw Errors.notFound("RUN_NOT_FOUND", "Génération introuvable.");
+  const m = await db.get("SELECT content, status FROM messages WHERE session_id = ? AND idx = ?", [row.session_id, row.assistant_idx]);
+  const sse = new SSEStream(req, res);
+  sse.send("snapshot", { text: m?.content || "", status: m?.status || row.status });
+  sse.send("done", { conversationId: row.session_id, runId: row.run_id, reply: m?.content || "", error: row.status === "failed", status: row.status });
+  sse.end();
+}
+
+async function runCancelHandler(req, res) {
+  const status = await runManager.cancel(req.params.runId, req.userId);
+  res.json({ success: true, status });
+}
+
+// ---------- Conversations / messages ----------
+async function listConversationsHandler(req, res) {
+  const limit = clamp(parseInt(req.query.limit, 10) || 50, 1, CONFIG.LIMITS.MAX_PAGE_SIZE);
+  const before = parseInt(req.query.before, 10) || null;
+  const conversations = await repo.listConversations(req.userId, { limit, beforeMs: before });
+  res.json({ success: true, error: false, conversations, nextBefore: conversations.length === limit ? conversations[conversations.length - 1].updatedAtMs : null });
+}
+
+async function messagesHandler(req, res) {
+  const convId = req.params.conversationId;
+  if (!CONV_ID_RE.test(convId)) throw Errors.badRequest("INVALID_CONVERSATION_ID", "ID invalide.");
+  const full = req.query.full === "true";
+  const limit = full ? 500 : clamp(parseInt(req.query.limit, 10) || 50, 1, CONFIG.LIMITS.MAX_PAGE_SIZE * 2);
+  const r = await repo.getMessages(req.userId, convId, { afterIdx: parseInt(req.query.after, 10) || 0, beforeIdx: parseInt(req.query.before, 10) || null, limit });
+  res.json({ success: true, error: false, conversationId: convId, messages: r.messages, count: r.messages.length, hasMore: r.hasMore, lastIdx: r.lastIdx });
+}
+
+async function syncHandler(req, res) {
+  const since = Math.max(0, parseInt(req.query.since, 10) || 0);
+  const limit = clamp(parseInt(req.query.limit, 10) || CONFIG.SYNC.PAGE, 1, 1000);
+  const snapshot = async (reason) => {
+    const cursor = await repo.currentSeq(req.userId);    // curseur AVANT la liste : un changement concurrent sera rejoué (idempotent)
+    const conversations = await repo.listConversations(req.userId, { limit: 100 });
+    return res.json({ success: true, mode: "snapshot", reason, cursor, conversations, hasMore: false });
+  };
+  if (since === 0) return snapshot("initial");
+  const d = await repo.syncDelta(req.userId, since, limit);
+  if (d.resyncRequired) return snapshot("cursor_too_old");
+  return res.json({ success: true, mode: "delta", ...d });
+}
+
+async function syncStreamHandler(req, res) {
+  const since = parseInt(req.headers["last-event-id"] || req.query.cursor || "0", 10) || 0;
+  const sse = new SSEStream(req, res);
+  const conn = { userId: req.userId, cursor: since, transport: "sse", send: (e, d, id) => sse.send(e, d, id), close: () => sse.end() };
+  syncHub.add(conn);
+  sse.onClose = () => syncHub.remove(conn);
+  if (since === 0) { conn.cursor = await repo.currentSeq(req.userId); sse.send("hello", { cursor: conn.cursor, snapshot: true }, conn.cursor); }
+  else { sse.send("hello", { cursor: since, snapshot: false }, since); syncHub.schedule(conn); }
+}
+
+async function bootstrapHandler(req, res) {
+  const uid = req.userId;
+  const [conversations, quota, tasks, user, facts, cursor] = await Promise.all([
+    repo.listConversations(uid, { limit: 30 }),
+    repo.getQuota(uid), repo.listTasks(uid, "pending").catch(() => []), repo.getUser(uid),
+    repo.listFacts(uid).catch(() => ({ grouped: {}, facts: [] })), repo.currentSeq(uid)
+  ]);
+  const first = (user?.display_name || req.displayName || "").split(" ")[0];
+  res.json({
+    success: true, error: false, userId: uid, role: req.userRole,
+    greeting: first ? `Bonjour ${first}, comment puis-je vous aider ?` : "Bonjour, je suis Luba. Comment puis-je vous aider ?",
+    conversations, pendingTasks: tasks, memoryFacts: facts.grouped, longTermFacts: facts.facts.slice(0, 20),
+    quotas: quota, limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE, whatsappConnected: Boolean(user?.whatsapp_connected),
+    hasMemory: facts.facts.length > 0, ads: {}, version: CONFIG.VERSION, syncCursor: cursor
+  });
+}
+
+// ---------- Diagnostics ----------
+function diagnostics() {
+  const mem = process.memoryUsage();
+  return {
+    version: CONFIG.VERSION, instance: CONFIG.INSTANCE_ID, uptimeS: Math.round(process.uptime()), node: process.version,
+    load: { ...loadState }, memoryMb: { rss: Math.round(mem.rss / 1048576), heapUsed: Math.round(mem.heapUsed / 1048576) },
+    queue: runManager.stats(), sync: syncHub.stats(), db: { writeQueue: db.pending, driver: db.writer?.driver },
+    providers: health.snapshot(), keys: Object.fromEntries(Object.entries(PROVIDERS).map(([n, p]) => [n, p.keys.length])),
+    mirrors: { firestore: mirrorState.firestore, supabase: mirrorState.supabase, ...mirrorWorker.stats }, legacyBridge: Boolean(legacy)
+  };
+}
+
+const hasDebugAccess = (req) => {
+  const t = req.query.token || (String(req.headers.authorization || "").startsWith("Bearer ") ? req.headers.authorization.slice(7) : "");
+  return Boolean(CONFIG.DEBUG_TOKEN && t && timingSafeStr(t, CONFIG.DEBUG_TOKEN));
+};
+
+function buildApp() {
+  if (!express) throw new Error("Le paquet `express` est requis (npm i express)");
+  const app = express();
+  app.set("trust proxy", envInt("TRUST_PROXY", 1));
+  app.disable("x-powered-by");
+
+  // Identifiant + journal + métriques (label = route déclarée, PAS l'URL : évite l'explosion de cardinalité)
+  app.use((req, res, next) => {
+    req.requestId = newId("req", 6);
+    res.setHeader("X-Request-Id", req.requestId);
+    const t0 = process.hrtime.bigint();
+    res.on("finish", () => {
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      const route = req.route?.path ? `${req.baseUrl || ""}${req.route.path}` : "unmatched";
+      M.http.inc({ method: req.method, route, status: String(res.statusCode) });
+      M.httpDur.observe({ method: req.method, route }, ms / 1000);
+      if (res.statusCode >= 500 || ms > 3000 || envBool("LOG_ALL_REQUESTS")) logger.info({ requestId: req.requestId, method: req.method, route, status: res.statusCode, ms: Math.round(ms) }, "requête");
+    });
+    next();
+  });
+
+  app.use(cors ? cors({
+    origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.includes(origin)),
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Google-Access-Token", "X-Session-Token", "x-luba-signature", "x-luba-timestamp", "Accept", "Last-Event-ID", "Idempotency-Key"],
+    exposedHeaders: ["X-Request-Id", "Retry-After", "RateLimit-Remaining"], credentials: true, maxAge: 86400
+  }) : (req, res, next) => next());
+  if (helmet) app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }));
+  const compression = tryRequire("compression");
+  if (compression) app.use(compression({ filter: (req, res) => !String(res.getHeader("Content-Type") || "").includes("text/event-stream") && compression.filter(req, res) }));
+
+  // HTTPS forcé en production, sauf sondes de santé (un LB en HTTP ne doit pas recevoir de 301)
+  app.use((req, res, next) => {
+    if (CONFIG.ENV === "production" && req.headers["x-forwarded-proto"] && req.headers["x-forwarded-proto"] !== "https" && !["/ready", "/api/health"].includes(req.path)) {
+      return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+    }
+    return next();
+  });
+
+  app.use(rateLimit("IP", { by: "ip" }));
+  app.use(express.json({ limit: "1mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+  const auth = authenticate();
+  const authStream = authenticate({ allowQueryToken: true });
+
+  // ----- Publiques -----
+  app.get("/", (_req, res) => res.json({ name: "Luba AI Pro", version: CONFIG.VERSION, company: "HIKLON TECHNOLOGIES", status: "ok" }));
+  app.get("/api/health", wrap(async (req, res) => {
+    const base = { status: runManager.draining ? "draining" : "ok", version: CONFIG.VERSION, uptimeS: Math.round(process.uptime()) };
+    if (req.query.full && hasDebugAccess(req)) return res.json({ ...base, ...diagnostics(), db: await db.health() });
+    return res.json(base);
+  }));
+  app.get("/ready", wrap(async (_req, res) => {
+    try { await db.health(); } catch { return res.status(503).json({ ready: false, reason: "db" }); }
+    if (runManager.draining) return res.status(503).json({ ready: false, reason: "draining" });
+    return res.status(loadState.shedding ? 503 : 200).json({ ready: !loadState.shedding, reason: loadState.shedding ? "overloaded" : null });
+  }));
+  app.get("/api/metrics", wrap(async (req, res) => {
+    if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
+    if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
+    res.setHeader("Content-Type", metrics.registry.contentType);
+    res.end(await metrics.registry.metrics());
+  }));
+  app.get("/api/debug", wrap(async (req, res) => {
+    if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
+    res.json({ success: true, ...diagnostics(), dbHealth: await db.health() });
+  }));
+  app.get("/api/ads/slots", (_req, res) => res.json({ success: true, slots: {} }));
+
+  // ----- Auth -----
+  app.get("/api/auth/check", auth, (req, res) => res.json({ success: true, authenticated: true, userId: req.userId, role: req.userRole }));
+  app.get("/api/user/whoami", auth, (req, res) => res.json({ success: true, userId: req.userId, email: req.userEmail, role: req.userRole }));
+  app.get("/api/session/bootstrap", auth, rateLimit("API"), wrap(bootstrapHandler));
+
+  // ----- Chat (le chemin critique) -----
+  app.post("/api/chat", auth, rateLimit("CHAT"), shedHeavy, chatUpload, wrap(chatHandler));
+  app.get("/api/runs/:runId", auth, rateLimit("SYNC"), wrap(runStatusHandler));
+  app.get("/api/runs/:runId/stream", authStream, rateLimit("SYNC"), wrap(runStreamHandler));
+  app.post("/api/runs/:runId/cancel", auth, rateLimit("API"), wrap(runCancelHandler));
+
+  // ----- Conversations & synchronisation -----
+  app.get("/api/conversations", auth, rateLimit("SYNC"), wrap(listConversationsHandler));
+  app.post("/api/conversations", auth, rateLimit("API"), wrap(async (req, res) => {
+    const id = req.body?.conversationId && CONV_ID_RE.test(req.body.conversationId) ? req.body.conversationId : newId("conv");
+    await repo.ensureConversation(req.userId, id, { firebaseUid: req.firebaseUid, title: req.body?.title ? String(req.body.title).slice(0, 120) : null });
+    res.status(201).json({ success: true, conversationId: id });
+  }));
+  app.patch("/api/conversations/:conversationId", auth, rateLimit("API"), wrap(async (req, res) => {
+    const seq = await repo.renameConversation(req.userId, req.params.conversationId, { title: req.body?.title, pinned: req.body?.pinned });
+    bus.publish(`user:${req.userId}`, { type: "sync", seq });
+    res.json({ success: true });
+  }));
+  app.delete("/api/conversations/:conversationId", auth, rateLimit("API"), wrap(async (req, res) => {
+    const seq = await repo.deleteConversation(req.userId, req.params.conversationId);
+    bus.publish(`user:${req.userId}`, { type: "sync", seq });
+    res.json({ success: true });
+  }));
+  app.get("/api/conversation/:conversationId/messages", auth, rateLimit("SYNC"), wrap(messagesHandler));        // chemin v16.5
+  app.get("/api/conversations/:conversationId/messages", auth, rateLimit("SYNC"), wrap(messagesHandler));
+  app.get("/api/sync", auth, rateLimit("SYNC"), wrap(syncHandler));
+  app.get("/api/sync/stream", authStream, rateLimit("SYNC"), wrap(syncStreamHandler));
+
+  // ----- Utilisateur : stats, mémoire, tâches -----
+  app.get("/api/user/stats", auth, rateLimit("API"), wrap(async (req, res) => {
+    const [quota, c, m] = await Promise.all([repo.getQuota(req.userId), db.get("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND deleted_at IS NULL", [req.userId]), db.get("SELECT COUNT(*) AS n FROM messages WHERE user_id = ?", [req.userId])]);
+    res.json({ success: true, role: req.userRole, quotas: quota, limits: USER_QUOTAS[req.userRole] || USER_QUOTAS.FREE, conversations: c?.n || 0, messages: m?.n || 0 });
+  }));
+  app.get("/api/memory/facts", auth, rateLimit("API"), wrap(async (req, res) => res.json({ success: true, ...(await repo.listFacts(req.userId)) })));
+  app.delete("/api/memory/facts/:factId", auth, rateLimit("API"), wrap(async (req, res) => res.json({ success: await repo.deleteFact(req.userId, parseInt(req.params.factId, 10)) })));
+  app.delete("/api/memory/facts", auth, rateLimit("API"), wrap(async (req, res) => { await repo.clearFacts(req.userId); res.json({ success: true }); }));
+  app.post("/api/memory/clear", auth, rateLimit("API"), wrap(async (req, res) => { await repo.clearFacts(req.userId); res.json({ success: true }); }));
+  app.post("/api/memory/recall", auth, rateLimit("API"), wrap(async (req, res) => {
+    const q = String(req.body?.query || "").slice(0, 100).replace(/[%_]/g, "");
+    const rows = q ? await db.all("SELECT id, fact, category FROM user_memory_facts WHERE user_id = ? AND fact LIKE ? ORDER BY updated_at DESC LIMIT 20", [req.userId, `%${q}%`]) : [];
+    res.json({ success: true, facts: rows });
+  }));
+  app.get("/api/tasks", auth, rateLimit("API"), wrap(async (req, res) => res.json({ success: true, tasks: await repo.listTasks(req.userId, req.query.status || null) })));
+  app.post("/api/tasks", auth, rateLimit("API"), wrap(async (req, res) => {
+    if (!req.body?.title) throw Errors.badRequest("MISSING_TITLE", "Titre obligatoire.");
+    res.status(201).json({ success: true, task: await repo.createTask(req.userId, { title: req.body.title, notes: req.body.notes, dueAt: parseDue(req.body.dueAt || req.body.due_at) }) });
+  }));
+  app.put("/api/tasks/:taskId/status", auth, rateLimit("API"), wrap(async (req, res) => {
+    const st = ["pending", "done", "cancelled"].includes(req.body?.status) ? req.body.status : null;
+    if (!st) throw Errors.badRequest("INVALID_STATUS", "Statut invalide.");
+    res.json({ success: await repo.setTaskStatus(req.userId, req.params.taskId, st) });
+  }));
+  app.delete("/api/tasks/:taskId", auth, rateLimit("API"), wrap(async (req, res) => res.json({ success: await repo.deleteTask(req.userId, req.params.taskId) })));
+
+  app.post("/api/tools", auth, rateLimit("API"), wrap(async (req, res) => {
+    const name = String(req.body?.tool || req.body?.name || "");
+    if (!getToolSchemas().some((s) => s.function.name === name)) throw Errors.badRequest("UNKNOWN_TOOL", "Outil inconnu.");
+    const out = await withTimeout(executeTool({ toolName: name, args: req.body?.args || {} }, { userId: req.userId, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null }), CONFIG.TIMEOUTS.TOOL_MS, null, `outil ${name}`);
+    res.json({ success: true, ...out });
+  }));
+
+  app.delete("/api/account", auth, rateLimit("STRICT"), wrap(async (req, res) => {
+    const uid = req.userId;
+    const sessions = await db.all("SELECT session_id FROM sessions WHERE user_id = ?", [uid]);
+    await db.transaction(async (w) => {
+      for (const s of sessions) await enqueueMirror(w, "session_delete", `s:${s.session_id}`, { session_id: s.session_id, user_id: uid });
+      await w.run("DELETE FROM sync_log WHERE user_id = ?", [uid]);
+      await w.run("DELETE FROM user_long_term_memory WHERE user_id = ?", [uid]);
+      await w.run("DELETE FROM users WHERE id = ?", [uid]);
+    });
+    userProfiles.delete(uid);
+    if (firebaseApp) { try { await firebaseAdmin.auth(firebaseApp).deleteUser(uid); } catch (e) { logger.warn({ err: e.message }, "suppression Firebase"); } }
+    res.json({ success: true });
+  }));
+
+  // ----- Admin -----
+  app.post("/api/admin/set-role", auth, requireRole("ADMIN"), rateLimit("STRICT"), wrap(async (req, res) => {
+    const { userId, role } = req.body || {};
+    if (!userId || !(String(role).toUpperCase() in ROLE_RANK)) throw Errors.badRequest("INVALID_ROLE", "userId/role invalides.");
+    await repo.setRole(userId, String(role).toUpperCase());
+    userProfiles.delete(userId);
+    logSecurity(req.userId, "ROLE_CHANGED", { target: userId, role }, req.ip);
+    res.json({ success: true });
+  }));
+  app.get("/api/admin/self-heal/stats", auth, requireRole("ADMIN"), wrap(async (_req, res) => res.json({ success: true, providers: health.snapshot(), queue: runManager.stats(), load: loadState })));
+  app.post("/api/admin/self-heal/reset", auth, requireRole("ADMIN"), wrap(async (_req, res) => { health.reset(); res.json({ success: true }); }));
+
+  // ----- Routes non portées (voix, WhatsApp, intentions…) : ancien code, optionnel -----
+  if (legacy?.app && envBool("LEGACY_MOUNT", true)) app.use(legacy.app);
+
+  app.use((req, res) => sendError(req, res, Errors.notFound("NOT_FOUND", "Route introuvable.")));
+  app.use((err, req, res, _next) => sendError(req, res, err));
+  return app;
+}
+
+// ================================================================================
+// §17 — BOOTSTRAP & ARRÊT PROPRE
+// ================================================================================
+
+let server = null;
+let shuttingDown = false;
+const timers = [];
+
+function validateEnvironment() {
+  const withKeys = Object.entries(PROVIDERS).filter(([n, p]) => n !== "fake" && p.keys.length).map(([n]) => n);
+  if (!withKeys.length && !CONFIG.FAKE_LLM) logger.error("AUCUNE clé LLM configurée (GROQ_API_KEY, GEMINI_API_KEY, …) : le chat ne pourra pas répondre.");
+  if (!FIREBASE_CONFIG.apiKey && !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) logger.error("Ni FIREBASE_API_KEY ni FIREBASE_SERVICE_ACCOUNT_JSON : l'authentification échouera.");
+  if (CONFIG.ENV === "production" && !CONFIG.DEBUG_TOKEN) logger.warn("DEBUG_TOKEN absent : /api/debug et /api/health?full=1 sont désactivés.");
+  logger.info({ providers: withKeys, fakeLlm: CONFIG.FAKE_LLM, node: process.version }, "environnement");
+}
+
+async function bootstrap({ listen = true } = {}) {
+  logger.info(`🚀 LUBA AI PRO v${CONFIG.VERSION} — HIKLON TECHNOLOGIES`);
+  fs.mkdirSync(CONFIG.PATHS.DATA, { recursive: true });
+  validateEnvironment();
+  initFirebase();
+  initSupabase();
+  await db.open();
+  await repo.recoverOrphans();
+  await loadBlockedIps();
+  await bus.attachRedis(process.env.REDIS_URL);
+  legacy = loadLegacy();
+  if (legacy && envBool("LEGACY_BOOT", true) && typeof legacy.bootstrapPart1 === "function") {
+    try { await legacy.bootstrapPart1(); }          // ouvre la base héritée (même fichier SQLite), Redis, e-mail, sandbox…
+    catch (e) { logger.error({ err: e.message }, "initialisation de l'héritage échouée (voix/WhatsApp peuvent être dégradés)"); }
+  }
+
+  const app = buildApp();
+  if (!listen) return { app };
+  server = http.createServer(app);
+  // Délais alignés sur les reverse-proxies (évite les 502 intermittents) ; SSE : aucune limite de durée côté Node.
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.requestTimeout = 0;
+  server.timeout = 0;
+  server.on("error", (e) => { logger.fatal({ err: e.message }, "erreur serveur HTTP"); process.exit(1); });
+  if (legacy?.setupLubaLiveWebSocket) { try { legacy.setupLubaLiveWebSocket(server); } catch (e) { logger.warn({ err: e.message }, "Luba Live indisponible"); } }
+  setupWebSocket(server);
+  await new Promise((resolve) => server.listen(CONFIG.PORT, CONFIG.HOST, resolve));
+  logger.info(`Serveur prêt sur ${CONFIG.HOST}:${CONFIG.PORT}`);
+
+  timers.push(startLoadMonitor());
+  mirrorWorker.start();
+  if (legacy) {   // rappels de tâches + entretien sécurité de l'héritage
+    const tk = legacy.CONFIG?.TIMEOUTS || {};
+    if (typeof legacy.reminderTick === "function") timers.push(setInterval(() => Promise.resolve(legacy.reminderTick()).catch(() => {}), tk.REMINDER_TICK_MS || 30000).unref());
+    if (typeof legacy.runSecurityHousekeeping === "function") timers.push(setInterval(() => Promise.resolve(legacy.runSecurityHousekeeping()).catch(() => {}), tk.HOUSEKEEPING_MS || 3600000).unref());
+  }
+  timers.push(setInterval(() => { tokenCache.sweep(); userProfiles.sweep(); authFails.sweep(); blockedIps.sweep(); }, 60000).unref());
+  timers.push(setInterval(() => repo.housekeeping().catch((e) => logger.warn({ err: e.message }, "housekeeping")), 6 * 3600 * 1000).unref());
+  setTimeout(() => repo.housekeeping().catch(() => {}), 30000).unref();
+  return { app, server };
+}
+
+async function shutdown(signal, code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "arrêt propre en cours");
+  const killer = setTimeout(() => { logger.error("arrêt forcé (délai dépassé)"); process.exit(1); }, CONFIG.TIMEOUTS.SHUTDOWN_DRAIN_MS + 20000);
+  killer.unref();
+  try {
+    runManager.draining = true;                                   // /ready → 503 : le load balancer nous retire
+    await sleepRaw(envInt("SHUTDOWN_READY_DELAY_MS", 2000));
+    if (server) { server.close(); server.closeIdleConnections?.(); }
+    await runManager.drain(CONFIG.TIMEOUTS.SHUTDOWN_DRAIN_MS);    // les réponses en cours se terminent (ou sont sauvegardées en partiel)
+    syncHub.closeAll();
+    try { wss?.close(); } catch {}
+    server?.closeAllConnections?.();
+    await mirrorWorker.tick().catch(() => {});
+    mirrorWorker.stop();
+    try { await legacy?.baileysManager?.destroyAll(); } catch {}
+    for (const t of timers) clearInterval(t);
+    await bus.close();
+    await db.close();
+    logger.info("arrêt propre terminé");
+  } catch (e) { logger.error({ err: e.message }, "erreur pendant l'arrêt"); }
+  process.exit(code);
+}
+
+function installProcessHandlers() {
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("uncaughtException", (e) => { logger.fatal({ err: e.message, stack: e.stack }, "uncaughtException"); shutdown("uncaughtException", 1); });
+  process.on("unhandledRejection", (r) => logger.error({ reason: String(r?.stack || r) }, "unhandledRejection"));
+}
+
+// ================================================================================
+// §19 — MODULE HÉRITAGE v16.5 (embarqué, isolé dans sa propre portée)
+// ================================================================================
+// Contient TOUT l'ancien backend : voix (STT/TTS + Luba Live), WhatsApp (Baileys),
+// 19 outils (météo, crypto, actualités, images, YouTube, sandbox de code…), pubs,
+// intentions, e-mail, rappels, mémoire longue durée.
+//
+// Ce qui change : son pipeline de chat, son SSE, son tracker de santé et son
+// authentification sont REMPLACÉS par le cœur v17 (voir `v17Api` et `legacyChatBridge`).
+// Les routes /api/chat, /api/conversations… de l'ancien code ne sont plus atteintes :
+// les routes v17 sont enregistrées en premier. Le code correspondant reste ici,
+// inerte, pour permettre un retour arrière (DISABLE_LEGACY=true désactive le module).
+//
+// Chargement paresseux et tolérant : si une dépendance manque, le cœur v17 démarre
+// quand même (sans voix/WhatsApp/outils externes) et le signale dans les logs.
+// ================================================================================
+function createLegacyModule(v17) {
+  "use strict";
+  const module = { exports: {} };    // masque `module` : `require.main === module` est faux, exports isolés
+// ================================================================================
 // LUBA AI PRO — BACKEND v16.5.0 — Self-Healing Edition
 // HIKLON TECHNOLOGIES · Kinshasa, RDC · 2026
 // ================================================================================
@@ -59,7 +3749,7 @@
 //   §1.26  Exports Partie 1
 // ================================================================================
 
-"use strict";
+// (mode strict appliqué par la fonction englobante)
 
 require("dotenv").config();
 
@@ -8771,6 +12461,7 @@ async function fastUpsertUser(uid, user, role) {
 }
 
 function authenticateUser(req, res, next) {
+  if (v17 && v17.authenticate) return v17.authenticate(req, res, next);   // v17 : auth unique (cache + single-flight)
   (async () => {
     const ip = req.ip;
     const ua = req.headers["user-agent"];
@@ -9825,10 +13516,11 @@ function setupLubaLiveWebSocket(server) {
   }
 
   wsServer = new WebSocketServer({
-    server, path: "/live",
+    noServer: true,
     perMessageDeflate: false,
     maxPayload: 1024 * 1024
   });
+  module.exports.__liveWss = wsServer;   // v17 : exposé au routeur d'upgrade
 
   wsServer.on("connection", (ws, req) => {
     const sid = `live_${crypto.randomUUID()}`;
@@ -10306,3 +13998,31 @@ if (require.main === module) {
 //   POST /api/admin/self-heal/reset   — Reset santé providers (admin)
 //   ws://localhost:3000/live          — Luba Live (WebSocket binaire)
 // ================================================================================
+
+  // ---------- v17 : le pipeline de chat de la v16.5 est remplacé par celui du cœur ----------
+  handleChat = (args) => v17.chat(args);   // WhatsApp (Baileys) et Luba Live passent par la file v17
+  module.exports.__v17Patched = true;
+  return module.exports;
+}
+
+// ================================================================================
+// §18 — EXPORTS & AUTO-START
+// ================================================================================
+
+module.exports = {
+  CONFIG, logger, AppError, Errors, bus, db, Database, repo, MIGRATIONS,
+  TTLCache, TokenBucketLimiter, ThinkFilter, readSSE, makeWatchdog, fitContext, clipMiddle,
+  ProviderHealth, ProviderError, health, KeyPool, PROVIDERS, TIERS, tierChain, classifyHttp,
+  callLLM, orchestrate, streamOpenAI, streamGemini, streamFake,
+  Run, RunManager, runManager, chat, SSEStream, SyncHub, syncHub, MirrorWorker, mirrorState,
+  verifyToken, tokenCache, authenticate, buildApp, bootstrap, shutdown, diagnostics,
+  formatFinalReply, cleanOutput, extractSuggestions, detectLanguage, quickIntent,
+  handlers: { chatHandler, runStatusHandler, runStreamHandler, runCancelHandler, listConversationsHandler, messagesHandler, syncHandler, syncStreamHandler, bootstrapHandler },
+  setupWebSocket, sha256, loadState, createLegacyModule, legacyChatBridge, pipeRunToSse, v17Api,
+  setLegacy: (m) => { legacy = m; }
+};
+
+if (require.main === module) {
+  installProcessHandlers();
+  bootstrap().catch((e) => { logger.fatal({ err: e.message, stack: e.stack }, "bootstrap échoué"); process.exit(1); });
+}

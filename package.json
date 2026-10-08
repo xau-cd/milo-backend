@@ -1,130 +1,51 @@
 {
-  "name": "luba-ai-pro-backend",
-  "version": "16.0.0",
-  "description": "LUBA AI PRO — Backend Enterprise (Mwamba/Ngandu, Luba Live, Voice STT/TTS, Memory multi-niveaux, Tool calling). HIKLON TECHNOLOGIES · Kinshasa, RDC.",
-  "author": "HIKLON TECHNOLOGIES <contact@luba.web.app>",
-  "license": "UNLICENSED",
-  "private": true,
-  "type": "commonjs",
+  "name": "luba-ai-pro",
+  "version": "17.0.0",
+  "description": "Luba AI Pro — backend v17 (cœur run-based + module héritage v16.5 : voix, WhatsApp, outils)",
   "main": "index.js",
-  "engines": {
-    "node": ">=20.0.0",
-    "npm": ">=10.0.0"
-  },
-
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "HIKLON TECHNOLOGIES",
+  "engines": { "node": ">=20.10.0" },
   "scripts": {
     "start": "node index.js",
-    "dev": "cross-env NODE_ENV=development nodemon index.js",
     "check": "node --check index.js",
-    "test": "node --test test/*.test.js || echo \"(aucun test configuré pour l'instant)\"",
-    "lint": "eslint . --ext .js --ignore-path .gitignore",
-    "lint:fix": "eslint . --ext .js --fix",
-    "format": "prettier --write \"**/*.{js,json,md}\"",
-
-    "docker:build": "docker build -t luba-backend:latest .",
-    "docker:up": "docker compose up -d --remove-orphans",
-    "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f luba-backend",
-
-    "deploy": "bash scripts/deploy.sh",
-    "rollback": "bash scripts/rollback.sh",
-
-    "postinstall": "node -e \"console.log('\\n✅ Luba AI Pro v16.0.0 — Dépendances installées. Lancez : npm start\\n')\""
+    "test": "node --no-warnings selftest.js && node --no-warnings selftest-http.js && node --no-warnings selftest-legacy.js",
+    "test:core": "node --no-warnings selftest.js",
+    "test:http": "node --no-warnings selftest-http.js",
+    "test:legacy": "node --no-warnings selftest-legacy.js",
+    "loadtest": "node --no-warnings stress.js 300 2"
   },
-
   "dependencies": {
-    "@supabase/supabase-js": "^2.47.10",
+    "@supabase/supabase-js": "^2.45.4",
     "axios": "^1.7.9",
     "cheerio": "^1.0.0",
+    "compression": "^1.7.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
+    "firebase-admin": "^13.0.2",
     "form-data": "^4.0.1",
     "helmet": "^8.0.0",
-    "lru-cache": "^11.0.2",
-    "mathjs": "^14.0.1",
-    "multer": "^2.0.0",
+    "lru-cache": "^10.4.3",
+    "mathjs": "^13.2.2",
+    "multer": "^2.0.2",
     "nodemailer": "^6.9.16",
-    "pino": "^9.5.0",
+    "pino": "^9.6.0",
     "qrcode": "^1.5.4",
-    "rss-parser": "^3.13.0",
     "sqlite3": "^5.1.7",
     "ws": "^8.18.0"
   },
-
   "optionalDependencies": {
-    "@google-cloud/firestore": "^7.10.0",
-    "@google/genai": "^0.21.0",
-    "@whiskeysockets/baileys": "^6.7.15",
+    "@google-cloud/firestore": "^7.11.0",
+    "@google/genai": "^1.0.0",
+    "@whiskeysockets/baileys": "^6.7.18",
     "bullmq": "^5.34.2",
-    "duck-duck-scrape": "^2.2.7",
-    "firebase-admin": "^13.0.2",
-    "groq-sdk": "^0.12.0",
+    "duck-duck-scrape": "^2.2.5",
     "ioredis": "^5.4.2",
     "prom-client": "^15.1.3",
     "rate-limit-redis": "^4.2.0",
-    "youtubei.js": "^13.0.0"
-  },
-
-  "devDependencies": {
-    "cross-env": "^7.0.3",
-    "eslint": "^9.17.0",
-    "nodemon": "^3.1.9",
-    "prettier": "^3.4.2"
-  },
-
-  "keywords": [
-    "luba",
-    "ai",
-    "assistant",
-    "hiklon",
-    "mwamba",
-    "ngandu",
-    "voice",
-    "stt",
-    "tts",
-    "luba-live",
-    "groq",
-    "openrouter",
-    "cerebras",
-    "gemini",
-    "firestore",
-    "supabase",
-    "redis",
-    "websocket",
-    "whatsapp",
-    "baileys",
-    "kinshasa",
-    "rdc",
-    "congo"
-  ],
-
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/hiklon-technologies/luba-backend.git"
-  },
-
-  "bugs": {
-    "url": "https://github.com/hiklon-technologies/luba-backend/issues",
-    "email": "contact@luba.web.app"
-  },
-
-  "homepage": "https://luba.web.app",
-
-  "os": [
-    "linux",
-    "darwin",
-    "win32"
-  ],
-
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
-
-  "config": {
-    "port": "3000",
-    "node_env": "production"
+    "youtubei.js": "^10.5.0"
   }
-  }
+}
