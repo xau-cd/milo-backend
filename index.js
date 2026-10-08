@@ -370,14 +370,15 @@ const CONFIG = deepFreeze({
       IDLE_MS: envInt("HEAVY_IDLE_MS", 60000),
       TOTAL_MS: envInt("HEAVY_TOTAL_MS", 300000)
     },
-    TOOL_MS: envInt("TOOL_TIMEOUT_MS", 15000),
+    TOOL_MS: envInt("TOOL_TIMEOUT_MS", 12000),
     HEARTBEAT_MS: envInt("SSE_HEARTBEAT_MS", 12000),
     SHUTDOWN_DRAIN_MS: envInt("SHUTDOWN_DRAIN_MS", 25000)
   },
 
   AGENT: {
     MAX_ITERATIONS: envInt("AGENT_MAX_ITERATIONS", 5),
-    MAX_TOOL_CALLS_PER_STEP: envInt("AGENT_MAX_TOOL_CALLS_PER_STEP", 6)
+    MAX_TOOL_CALLS_PER_STEP: envInt("AGENT_MAX_TOOL_CALLS_PER_STEP", 6),
+    TOOL_BUDGET_MS: envInt("TOOL_BUDGET_MS", 25000)      // temps cumulé max passé en outils par réponse
   },
 
   // Santé des providers — fenêtre glissante, pas de cumul infini
@@ -1915,11 +1916,11 @@ function toGeminiPayload(messages, images, tools, { maxTokens, temperature, mode
  * Appel STREAMÉ OpenAI-compatible (Groq / OpenRouter / Cerebras).
  * `h` = { onText, onReasoning, onBeat } ; retourne { text, reasoning, toolCalls, usage }.
  */
-async function streamOpenAI({ pc, cfg, key, messages, tools, images, wd, h }) {
+async function streamOpenAI({ pc, cfg, key, messages, tools, images, wd, h, toolChoice }) {
   const payload = { model: pc.model, messages: toOpenAIMessages(messages, images), temperature: pc.temperature, max_tokens: pc.maxTokens, stream: true };
   if (cfg.usage) payload.stream_options = { include_usage: true };
   if (pc.reasoningEffort) payload.reasoning_effort = pc.reasoningEffort;
-  if (tools?.length) { payload.tools = tools; payload.tool_choice = "auto"; }
+  if (tools?.length) { payload.tools = tools; payload.tool_choice = toolChoice || "auto"; }
   const headers = { Authorization: `Bearer ${key.apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream" };
   if (pc.provider === "openrouter") { headers["HTTP-Referer"] = envStr("HOSTING_DOMAIN", "https://luba.web.app"); headers["X-Title"] = "Luba AI"; }
 
@@ -1962,8 +1963,9 @@ async function streamOpenAI({ pc, cfg, key, messages, tools, images, wd, h }) {
   return { text, reasoning, toolCalls: [...calls.values()].filter((c) => c.function.name), usage };
 }
 
-async function streamGemini({ pc, cfg, key, messages, tools, images, wd, h }) {
+async function streamGemini({ pc, cfg, key, messages, tools, images, wd, h, toolChoice }) {
   const body = toGeminiPayload(messages, images, tools, pc);
+  if (toolChoice === "none" && tools?.length) body.toolConfig = { functionCallingConfig: { mode: "NONE" } };
   let res;
   try {
     res = await fetch(`${cfg.baseURL}/models/${encodeURIComponent(pc.model)}:streamGenerateContent?alt=sse`, {
@@ -2086,7 +2088,7 @@ const friendlyMessage = (err) => FRIENDLY[err?.kind] || FRIENDLY.default;
  *   • un 429 met la CLÉ de côté, pas le provider ; un timeout de raisonnement pèse peu ;
  *   • on essaie d'abord les providers sains, puis (dernier recours) ceux au disjoncteur ouvert.
  */
-async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit }) {
+async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit, toolChoice = null }) {
   const T = lane === "heavy" ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT;
   const { healthy, lastResort } = health.rank(chain);
   const order = [...healthy, ...lastResort];
@@ -2135,7 +2137,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
       try {
         emit.status("generating", { provider: pc.provider, model: pc.model, attempt: attempt + 1 });
         const streamer = cfg.kind === "gemini" ? streamGemini : cfg.kind === "fake" ? streamFake : streamOpenAI;
-        const r = await streamer({ pc, cfg, key, messages: sendMessages, tools, images, wd, h });
+        const r = await streamer({ pc, cfg, key, messages: sendMessages, tools, images, wd, h, toolChoice });
         const tail = filter.flush();
         if (tail.text) { visible += tail.text; emit.token(tail.text); }
         if (tail.reasoning) emit.reasoning(tail.reasoning);
@@ -2184,6 +2186,8 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
   const working = [...messages];
   const sources = new Set(), imagesOut = [], videosOut = [], trace = [], segments = [];
   const toolCache = new Map();
+  const deadTools = new Map();      // outil qui a dépassé son délai : plus rappelé pendant CETTE réponse
+  let toolMs = 0;
   const usage = { prompt: 0, completion: 0 };
   let provider = null, model = null, ttftMs = null, reasoning = "", partial = false, error = null;
 
@@ -2198,12 +2202,14 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
     const args = safeJsonParse(call.function.arguments, {}) || {};
     const ck = `${name}:${stableStringify(args)}`;
     if (toolCache.has(ck)) return toolCache.get(ck);
+    if (deadTools.has(name)) return { result: { success: false, error: `Outil « ${name} » indisponible pour cette requête (${deadTools.get(name)}). Réponds sans lui.` }, sourceKeys: [] };
     emit.status("tool", { name });
     trace.push({ name, args });
     let out;
     try { out = await withTimeout(executeTool({ toolName: name, args }), CONFIG.TIMEOUTS.TOOL_MS, signal, `outil ${name}`); }
     catch (e) {
       if (signal.aborted) throw e;
+      if (/délai dépassé/.test(String(e.message))) deadTools.set(name, "trop lent");
       out = { result: { success: false, error: String(e.message || e).slice(0, 300) }, sourceKeys: [] };
     }
     out = out && typeof out === "object" ? out : { result: out, sourceKeys: [] };
@@ -2229,7 +2235,9 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
 
     working.push({ role: "assistant", content: r.text || "", tool_calls: r.toolCalls });
     const bounded = r.toolCalls.slice(0, CONFIG.AGENT.MAX_TOOL_CALLS_PER_STEP);
+    const toolStart = now();
     const outs = await Promise.all(bounded.map(runTool));          // outils EN PARALLÈLE (avant : séquentiel)
+    toolMs += now() - toolStart;
     bounded.forEach((call, i) => working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: safeJsonStringify(outs[i].result).slice(0, 8000) }));
     // CORRECTIF : chaque tool_call DOIT recevoir une réponse, sinon l'API rejette (400) — v16.5 oubliait ceux au-delà de la limite.
     for (const call of r.toolCalls.slice(CONFIG.AGENT.MAX_TOOL_CALLS_PER_STEP)) {
@@ -2237,12 +2245,18 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
     }
     if (r.text.trim()) emit.token("\n\n");
 
-    if (it === CONFIG.AGENT.MAX_ITERATIONS) {
-      working.push({ role: "system", content: "Synthétise ta réponse finale MAINTENANT. Pas de nouvel appel d'outil." });
-      const f = await callLLM({ chain, messages: fitContext(working, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET).messages, tools: [], images, lane, signal, deadlineAt, emit });
+    // Outils trop lents ou en échec répété : on cesse d'attendre et on répond avec ce qu'on a (jamais de boucle interminable).
+    const allFailed = outs.every((o) => o?.result?.success === false);
+    const outOfBudget = toolMs >= CONFIG.AGENT.TOOL_BUDGET_MS || (allFailed && it >= 2);
+    if (it === CONFIG.AGENT.MAX_ITERATIONS || outOfBudget) {
+      working.push({ role: "system", content: outOfBudget && it < CONFIG.AGENT.MAX_ITERATIONS
+        ? "Les outils externes sont lents ou indisponibles. Réponds MAINTENANT avec ce que tu as déjà obtenu et tes connaissances, en précisant honnêtement ce que tu n'as pas pu vérifier. N'appelle plus d'outil."
+        : "Synthétise ta réponse finale MAINTENANT. Pas de nouvel appel d'outil." });
+      const f = await callLLM({ chain, messages: fitContext(working, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET).messages, tools, toolChoice: "none", images, lane, signal, deadlineAt, emit });
       provider = f.provider; model = f.model; addUsage(f.usage);
       if (f.text.trim()) segments.push(f.text);
       partial = f.partial; error = f.error || null;
+      break;
     }
   }
 
@@ -3304,7 +3318,7 @@ async function chatHandler(req, res) {
   }
 
   if (!run) return res.json({ success: true, error: false, ...accepted });
-  const waitMs = envInt("NONSTREAM_WAIT_MS", 55000);
+  const waitMs = envInt("NONSTREAM_WAIT_MS", 90000);
   const result = await Promise.race([run.finished, sleepRaw(waitMs).then(() => null)]);
   if (!result) return res.status(202).json({ success: true, accepted: true, status: run.status, ...accepted, pollUrl: `/api/runs/${run.id}` });
   return res.status(200).json({ success: !result.error, ...result, conversationId: convId, isNewConversation: accepted.isNewConversation, duplicate: Boolean(duplicate) });
@@ -3315,12 +3329,12 @@ async function runStatusHandler(req, res) {
   const run = runManager.get(req.params.runId);
   if (run) {
     if (run.userId !== req.userId) throw Errors.forbidden("RUN_OWNERSHIP", "Cette génération ne vous appartient pas.");
-    return res.json({ success: true, ...run.summary(), result: run.isFinal ? run.result : null, partialText: run.isFinal ? undefined : run.rawText });
+    return res.json({ success: true, ...run.summary(), queueMs: run.queueMs, timeline: run.events.filter((e) => e.type === "status").map((e) => ({ tMs: e.ts - run.queuedAt, ...e.data })), result: run.isFinal ? run.result : null, partialText: run.isFinal ? undefined : run.rawText });
   }
   const row = await db.get("SELECT * FROM runs WHERE run_id = ? AND user_id = ?", [req.params.runId, req.userId]);
   if (!row) throw Errors.notFound("RUN_NOT_FOUND", "Génération introuvable.");
   const m = await db.get("SELECT content, status FROM messages WHERE session_id = ? AND idx = ?", [row.session_id, row.assistant_idx]);
-  return res.json({ success: true, runId: row.run_id, status: row.status, conversationId: row.session_id, assistantIdx: row.assistant_idx, result: m ? { reply: m.content, status: m.status } : null });
+  return res.json({ success: true, runId: row.run_id, status: row.status, conversationId: row.session_id, assistantIdx: row.assistant_idx, provider: row.provider, model: row.model, ttftMs: row.ttft_ms, queueMs: row.queue_ms, startedAt: row.started_at, finishedAt: row.finished_at, errorCode: row.error_code, result: m ? { reply: m.content, status: m.status } : null });
 }
 
 async function runStreamHandler(req, res) {
@@ -3483,7 +3497,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
