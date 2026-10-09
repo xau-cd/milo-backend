@@ -378,7 +378,8 @@ const CONFIG = deepFreeze({
   AGENT: {
     MAX_ITERATIONS: envInt("AGENT_MAX_ITERATIONS", 5),
     MAX_TOOL_CALLS_PER_STEP: envInt("AGENT_MAX_TOOL_CALLS_PER_STEP", 6),
-    TOOL_BUDGET_MS: envInt("TOOL_BUDGET_MS", 25000)      // temps cumulé max passé en outils par réponse
+    TOOL_BUDGET_MS: envInt("TOOL_BUDGET_MS", 25000),     // temps cumulé max passé en outils par réponse
+    MAX_TOOLS: envInt("AGENT_MAX_TOOLS", 12)             // outils exposés au LLM par requête (routage par sujet)
   },
 
   // Santé des providers — fenêtre glissante, pas de cumul infini
@@ -1714,6 +1715,14 @@ function classifyHttp(status, body, retryAfterHeader) {
  *   • disjoncteur half-open : UN seul essai de sonde, cooldown exponentiel ;
  *   • jamais « tout indisponible » : les modèles ouverts restent en dernier recours.
  */
+/** Masque les clés d'API qu'un provider pourrait renvoyer dans un message d'erreur. */
+const redactSecrets = (t) => String(t ?? "").replace(/\b(gsk_|sk-or-|sk-|AIza|csk-|nvapi-)[A-Za-z0-9_\-.]{6,}/g, "[clé masquée]");
+const llmErrors = [];                                   // dernières erreurs LLM (visibles via /api/debug, jamais de secret)
+function noteLlmError(pc, err) {
+  llmErrors.push({ at: new Date().toISOString(), provider: pc.provider, model: pc.model, kind: err.kind, status: err.status ?? null, message: redactSecrets(err.message).slice(0, 220) });
+  if (llmErrors.length > 40) llmErrors.shift();
+}
+
 const FAIL_WEIGHT = { rate_limit: 0.2, server: 1, network: 1, auth: 0.5, model: 1, empty: 1, timeout_first: 0.6, timeout_idle: 1, timeout_total: 0.6, context: 0, client: 0 };
 
 class ProviderHealth {
@@ -1871,6 +1880,23 @@ function toOpenAIMessages(messages, images) {
   return out;
 }
 
+const GEMINI_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "properties", "required", "items", "minItems", "maxItems", "minimum", "maximum", "title"]);
+/** Gemini rejette (400) les mots-clés JSON-Schema inconnus (additionalProperties, default, $schema…) : on ne garde que son sous-ensemble. */
+function sanitizeGeminiSchema(sc) {
+  if (Array.isArray(sc)) return sc.map(sanitizeGeminiSchema);
+  if (!sc || typeof sc !== "object") return sc;
+  const out = {};
+  for (const [k, v] of Object.entries(sc)) {
+    if (k === "properties" && v && typeof v === "object") { out.properties = Object.fromEntries(Object.entries(v).map(([pk, pv]) => [pk, sanitizeGeminiSchema(pv)])); continue; }
+    if (!GEMINI_SCHEMA_KEYS.has(k)) continue;
+    if (k === "type" && Array.isArray(v)) { out.type = v.find((x) => x !== "null") || "string"; if (v.includes("null")) out.nullable = true; continue; }
+    if (k === "items") { out.items = sanitizeGeminiSchema(v); continue; }
+    if (k === "enum" && Array.isArray(v)) { out.enum = v.map(String); continue; }
+    out[k] = v;
+  }
+  return out;
+}
+
 function toGeminiPayload(messages, images, tools, { maxTokens, temperature, model }) {
   const sys = [];
   const contents = [];
@@ -1908,7 +1934,14 @@ function toGeminiPayload(messages, images, tools, { maxTokens, temperature, mode
   const body = { contents, generationConfig: { temperature, maxOutputTokens: maxTokens || 8000 } };
   if (/gemini-(2\.5|3)/.test(model || "")) body.generationConfig.thinkingConfig = { includeThoughts: true };   // refusé (400) par les anciens modèles
   if (sys.length) body.systemInstruction = { parts: [{ text: sys.join("\n\n") }] };
-  if (tools?.length) body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters })) }];
+  if (tools?.length) {
+    body.tools = [{ functionDeclarations: tools.map((t) => {
+      const params = sanitizeGeminiSchema(t.function.parameters);
+      const decl = { name: t.function.name, description: String(t.function.description || "").slice(0, 1000) };
+      if (params?.properties && Object.keys(params.properties).length) decl.parameters = params;   // Gemini refuse un objet sans propriétés
+      return decl;
+    }) }];
+  }
   return body;
 }
 
@@ -2076,6 +2109,9 @@ const FRIENDLY = {
   timeout_idle: "La connexion au modèle s'est interrompue. Réessaie dans un instant.",
   timeout_total: "La réponse a pris trop de temps. Réessaie avec une question plus ciblée.",
   context: "Le message est trop long pour être traité. Raccourcis-le ou découpe-le.",
+  auth: "Luba est momentanément indisponible (accès au modèle en cours de vérification). Réessaie un peu plus tard.",
+  model: "Luba est momentanément indisponible (modèle en cours de mise à jour). Réessaie un peu plus tard.",
+  network: "Luba n'arrive pas à joindre ses modèles pour le moment. Réessaie dans un instant.",
   default: "Je n'arrive pas à répondre pour le moment. Réessaie dans un instant."
 };
 const friendlyMessage = (err) => FRIENDLY[err?.kind] || FRIENDLY.default;
@@ -2097,6 +2133,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
   let committed = "";
   let lastErr = null;
   let work = messages;
+  let toolsNow = tools;
 
   for (const pc of order) {
     const cfg = PROVIDERS[pc.provider];
@@ -2137,7 +2174,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
       try {
         emit.status("generating", { provider: pc.provider, model: pc.model, attempt: attempt + 1 });
         const streamer = cfg.kind === "gemini" ? streamGemini : cfg.kind === "fake" ? streamFake : streamOpenAI;
-        const r = await streamer({ pc, cfg, key, messages: sendMessages, tools, images, wd, h, toolChoice });
+        const r = await streamer({ pc, cfg, key, messages: sendMessages, tools: toolsNow, images, wd, h, toolChoice });
         const tail = filter.flush();
         if (tail.text) { visible += tail.text; emit.token(tail.text); }
         if (tail.reasoning) emit.reasoning(tail.reasoning);
@@ -2159,13 +2196,18 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         health.record(pc, err.kind);
         M.llm.inc({ provider: pc.provider, model: pc.model, outcome: err.kind });
         lastErr = err;
-        logger.warn({ provider: pc.provider, model: pc.model, kind: err.kind, status: err.status, attempt, msg: String(err.message).slice(0, 200) }, "appel LLM échoué");
+        noteLlmError(pc, err);
+        logger.warn({ provider: pc.provider, model: pc.model, kind: err.kind, status: err.status, attempt, msg: redactSecrets(err.message).slice(0, 200) }, "appel LLM échoué");
         if (visible) committed += visible;     // déjà vu par l'utilisateur → on continuera, sans rejouer
 
         if (err.kind === "rate_limit") pool.cool(key.label, err.retryAfterMs ?? CONFIG.HEALTH.KEY_COOLDOWN_MS);
         if (err.kind === "auth") pool.cool(key.label, CONFIG.HEALTH.KEY_AUTH_COOLDOWN_MS);
 
-        if (err.kind === "context") { work = fitContext(work, Math.floor(CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET / 2)).messages; attempt++; continue; }
+        if (err.kind === "context") {   // requête trop grosse (ex. Groq 413 / quota de jetons) : moins d'historique ET moins d'outils
+          work = fitContext(work, Math.floor(CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET / 2)).messages;
+          if (toolsNow?.length > 6) toolsNow = toolsNow.slice(0, 6);
+          attempt++; continue;
+        }
         if (err.kind === "rate_limit" && pool.pick()) { attempt++; continue; }       // une autre clé est libre
         if ((err.kind === "server" || err.kind === "network") && attempt < CONFIG.RETRY.MAX_PER_PROVIDER) {
           await sleep(CONFIG.RETRY.BASE_MS * 2 ** attempt + Math.floor(Math.random() * 150), signal);
@@ -2269,6 +2311,33 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
 function dedupeVideos(list) {
   const seen = new Set();
   return list.filter((v) => { if (!v?.videoId || seen.has(v.videoId)) return false; seen.add(v.videoId); return true; });
+}
+
+/** Teste CHAQUE modèle configuré avec une toute petite requête : dit exactement lequel échoue et pourquoi. */
+async function diagnoseProviders({ timeoutMs = 12000 } = {}) {
+  const chains = CONFIG.FAKE_LLM ? [[{ provider: "fake", model: "fake-1", maxTokens: 24, temperature: 0 }]] : [TIERS.v100.chain, TIERS.v250.chain, TIERS.v250.code, TIERS.vision.chain];
+  const seen = new Set(), todo = [];
+  for (const pc of chains.flat()) {
+    const k = `${pc.provider}:${pc.model}`;
+    if (seen.has(k) || !PROVIDERS[pc.provider]?.keys.length) continue;
+    seen.add(k); todo.push(pc);
+  }
+  return Promise.all(todo.map(async (pc) => {
+    const cfg = PROVIDERS[pc.provider], key = keyPools[pc.provider].keys[0];
+    const wd = makeWatchdog({ firstMs: timeoutMs, idleMs: timeoutMs, totalMs: timeoutMs, parent: null });
+    const t0 = now();
+    let text = "";
+    const h = { onText: (x) => { text += x; wd.beat(); }, onReasoning: () => wd.beat() };
+    const base = { provider: pc.provider, model: pc.model, keys: PROVIDERS[pc.provider].keys.length };
+    try {
+      const streamer = cfg.kind === "gemini" ? streamGemini : cfg.kind === "fake" ? streamFake : streamOpenAI;
+      await streamer({ pc: { ...pc, maxTokens: 24, temperature: 0, reasoningEffort: pc.reasoningEffort ? "low" : undefined }, cfg, key, messages: [{ role: "user", content: "Réponds uniquement : OK" }], tools: null, images: null, wd, h });
+      return { ...base, ok: true, latencyMs: now() - t0, sample: text.replace(/\s+/g, " ").trim().slice(0, 30) };
+    } catch (e) {
+      const err = e instanceof ProviderError ? e : new ProviderError(wd.signal.aborted ? (wd.reason || "timeout_total") : "network", String(e.message || e));
+      return { ...base, ok: false, kind: err.kind, status: err.status, message: redactSecrets(err.message).slice(0, 220), latencyMs: now() - t0 };
+    } finally { wd.stop(); }
+  }));
 }
 
 // ================================================================================
@@ -2387,6 +2456,43 @@ function getToolSchemas() {
     try { extra = legacy.getToolSchemas("chat").filter((t) => !taken.has(t.function?.name)); } catch {}
   }
   return [...native, ...free, ...extra];
+}
+
+const TOOL_ROUTES = [
+  [/m[ée]t[ée]o|temp[ée]rature|pluie|climat|weather|forecast|chaleur|il fait/i, /weather|meteo/],
+  [/actu|news|nouvelle|journal|derni[èe]res?|r[ée]cent|breaking|\binfos?\b/i, /news/],
+  [/bitcoin|crypto|ethereum|\bbtc\b|\beth\b|solana|coin/i, /crypto|coin/],
+  [/bourse|\baction\b|stock|nasdaq|cac ?40|tesla|apple|cours de/i, /stock|finance/],
+  [/match|score|foot|ligue|\bnba\b|classement|champion|coupe|sport/i, /sport|score/],
+  [/article|[ée]tude|scientifique|science|paper|arxiv|\bdoi\b|publication|chercheur|th[èe]se/i, /science|openalex|crossref|arxiv|scholar/],
+  [/livre|roman|auteur|isbn|biblioth[èe]que|[ée]crivain/i, /openlibrary|book/],
+  [/pharmacie|h[ôo]pital|clinique|restaurant|banque|\batm\b|station|[ée]cole|universit[ée]|police|march[ée]|h[ôo]tel|pr[èe]s de|proche|autour|adresse|o[uù] (se trouve|est)|coordonn[ée]es|gps|carte|itin[ée]raire|distance/i, /osm_|map|place|geo/],
+  [/population|\bpib\b|\bgdp\b|inflation|esp[ée]rance|ch[ôo]mage|statistique|habitants|banque mondiale|pays/i, /worldbank/],
+  [/chanson|musique|album|artiste|chanteur|chanteuse|paroles|song|track|single|clip|concert|playlist/i, /deezer|itunes|youtube|music/],
+  [/vid[ée]o|youtube|tuto|film|bande[- ]annonce|trailer|regarder/i, /youtube|video/],
+  [/image|photo|illustration|picture|archive|historique|ancien|dessin|logo/i, /image|loc_gov/],
+  [/\bcode\b|script|python|javascript|programme|ex[ée]cute|\bbug\b|fonction|algorithme|\bsql\b/i, /run_code|code|sandbox/],
+  [/calcul|combien|racine|int[ée]grale|d[ée]riv[ée]e|[ée]quation|pourcentage|\d+\s*[+\-*\/x×^]\s*\d+|math/i, /math/],
+  [/rappel|t[âa]che|todo|[àa] faire|agenda/i, /task/],
+  [/souviens|retiens|m[ée]moire|rappelle-toi|oublie/i, /memory|remember|recall|fact/],
+  [/e-?mail|gmail|calendrier|drive|whatsapp/i, /email|mail|calendar|whatsapp|drive/],
+  [/heure|\bdate\b|\bjour\b|aujourd/i, /time/]
+];
+const TOOL_ALWAYS = /^(search_web|get_current_time)$/;
+
+/**
+ * Choisit les outils à exposer au LLM d'après le message. 37 schémas à chaque requête = milliers de jetons
+ * (refus 413 sur les offres gratuites, latence, hésitation du modèle) ; ici ≤ 12, les plus pertinents.
+ * TOOL_ROUTING=false renvoie tout.
+ */
+function selectTools(message, all) {
+  if (!all.length || !envBool("TOOL_ROUTING", true)) return all;
+  const text = String(message || "");
+  const wanted = TOOL_ROUTES.filter(([mre]) => mre.test(text)).map(([, tre]) => tre);
+  const score = (name) => (wanted.some((tre) => tre.test(name)) ? 2 : TOOL_ALWAYS.test(name) ? 1 : 0);
+  return all.filter((t) => score(t.function.name) > 0)
+    .sort((a, b) => score(b.function.name) - score(a.function.name))
+    .slice(0, CONFIG.AGENT.MAX_TOOLS);
 }
 
 async function executeTool({ toolName, args }, ctx) {
@@ -2767,7 +2873,7 @@ const chat = {
       await repo.finalizeMessage({ userId: run.userId, convId: run.convId, idx: run.assistantIdx, content: partial, status: partial ? (status === "failed" ? "interrupted" : status) : status });
     } catch (e) { logger.error({ err: e.message, runId: run.id }, "finalisation du message échouée"); }
     if (!partial && !run.skipQuota) await repo.refundQuota(run.userId, "message").catch(() => {});
-    if (err) run.push("error", { code: err.code, reply: err.message, retryable: Boolean(err.retryable) });
+    if (err) run.push("error", { code: err.code, reply: err.message, retryable: Boolean(err.retryable), reason: err.details?.reason ?? null });
     const result = { conversationId: run.convId, runId: run.id, error: status === "failed", cancelled: status === "cancelled", interrupted: status === "interrupted", reply: partial || err?.message || "", degraded: Boolean(partial), code: err?.code || null };
     run.push("done", result);
     run.finish(status === "cancelled" ? "cancelled" : status === "interrupted" ? "interrupted" : "failed", result);
@@ -2823,12 +2929,15 @@ const chat = {
       const skipImage = hasImages || intent === "SMALLTALK" || enrichment?.media?.images?.length || (legacy?.isIdentityOrSelfQuestion && legacy.isIdentityOrSelfQuestion(run.message));
       if (!skipImage && legacy?.ensureImageForResponse) imagePromise = settle(legacy.ensureImageForResponse(run.message, entity), 6000, null);
 
+      const tools = hasImages || intent === "SMALLTALK" ? [] : selectTools(run.message, getToolSchemas());
+
       // Messages
       const history = ctxRows.filter((r) => r.idx < run.userIdx).slice(-CONFIG.LIMITS.MAX_CONTEXT_MESSAGES).map((r) => ({ role: r.role, content: r.content }));
       let system = LUBA_SYSTEM_PROMPT + `\n\n[LANGUE DÉTECTÉE : ${run.language.toUpperCase()}] → Réponds en ${LANG_NAME[run.language] || "français"}.`;
-      if (freeSources && !hasImages && intent !== "SMALLTALK") {
-        const names = freeSources.schemas().map((t) => t.function.name);
-        if (names.length) system += `\n\n[SOURCES GRATUITES DISPONIBLES : ${names.join(", ")}. Utilise-les selon le sujet : actualités, science, livres, lieux proches, données par pays, musique, archives historiques.]`;
+      if (freeSources && tools.length) {
+        const freeNames = new Set(freeSources.schemas().map((t) => t.function.name));
+        const names = tools.map((t) => t.function.name).filter((n) => freeNames.has(n));
+        if (names.length) system += `\n\n[SOURCES GRATUITES DISPONIBLES POUR CETTE QUESTION : ${names.join(", ")}. Utilise-les si elles aident à répondre.]`;
       }
       if (memoryBlock) system += `\n\n${memoryBlock}`;
       if (intent && intent !== "GENERAL" && intent !== "SMALLTALK") system += `\n\n[DOMAINE DÉTECTÉ : ${intent}]`;
@@ -2837,7 +2946,6 @@ const chat = {
       const messages = [{ role: "system", content: system }, ...history, { role: "user", content: userContent }];
 
       const chain = tierChain(run.tier, { hasImages, code: run.tier === "v250" && intent === "CODE" });
-      const tools = hasImages || intent === "SMALLTALK" ? [] : getToolSchemas();
       const ctx = { userId: run.userId, googleAccessToken: run.googleAccessToken, convId: run.convId };
 
       const out = await orchestrate({
@@ -2898,7 +3006,7 @@ const chat = {
         const status = run.cancelReason === "shutdown" ? "interrupted" : "cancelled";
         return chat.failRun(run, status, status === "interrupted" ? new AppError("SHUTDOWN", "Le serveur redémarre, réessayez.", { status: 503, retryable: true }) : null);
       }
-      const err = e instanceof AppError ? e : new AppError(e instanceof ProviderError ? "LLM_UNAVAILABLE" : "RUN_FAILED", e instanceof ProviderError ? friendlyMessage(e) : "Une erreur interne est survenue.", { status: 503, retryable: true });
+      const err = e instanceof AppError ? e : new AppError(e instanceof ProviderError ? "LLM_UNAVAILABLE" : "RUN_FAILED", e instanceof ProviderError ? friendlyMessage(e) : "Une erreur interne est survenue.", { status: 503, retryable: true, details: { reason: e?.kind || null } });
       if (!(e instanceof AppError) && !(e instanceof ProviderError)) logger.error({ err: e?.message, stack: e?.stack, runId: run.id }, "run échoué");
       return chat.failRun(run, "failed", err);
     } finally {
@@ -3425,7 +3533,7 @@ function diagnostics() {
     version: CONFIG.VERSION, instance: CONFIG.INSTANCE_ID, uptimeS: Math.round(process.uptime()), node: process.version,
     load: { ...loadState }, memoryMb: { rss: Math.round(mem.rss / 1048576), heapUsed: Math.round(mem.heapUsed / 1048576) },
     queue: runManager.stats(), sync: syncHub.stats(), db: { writeQueue: db.pending, driver: db.writer?.driver },
-    providers: health.snapshot(), keys: Object.fromEntries(Object.entries(PROVIDERS).map(([n, p]) => [n, p.keys.length])),
+    recentLlmErrors: llmErrors.slice(-15), providers: health.snapshot(), keys: Object.fromEntries(Object.entries(PROVIDERS).map(([n, p]) => [n, p.keys.length])),
     mirrors: { firestore: mirrorState.firestore, supabase: mirrorState.supabase, ...mirrorWorker.stats }, legacyBridge: Boolean(legacy)
   };
 }
@@ -3497,11 +3605,14 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.json({ success: true, ...diagnostics(), dbHealth: await db.health() });
+  }));
+  app.get("/api/debug/llm", (req, res, next) => (hasDebugAccess(req) ? next() : auth(req, res, (e) => (e ? next(e) : requireRole("ADMIN")(req, res, next)))), wrap(async (_req, res) => {
+    res.json({ success: true, results: await diagnoseProviders(), recentErrors: llmErrors.slice(-15), providers: health.snapshot() });
   }));
   app.get("/api/ads/slots", (_req, res) => res.json({ success: true, slots: {} }));
 
@@ -3654,6 +3765,13 @@ async function bootstrap({ listen = true } = {}) {
   logger.info(`Serveur prêt sur ${CONFIG.HOST}:${CONFIG.PORT}`);
 
   timers.push(startLoadMonitor());
+  if (!CONFIG.FAKE_LLM && envBool("STARTUP_LLM_CHECK", CONFIG.ENV !== "test")) {     // verdict immédiat dans les logs : quel modèle répond, lequel échoue et pourquoi
+    setTimeout(() => diagnoseProviders().then((r) => {
+      for (const x of r) (x.ok ? logger.info : logger.error)(x, x.ok ? "auto-diagnostic LLM : OK" : "auto-diagnostic LLM : ÉCHEC");
+      if (!r.length) logger.error("auto-diagnostic LLM : aucune clé de modèle configurée");
+      else if (!r.some((x) => x.ok)) logger.error("auto-diagnostic LLM : AUCUN modèle ne répond → Luba ne pourra pas répondre (voir les lignes ÉCHEC ci-dessus)");
+    }).catch((e) => logger.warn({ err: e.message }, "auto-diagnostic LLM impossible")), 1500).unref();
+  }
   mirrorWorker.start();
   if (legacy) {   // rappels de tâches + entretien sécurité de l'héritage
     const tk = legacy.CONFIG?.TIMEOUTS || {};
@@ -14047,7 +14165,7 @@ module.exports = {
   verifyToken, tokenCache, authenticate, buildApp, bootstrap, shutdown, diagnostics,
   formatFinalReply, cleanOutput, extractSuggestions, detectLanguage, quickIntent,
   handlers: { chatHandler, runStatusHandler, runStreamHandler, runCancelHandler, listConversationsHandler, messagesHandler, syncHandler, syncStreamHandler, bootstrapHandler },
-  setupWebSocket, sha256, loadState, createLegacyModule, legacyChatBridge, pipeRunToSse, v17Api,
+  setupWebSocket, sha256, loadState, createLegacyModule, legacyChatBridge, pipeRunToSse, v17Api, selectTools, getToolSchemas, diagnoseProviders, sanitizeGeminiSchema, redactSecrets, llmErrors,
   setLegacy: (m) => { legacy = m; }
 };
 
