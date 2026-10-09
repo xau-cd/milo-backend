@@ -322,7 +322,7 @@ function deepFreeze(o) {
 
 const CONFIG = deepFreeze({
   ENV: envStr("NODE_ENV", "production"),
-  VERSION: "17.0.0",
+  VERSION: "17.1.0",
   AGENT_NAME: "Luba",
   HOST: envStr("HOST", "0.0.0.0"),
   PORT: envInt("PORT", 3000),
@@ -960,6 +960,8 @@ function rowToMessage(r) {
 
 function rowToConversation(r) {
   return {
+    id: r.session_id,
+    sessionId: r.session_id,
     conversationId: r.session_id,
     title: r.title || null,
     createdAt: new Date(r.created_at).toISOString(),
@@ -998,6 +1000,20 @@ async function enqueueMirror(w, kind, key, doc) {
       [target, kind, key, safeJsonStringify(doc), ts, ts]
     );
   }
+}
+
+/** Document « session » envoyé au miroir cloud (toujours l'état le plus récent, relu dans la transaction). */
+const mirrorSessionDoc = (row) => ({
+  session_id: row.session_id, user_id: row.user_id, title: row.title || null,
+  preview: row.last_preview || null, last_role: row.last_role || null,
+  message_count: row.msg_count || 0, last_idx: row.last_idx || 0, pinned: Boolean(row.pinned),
+  created_at: row.created_at, updated_at: row.updated_at, version: row.version || 0
+});
+
+/** Ne ressuscite JAMAIS une conversation supprimée : la ligne `session_delete` de l'outbox ne doit pas être écrasée. */
+async function enqueueSessionMirror(w, convId) {
+  const row = await w.get("SELECT * FROM sessions WHERE session_id = ?", [convId]);
+  if (row && !row.deleted_at) await enqueueMirror(w, "session", `s:${convId}`, mirrorSessionDoc(row));
 }
 
 const repo = {
@@ -1074,6 +1090,7 @@ const repo = {
       if (pinned !== undefined) { sets.push("pinned = ?"); params.push(pinned ? 1 : 0); }
       params.push(convId);
       await w.run(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id = ?`, params);
+      await enqueueSessionMirror(w, convId);
       return logSync(w, userId, convId, null);
     });
   },
@@ -1085,6 +1102,8 @@ const repo = {
       if (s.user_id !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
       if (!s.deleted_at) await w.run("UPDATE sessions SET deleted_at = ?, version = version + 1 WHERE session_id = ?", [now(), convId]);
       const seq = await logSync(w, userId, convId, null, "delete");
+      // Les messages encore en attente d'envoi ne doivent pas recréer des documents orphelins après la suppression.
+      await w.run("DELETE FROM mirror_queue WHERE kind = 'message' AND instr(key, ?) = 1", [`${convId}:`]);
       await enqueueMirror(w, "session_delete", `s:${convId}`, { session_id: convId, user_id: userId });
       return seq;
     });
@@ -1120,7 +1139,7 @@ const repo = {
       });
       if (status === "final") {
         await enqueueMirror(w, "message", msgKey(convId, idx), { ...message, user_id: userId });
-        await enqueueMirror(w, "session", `s:${convId}`, { session_id: convId, user_id: userId, updated_at: ts, title: s.title || newTitle });
+        await enqueueSessionMirror(w, convId);
       }
       return { message, duplicate: false, seq };
     });
@@ -1145,7 +1164,11 @@ const repo = {
       );
       const s = await logSync(w, userId, convId, idx);
       const row = await w.get("SELECT * FROM messages WHERE session_id = ? AND idx = ?", [convId, idx]);
-      await enqueueMirror(w, "message", msgKey(convId, idx), { ...rowToMessage(row), user_id: userId });
+      const live = await w.get("SELECT deleted_at FROM sessions WHERE session_id = ?", [convId]);
+      if (row && live && !live.deleted_at) {
+        await enqueueMirror(w, "message", msgKey(convId, idx), { ...rowToMessage(row), user_id: userId });
+        await enqueueSessionMirror(w, convId);   // CORRECTIF : l'aperçu / le dernier idx cloud n'étaient jamais mis à jour en fin de génération
+      }
       return s;
     });
     bus.publish(`user:${userId}`, { type: "sync", seq, conversationId: convId });
@@ -1159,7 +1182,7 @@ const repo = {
 
   async getMessages(userId, convId, { afterIdx = 0, beforeIdx = null, limit = 100 } = {}) {
     const s = await repo.getConversation(userId, convId);
-    if (!s) return { messages: [], hasMore: false, lastIdx: 0 };
+    if (!s || s.deleted_at) return { messages: [], hasMore: false, lastIdx: 0 };
     const lim = clamp(limit, 1, CONFIG.LIMITS.MAX_PAGE_SIZE * 2);
     let rows;
     if (beforeIdx) {
@@ -1387,6 +1410,7 @@ function initFirebase() {
       ? firebaseAdmin.app()
       : firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert(sa), projectId: sa.project_id || FIREBASE_CONFIG.projectId });
     firestoreDb = firebaseAdmin.firestore(firebaseApp);
+    try { firestoreDb.settings({ ignoreUndefinedProperties: true }); } catch { /* déjà configuré */ }
     mirrorState.firestore = envBool("MIRROR_FIRESTORE", true);
     logger.info("Firebase Admin initialisé");
   } catch (e) {
@@ -2820,8 +2844,19 @@ const factSlots = { n: 0, max: 2 };
 
 const chat = {
   /** Admission + persistance idempotente + mise en file. Retourne immédiatement (aucun appel LLM ici). */
-  async start({ userId, role, firebaseUid, convId, message, clientMsgId = null, tier = "v100", images = null, googleAccessToken = null, channel = "web", skipQuota = false }) {
+  async start({ userId, role, firebaseUid, convId, message, clientMsgId = null, tier = "v100", images = null, googleAccessToken = null, channel = "web", skipQuota = false, knownNew = false }) {
     const { created } = await repo.ensureConversation(userId, convId, { firebaseUid });
+
+    // SYNC CLOUD : si cette conversation existe dans Firestore (SQLite vidé / autre instance), on la restaure AVANT d'y ajouter
+    // un message — sinon le nouvel idx écraserait un message déjà sauvegardé et le contexte envoyé au LLM serait incomplet.
+    if (!knownNew && cloud.enabled()) {
+      const h = await settle(cloud.hydrateConversation(userId, convId), 8000, { status: "error" });
+      if (h.status === "error") {
+        const cov = await db.writerGet("SELECT COALESCE(MAX(idx), 0) AS m FROM messages WHERE session_id = ?", [convId]);
+        const sess = await db.writerGet("SELECT last_idx FROM sessions WHERE session_id = ?", [convId]);
+        if (created || (sess?.last_idx || 0) > (cov?.m || 0)) throw Errors.busy("Synchronisation cloud momentanément indisponible. Réessayez dans un instant.", 3000);
+      }
+    }
 
     if (clientMsgId) {   // un retry réseau du client ne crée NI doublon NI nouvelle facturation
       const dup = await db.get("SELECT idx FROM messages WHERE session_id = ? AND client_msg_id = ?", [convId, clientMsgId]);
@@ -3243,6 +3278,245 @@ function onWsConnection(ws, userId, since) {
 }
 
 // ================================================================================
+// §15b — STOCKAGE CLOUD DES DISCUSSIONS (Firestore, rangé par uid Firebase Auth)
+// ================================================================================
+// Arborescence :  users/{uid}/conversations/{convId}                → métadonnées (titre, aperçu, curseurs)
+//                 users/{uid}/conversations/{convId}/messages/{idx}  → messages (idx sur 6 chiffres)
+//  • Écriture : UNIQUEMENT ici (Admin SDK, via l'outbox durable). Les règles Firestore interdisent toute écriture client.
+//  • Lecture client : règle `request.auth.uid == uid` → un utilisateur ne voit jamais les discussions d'un autre.
+//  • Restauration : si SQLite est vide (disque éphémère, redéploiement…), on reconstruit depuis Firestore,
+//    et on ne laisse JAMAIS un nouvel idx écraser un message déjà présent dans le cloud.
+
+const FS_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const fsPad = (idx) => String(idx).padStart(6, "0");
+const toMs = (v) => {
+  if (v && typeof v.toMillis === "function") return v.toMillis();
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : now();
+};
+const clampJson = (v, maxChars) => {
+  try { const j = JSON.stringify(v); return j !== undefined && j.length <= maxChars ? JSON.parse(j) : undefined; } catch { return undefined; }
+};
+const CLOUD_LIST_LIMIT = envInt("CLOUD_LIST_LIMIT", 100);
+const CLOUD_PAGE = 200;
+
+function cloudMessageDoc(p) {
+  const md = p.metadata && typeof p.metadata === "object" ? p.metadata : {};
+  const metadata = {};
+  const put = (k, v, max) => { if (v === undefined) return; const c = clampJson(v, max); if (c !== undefined) metadata[k] = c; };
+  put("sources", md.sources, 8000); put("media", md.media, 20000); put("suggestions", md.suggestions, 2000);
+  put("model", md.model, 200); put("providerUsed", md.providerUsed, 100); put("partial", md.partial, 10);
+  return {
+    idx: p.idx, role: p.role, content: String(p.content ?? "").slice(0, 250000), status: p.status || "final",
+    metadata, createdAt: toMs(p.createdAt), updatedAt: toMs(p.updatedAt)
+  };
+}
+
+function cloudSessionDoc(p) {
+  return {
+    title: p.title ? String(p.title).slice(0, 120) : null,
+    preview: p.preview ? String(p.preview).slice(0, 160) : null,
+    lastRole: p.last_role || null, messageCount: p.message_count || 0, lastIdx: p.last_idx || 0,
+    pinned: Boolean(p.pinned), createdAt: toMs(p.created_at), updatedAtMs: toMs(p.updated_at), version: p.version || 0
+  };
+}
+
+/** Supprime un document (et toutes ses sous-collections) ou une collection entière. */
+async function cloudDeleteTree(ref) {
+  if (typeof firestoreDb.recursiveDelete === "function") return firestoreDb.recursiveDelete(ref);
+  if (typeof ref.listDocuments === "function") { for (const d of await ref.listDocuments()) await cloudDeleteTree(d); return undefined; }
+  for (const c of await ref.listCollections()) await cloudDeleteTree(c);
+  return ref.delete();
+}
+
+const hydratedUsers = new TTLCache({ max: 20000, ttlMs: envInt("CLOUD_HYDRATE_USER_TTL_MS", 30 * 60 * 1000) });
+const hydratedConvs = new TTLCache({ max: 50000, ttlMs: envInt("CLOUD_HYDRATE_CONV_TTL_MS", 10 * 60 * 1000) });
+const inflightCloud = new Map();
+const singleFlight = (key, fn) => {
+  if (inflightCloud.has(key)) return inflightCloud.get(key);
+  const p = fn().finally(() => inflightCloud.delete(key));
+  inflightCloud.set(key, p);
+  return p;
+};
+const cloudConvCol = (uid) => firestoreDb.collection("users").doc(uid).collection("conversations");
+
+function metaFromCloud(id, d) {
+  const int = (v) => (Number.isFinite(Number(v)) ? Math.max(0, Math.floor(Number(v))) : 0);
+  return {
+    id,
+    title: typeof d.title === "string" ? d.title.slice(0, 120) : null,
+    preview: typeof d.preview === "string" ? d.preview.slice(0, 160) : null,
+    lastRole: d.lastRole === "user" || d.lastRole === "assistant" ? d.lastRole : null,
+    messageCount: int(d.messageCount), lastIdx: int(d.lastIdx), pinned: Boolean(d.pinned),
+    createdAt: toMs(d.createdAt), updatedAtMs: toMs(d.updatedAtMs)
+  };
+}
+
+/** Crée (ou rattrape) la ligne SQLite d'une conversation décrite par le cloud. Retourne 1 si quelque chose a changé. */
+async function cloudUpsertLocalSession(uid, m) {
+  return db.transaction(async (w) => {
+    const row = await w.get("SELECT * FROM sessions WHERE session_id = ?", [m.id]);
+    if (row) {
+      if (row.user_id !== uid || row.deleted_at) return 0;
+      if (m.lastIdx <= (row.last_idx || 0)) return 0;
+      await w.run(
+        `UPDATE sessions SET last_idx = ?, msg_count = MAX(COALESCE(msg_count, 0), ?), last_preview = COALESCE(?, last_preview),
+           last_role = COALESCE(?, last_role), title = COALESCE(title, ?), updated_at = MAX(updated_at, ?), version = version + 1
+         WHERE session_id = ?`,
+        [m.lastIdx, m.messageCount, m.preview, m.lastRole, m.title, m.updatedAtMs, m.id]);
+    } else {
+      const ts = now();
+      await w.run("INSERT OR IGNORE INTO users (id, firebase_uid, role, created_at, updated_at) VALUES (?, ?, 'FREE', ?, ?)", [uid, uid, ts, ts]);
+      await w.run(
+        `INSERT OR IGNORE INTO sessions (session_id, user_id, firebase_uid, created_at, updated_at, title, msg_count, last_idx, last_preview, last_role, pinned, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        [m.id, uid, uid, m.createdAt, m.updatedAtMs, m.title, m.messageCount, m.lastIdx, m.preview, m.lastRole, m.pinned ? 1 : 0]);
+    }
+    await logSync(w, uid, m.id, null);
+    return 1;
+  });
+}
+
+/** Recalcule les compteurs d'une session d'après les messages réellement présents (idempotent). */
+async function cloudNormalizeSession(w, uid, convId) {
+  const agg = await w.get("SELECT COALESCE(MAX(idx), 0) AS m, COUNT(*) AS n FROM messages WHERE session_id = ?", [convId]);
+  const last = await w.get("SELECT role, content FROM messages WHERE session_id = ? AND content <> '' ORDER BY idx DESC LIMIT 1", [convId]);
+  await w.run(
+    `UPDATE sessions SET last_idx = ?, msg_count = ?, last_preview = COALESCE(?, last_preview), last_role = COALESCE(?, last_role),
+       version = version + 1 WHERE session_id = ?`,
+    [agg?.m || 0, agg?.n || 0, last ? preview(last.content) : null, last ? last.role : null, convId]);
+  await logSync(w, uid, convId, null);
+}
+
+const CLOUD_STATUSES = new Set(["final", "interrupted", "failed", "cancelled"]);
+
+async function cloudInsertMessages(w, uid, convId, docs) {
+  let n = 0;
+  for (const x of docs) {
+    const idx = Number(x.idx);
+    if (!Number.isInteger(idx) || idx < 1 || (x.role !== "user" && x.role !== "assistant") || typeof x.content !== "string" || x.status === "streaming") continue;
+    const r = await w.run(
+      `INSERT OR IGNORE INTO messages (session_id, user_id, role, content, metadata, created_at, updated_at, idx, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [convId, uid, x.role, x.content, safeJsonStringify(x.metadata && typeof x.metadata === "object" ? x.metadata : {}),
+        toMs(x.createdAt), toMs(x.updatedAt), idx, CLOUD_STATUSES.has(x.status) ? x.status : "final"]);
+    n += r.changes;
+  }
+  return n;
+}
+
+/** Migration unique des anciens miroirs (collections racine `sessions` / `messages`) vers le nouveau rangement par uid. */
+async function cloudMigrateLegacy(uid) {
+  const flagKey = `legacy_fs:${uid}`;
+  if (await db.get("SELECT value FROM kv WHERE key = ?", [flagKey])) return 0;
+  let migrated = 0;
+  try {
+    const ss = await firestoreDb.collection("sessions").where("user_id", "==", uid).limit(CLOUD_LIST_LIMIT).get();
+    for (const sd of ss.docs) {
+      const convId = sd.id;
+      if (!CONV_ID_RE.test(convId)) continue;
+      const ms = await firestoreDb.collection("messages").where("session_id", "==", convId).limit(1000).get();
+      const msgs = ms.docs.map((d) => d.data())
+        .filter((m) => m.user_id === uid && Number.isInteger(Number(m.idx)) && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content !== "")
+        .sort((a, b) => a.idx - b.idx);
+      if (!msgs.length) continue;
+      const sMeta = sd.data() || {};
+      await db.transaction(async (w) => {
+        const ts = now();
+        await w.run("INSERT OR IGNORE INTO users (id, firebase_uid, role, created_at, updated_at) VALUES (?, ?, 'FREE', ?, ?)", [uid, uid, ts, ts]);
+        await w.run(
+          `INSERT OR IGNORE INTO sessions (session_id, user_id, firebase_uid, created_at, updated_at, title, msg_count, last_idx, version)
+           VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)`,
+          [convId, uid, uid, toMs(msgs[0].created_at), toMs(sMeta.updated_at || msgs[msgs.length - 1].updated_at),
+            typeof sMeta.title === "string" && sMeta.title ? sMeta.title.slice(0, 120) : preview(msgs.find((m) => m.role === "user")?.content || "Conversation", 60)]);
+        const own = await w.get("SELECT user_id, deleted_at FROM sessions WHERE session_id = ?", [convId]);
+        if (!own || own.user_id !== uid || own.deleted_at) return;
+        const docs = msgs.map((m) => ({ idx: m.idx, role: m.role, content: m.content, status: m.status, metadata: m.metadata, createdAt: m.created_at, updatedAt: m.updated_at }));
+        await cloudInsertMessages(w, uid, convId, docs);
+        await cloudNormalizeSession(w, uid, convId);
+        // On range ces anciennes discussions dans le nouveau format cloud.
+        for (const d of docs) {
+          if (d.status === "streaming") continue;
+          await enqueueMirror(w, "message", msgKey(convId, d.idx), { conversationId: convId, user_id: uid, idx: Number(d.idx), role: d.role, content: d.content, status: CLOUD_STATUSES.has(d.status) ? d.status : "final", metadata: d.metadata, createdAt: toMs(d.createdAt), updatedAt: toMs(d.updatedAt) });
+        }
+        await enqueueSessionMirror(w, convId);
+      });
+      migrated++;
+    }
+    await db.run("INSERT INTO kv (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value", [flagKey]);
+  } catch (e) {
+    logger.warn({ err: e.message, uid }, "migration des anciens miroirs Firestore ignorée (sera retentée)");
+  }
+  return migrated;
+}
+
+const cloud = {
+  enabled: () => Boolean(firestoreDb) && mirrorState.firestore && CONFIG.MIRROR.ENABLED,
+
+  /** Liste cloud → lignes SQLite manquantes. Une seule fois par utilisateur et par fenêtre (30 min). */
+  async hydrateUser(uid) {
+    if (!cloud.enabled() || !FS_ID_RE.test(String(uid))) return { status: "disabled" };
+    if (hydratedUsers.get(uid)) return { status: "ok", cached: true };
+    return singleFlight(`u:${uid}`, async () => {
+      try {
+        const snap = await cloudConvCol(uid).orderBy("updatedAtMs", "desc").limit(CLOUD_LIST_LIMIT).get();
+        let changed = 0;
+        for (const doc of snap.docs) {
+          if (!CONV_ID_RE.test(doc.id)) continue;
+          changed += await cloudUpsertLocalSession(uid, metaFromCloud(doc.id, doc.data() || {}));
+        }
+        if (snap.empty) changed += await cloudMigrateLegacy(uid);
+        hydratedUsers.set(uid, true);
+        if (changed) logger.info({ uid, changed }, "discussions restaurées depuis Firestore");
+        return { status: "ok", changed };
+      } catch (e) {
+        logger.warn({ err: e.message, uid }, "restauration cloud (liste) impossible");
+        return { status: "error", error: e.message };
+      }
+    });
+  },
+
+  /** Messages cloud manquants → SQLite. À appeler AVANT d'ajouter un message à une conversation existante. */
+  async hydrateConversation(uid, convId) {
+    if (!cloud.enabled()) return { status: "disabled" };
+    if (!FS_ID_RE.test(String(uid)) || !CONV_ID_RE.test(String(convId))) return { status: "absent" };
+    const key = `${uid}:${convId}`;
+    if (hydratedConvs.get(key)) return { status: "ok", cached: true };
+    return singleFlight(`c:${key}`, async () => {
+      try {
+        const ref = cloudConvCol(uid).doc(convId);
+        const snap = await ref.get();
+        if (!snap.exists) return { status: "absent" };
+        const meta = metaFromCloud(convId, snap.data() || {});
+        await cloudUpsertLocalSession(uid, meta);
+        const own = await db.writerGet("SELECT user_id, deleted_at FROM sessions WHERE session_id = ?", [convId]);
+        if (!own || own.user_id !== uid || own.deleted_at) return { status: "absent" };
+        const cov = await db.writerGet("SELECT COALESCE(MAX(idx), 0) AS m FROM messages WHERE session_id = ?", [convId]);
+        let after = cov?.m || 0, imported = 0;
+        while (after < meta.lastIdx) {
+          const page = await ref.collection("messages").orderBy("idx").startAfter(after).limit(CLOUD_PAGE).get();
+          if (page.empty) break;
+          const docs = page.docs.map((d) => d.data() || {});
+          imported += await db.transaction((w) => cloudInsertMessages(w, uid, convId, docs));
+          const nextAfter = Number(docs[docs.length - 1].idx);
+          if (!Number.isFinite(nextAfter) || nextAfter <= after) break;
+          after = nextAfter;
+          if (page.size < CLOUD_PAGE) break;
+        }
+        await db.transaction((w) => cloudNormalizeSession(w, uid, convId));
+        hydratedConvs.set(key, true);
+        return { status: "ok", imported };
+      } catch (e) {
+        logger.warn({ err: e.message, uid, convId }, "restauration cloud (messages) impossible");
+        return { status: "error", error: e.message };
+      }
+    });
+  },
+
+  forget(uid, convId = null) { hydratedUsers.delete(uid); if (convId) hydratedConvs.delete(`${uid}:${convId}`); }
+};
+
+// ================================================================================
 // §15 — MIROIRS FIRESTORE / SUPABASE (outbox durable · asynchrone · jamais lus)
 // ================================================================================
 // SQLite est la source de vérité. Les miroirs sont alimentés par `mirror_queue`, écrite
@@ -3269,34 +3543,53 @@ class MirrorWorker {
       for (const target of ["firestore", "supabase"]) {
         const batch = rows.filter((r) => r.target === target);
         if (!batch.length) continue;
-        let err = null;
-        try {
-          if (target === "firestore" && firestoreDb) await this._firestore(batch);
-          else if (target === "supabase" && supabaseClient) await this._supabase(batch);
-          else err = new Error("cible indisponible");
-        } catch (e) { err = e; }
-        await this._settle(batch, err);
+        let err = null, perRow = null;
+        const run = (list) => {
+          if (target === "firestore" && firestoreDb) return this._firestore(list);
+          if (target === "supabase" && supabaseClient) return this._supabase(list);
+          throw new Error("cible indisponible");
+        };
+        try { await run(batch); }
+        catch (e) {
+          err = e;
+          // Un lot ne doit jamais être bloqué par UNE ligne défectueuse : on rejoue ligne par ligne pour l'isoler.
+          if (batch.length > 1 && (target === "supabase" ? supabaseClient : firestoreDb)) {
+            perRow = [];
+            for (const r of batch) { try { await run([r]); perRow.push(null); } catch (e2) { perRow.push(e2); } }
+            err = null;
+          }
+        }
+        await this._settle(batch, err, perRow);
       }
     } finally { this.busy = false; }
   }
 
   async _firestore(batch) {
-    const col = (n) => firestoreDb.collection(n);
-    const wb = firestoreDb.batch();
+    let wb = firestoreDb.batch();
+    let pending = 0;
+    const flush = async () => { if (pending) { const b = wb; wb = firestoreDb.batch(); pending = 0; await b.commit(); } };
     for (const r of batch) {
       const p = safeJsonParse(r.payload, {});
+      const uid = p.user_id;
+      if (typeof uid !== "string" || !FS_ID_RE.test(uid)) continue;            // identifiant invalide : jamais de chemin forgé
+      const convId = p.conversationId || p.session_id;
+      if (r.kind !== "user_purge" && !CONV_ID_RE.test(String(convId || ""))) continue;
       if (r.kind === "message") {
-        wb.set(col("messages").doc(r.key.replace(/[:/]/g, "_")), {
-          session_id: p.conversationId, user_id: p.user_id, firebase_uid: p.user_id, idx: p.idx, role: p.role, content: p.content,
-          status: p.status, metadata: p.metadata || {}, created_at: p.createdAt, updated_at: p.updatedAt
-        }, { merge: true });
+        wb.set(cloudConvCol(uid).doc(convId).collection("messages").doc(fsPad(p.idx)), cloudMessageDoc(p), { merge: true });
+        pending++;
       } else if (r.kind === "session") {
-        wb.set(col("sessions").doc(p.session_id), { session_id: p.session_id, user_id: p.user_id, firebase_uid: p.user_id, updated_at: p.updated_at, title: p.title || null }, { merge: true });
+        wb.set(cloudConvCol(uid).doc(convId), cloudSessionDoc(p), { merge: true });
+        pending++;
       } else if (r.kind === "session_delete") {
-        wb.delete(col("sessions").doc(p.session_id));
+        await flush();                                                          // l'ordre de l'outbox est respecté
+        await cloudDeleteTree(cloudConvCol(uid).doc(convId));
+      } else if (r.kind === "user_purge") {
+        await flush();
+        await cloudDeleteTree(cloudConvCol(uid));
       }
+      if (pending >= 400) await flush();                                        // Firestore : 500 opérations max par lot
     }
-    await wb.commit();
+    await flush();
   }
 
   async _supabase(batch) {
@@ -3310,14 +3603,18 @@ class MirrorWorker {
     if (msgs.length) { const { error } = await supabaseClient.from("messages").upsert(msgs, { onConflict: "session_id,idx" }); if (error) throw new Error(error.message); }
   }
 
-  async _settle(batch, err) {
+  async _settle(batch, errAll, perRow = null) {
+    let firstErr = errAll;
     await db.transaction(async (w) => {
-      for (const r of batch) {
+      for (let i = 0; i < batch.length; i++) {
+        const r = batch[i];
+        const err = perRow ? perRow[i] : errAll;
         if (!err) {
           // ne supprime que si le payload n'a pas été remplacé entre-temps (sinon il sera renvoyé)
           await w.run("DELETE FROM mirror_queue WHERE id = ? AND payload = ?", [r.id, r.payload]);
           this.stats.ok++;
         } else {
+          firstErr = firstErr || err;
           const attempts = r.attempts + 1;
           const dead = attempts >= CONFIG.MIRROR.MAX_ATTEMPTS;
           await w.run("UPDATE mirror_queue SET attempts = ?, status = ?, next_attempt_at = ?, last_error = ? WHERE id = ?",
@@ -3326,7 +3623,7 @@ class MirrorWorker {
         }
       }
     });
-    if (err) logger.warn({ err: err.message, n: batch.length, target: batch[0].target }, "miroir : échec (retry planifié)");
+    if (firstErr) logger.warn({ err: firstErr.message, n: batch.length, target: batch[0].target }, "miroir : échec (retry planifié)");
   }
 }
 const mirrorWorker = new MirrorWorker();
@@ -3401,7 +3698,7 @@ async function chatHandler(req, res) {
   }
 
   const started = await chat.start({
-    userId: req.userId, role: req.userRole, firebaseUid: req.firebaseUid, convId, message, clientMsgId,
+    userId: req.userId, role: req.userRole, firebaseUid: req.firebaseUid, convId, message, clientMsgId, knownNew: isNewRequest,
     tier: req.body?.modelTier === "v250" ? "v250" : "v100", images,
     googleAccessToken: req.headers["x-google-access-token"] || null, channel: stream ? "web-sse" : "web"
   });
@@ -3472,6 +3769,7 @@ async function runCancelHandler(req, res) {
 async function listConversationsHandler(req, res) {
   const limit = clamp(parseInt(req.query.limit, 10) || 50, 1, CONFIG.LIMITS.MAX_PAGE_SIZE);
   const before = parseInt(req.query.before, 10) || null;
+  await settle(cloud.hydrateUser(req.userId), 6000, null);     // SQLite vide (disque éphémère) → on restaure depuis Firestore
   const conversations = await repo.listConversations(req.userId, { limit, beforeMs: before });
   res.json({ success: true, error: false, conversations, nextBefore: conversations.length === limit ? conversations[conversations.length - 1].updatedAtMs : null });
 }
@@ -3481,6 +3779,7 @@ async function messagesHandler(req, res) {
   if (!CONV_ID_RE.test(convId)) throw Errors.badRequest("INVALID_CONVERSATION_ID", "ID invalide.");
   const full = req.query.full === "true";
   const limit = full ? 500 : clamp(parseInt(req.query.limit, 10) || 50, 1, CONFIG.LIMITS.MAX_PAGE_SIZE * 2);
+  await settle(cloud.hydrateConversation(req.userId, convId), 8000, null);
   const r = await repo.getMessages(req.userId, convId, { afterIdx: parseInt(req.query.after, 10) || 0, beforeIdx: parseInt(req.query.before, 10) || null, limit });
   res.json({ success: true, error: false, conversationId: convId, messages: r.messages, count: r.messages.length, hasMore: r.hasMore, lastIdx: r.lastIdx });
 }
@@ -3511,6 +3810,7 @@ async function syncStreamHandler(req, res) {
 
 async function bootstrapHandler(req, res) {
   const uid = req.userId;
+  await settle(cloud.hydrateUser(uid), 6000, null);
   const [conversations, quota, tasks, user, facts, cursor] = await Promise.all([
     repo.listConversations(uid, { limit: 30 }),
     repo.getQuota(uid), repo.listTasks(uid, "pending").catch(() => []), repo.getUser(uid),
@@ -3570,6 +3870,14 @@ function buildApp() {
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Google-Access-Token", "X-Session-Token", "x-luba-signature", "x-luba-timestamp", "Accept", "Last-Event-ID", "Idempotency-Key"],
     exposedHeaders: ["X-Request-Id", "Retry-After", "RateLimit-Remaining"], credentials: true, maxAge: 86400
   }) : (req, res, next) => next());
+  // L'API ne sert que du JSON / SSE : aucune ressource ne doit pouvoir être exécutée, intégrée ou mise en cache.
+  app.use((req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    if (req.path.startsWith("/api/") && req.path !== "/api/health") res.setHeader("Cache-Control", "no-store");
+    next();
+  });
   if (helmet) app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }));
   const compression = tryRequire("compression");
   if (compression) app.use(compression({ filter: (req, res) => !String(res.getHeader("Content-Type") || "").includes("text/event-stream") && compression.filter(req, res) }));
@@ -3605,7 +3913,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
@@ -3646,6 +3954,7 @@ function buildApp() {
   }));
   app.get("/api/conversation/:conversationId/messages", auth, rateLimit("SYNC"), wrap(messagesHandler));        // chemin v16.5
   app.get("/api/conversations/:conversationId/messages", auth, rateLimit("SYNC"), wrap(messagesHandler));
+  app.get("/api/conversations/:conversationId", auth, rateLimit("SYNC"), wrap(messagesHandler));          // alias : l'interface charge /api/conversations/:id
   app.get("/api/sync", auth, rateLimit("SYNC"), wrap(syncHandler));
   app.get("/api/sync/stream", authStream, rateLimit("SYNC"), wrap(syncStreamHandler));
 
@@ -3687,11 +3996,16 @@ function buildApp() {
     const sessions = await db.all("SELECT session_id FROM sessions WHERE user_id = ?", [uid]);
     await db.transaction(async (w) => {
       for (const s of sessions) await enqueueMirror(w, "session_delete", `s:${s.session_id}`, { session_id: s.session_id, user_id: uid });
+      await enqueueMirror(w, "user_purge", `u:${uid}`, { user_id: uid });        // efface aussi les discussions présentes uniquement dans le cloud
+      for (const q of await w.all("SELECT id, payload FROM mirror_queue WHERE kind IN ('message','session')")) {
+        if (safeJsonParse(q.payload, {}).user_id === uid) await w.run("DELETE FROM mirror_queue WHERE id = ?", [q.id]);
+      }
       await w.run("DELETE FROM sync_log WHERE user_id = ?", [uid]);
       await w.run("DELETE FROM user_long_term_memory WHERE user_id = ?", [uid]);
       await w.run("DELETE FROM users WHERE id = ?", [uid]);
     });
     userProfiles.delete(uid);
+    cloud.forget(uid);
     if (firebaseApp) { try { await firebaseAdmin.auth(firebaseApp).deleteUser(uid); } catch (e) { logger.warn({ err: e.message }, "suppression Firebase"); } }
     res.json({ success: true });
   }));
@@ -14166,7 +14480,9 @@ module.exports = {
   formatFinalReply, cleanOutput, extractSuggestions, detectLanguage, quickIntent,
   handlers: { chatHandler, runStatusHandler, runStreamHandler, runCancelHandler, listConversationsHandler, messagesHandler, syncHandler, syncStreamHandler, bootstrapHandler },
   setupWebSocket, sha256, loadState, createLegacyModule, legacyChatBridge, pipeRunToSse, v17Api, selectTools, getToolSchemas, diagnoseProviders, sanitizeGeminiSchema, redactSecrets, llmErrors,
-  setLegacy: (m) => { legacy = m; }
+  setLegacy: (m) => { legacy = m; },
+  cloud, cloudMessageDoc, cloudSessionDoc, metaFromCloud, mirrorSessionDoc, enqueueSessionMirror,
+  setFirestoreForTest: (fs) => { firestoreDb = fs; mirrorState.firestore = Boolean(fs); hydratedUsers.clear(); hydratedConvs.clear(); }
 };
 
 if (require.main === module) {
