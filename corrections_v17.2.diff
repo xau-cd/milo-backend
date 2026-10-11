@@ -1,0 +1,456 @@
+--- /mnt/user-data/uploads/index.js	2026-10-10 23:43:12.836581000 +0000
++++ v17.js	2026-10-10 23:52:02.474079268 +0000
+@@ -30,6 +30,21 @@
+ //     Firestore / Supabase = miroirs ASYNCHRONES via outbox durable (jamais lus).
+ //   • Sync delta par curseur (sync_log) + messages numérotés (idx) + idempotence.
+ //
++// CORRECTIONS v17.2 (audit + tests de charge avec le faux LLM)
++//   1. Envois rapides dans une même conversation : les idx étaient entrelacés (u,u,u,…,a,a,a) et les requêtes refusées
++//      laissaient un message utilisateur « fantôme ». → `repo.appendTurn` (user + réponse en UNE transaction) et
++//      `runManager.reserve()` (place réservée AVANT d'écrire en base ; plus de course entre contrôle et insertion).
++//   2. /api/chat JSON non streamé (Luba.html) : plus de silence de 90 s ni de 202 brut affiché comme message.
++//      Keep-alive (espaces avant le JSON) → le proxy ne coupe plus ; délai porté à 270 s ; dépassement = message lisible ;
++//      surcharge = 200 + texte (au lieu d'un 5xx qui faisait passer l'interface « hors ligne »).
++//   3. POST /api/tools : accepte { action, params } (format de Luba.html), alias web_search → web_fast, champ `reply` ajouté.
++//   4. POST /api/clear-cache (appelé par l'interface) n'existait plus en v17 → rétabli.
++//   5. Historique /api/conversations/:id : plus de bulles vides (réponses échouées/annulées vides filtrées ; ?raw=1 pour tout).
++//   6. Réponse /api/chat : champ `images` au premier niveau (contrat v16.5) en plus de `media.images`.
++//   7. Images Markdown recopiées par le modèle dans son texte retirées (anti double affichage avec la galerie).
++//   8. Synchro SSE/WebSocket : curseur déterminé AVANT l'enregistrement dans le hub (flush concurrent repartait de 0)
++//      + plus de connexion « fantôme » enregistrée si le client part pendant l'attente.
++//
+ // TABLE DES MATIÈRES
+ //   §1  Imports & utilitaires        §10 Orchestrateur LLM (streaming, outils)
+ //   §2  Configuration                §11 Pont outils legacy (optionnel)
+@@ -322,7 +337,7 @@
+ 
+ const CONFIG = deepFreeze({
+   ENV: envStr("NODE_ENV", "production"),
+-  VERSION: "17.1.0",
++  VERSION: "17.2.0",
+   AGENT_NAME: "Luba",
+   HOST: envStr("HOST", "0.0.0.0"),
+   PORT: envInt("PORT", 3000),
+@@ -1017,6 +1032,40 @@
+   if (row && !row.deleted_at) await enqueueMirror(w, "session", `s:${convId}`, mirrorSessionDoc(row));
+ }
+ 
++/** Ajoute UN message dans une transaction déjà ouverte (utilisé par appendMessage et appendTurn). */
++async function appendInTx(w, { userId, convId, role, content, clientMsgId = null, runId = null, status = "final", metadata = null }) {
++    if (clientMsgId) {
++      const dup = await w.get("SELECT * FROM messages WHERE session_id = ? AND client_msg_id = ?", [convId, clientMsgId]);
++      if (dup) return { message: rowToMessage(dup), duplicate: true, seq: null };
++    }
++    const s = await w.get("SELECT user_id, last_idx, deleted_at, title FROM sessions WHERE session_id = ?", [convId]);
++    if (!s || s.deleted_at) throw Errors.notFound("CONVERSATION_NOT_FOUND", "Conversation introuvable.");
++    if (s.user_id !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
++    const idx = (s.last_idx || 0) + 1;
++    const ts = now();
++    const r = await w.run(
++      `INSERT INTO messages (session_id, user_id, role, content, metadata, created_at, updated_at, idx, client_msg_id, run_id, status)
++       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++      [convId, userId, role, content, safeJsonStringify(metadata || {}), ts, ts, idx, clientMsgId, runId, status]
++    );
++    const newTitle = !s.title && role === "user" ? preview(content, 60) : null;
++    await w.run(
++      `UPDATE sessions SET last_idx = ?, msg_count = msg_count + 1, last_preview = ?, last_role = ?,
++         updated_at = ?, version = version + 1, title = COALESCE(title, ?) WHERE session_id = ?`,
++      [idx, preview(content), role, ts, newTitle, convId]
++    );
++    const seq = await logSync(w, userId, convId, idx);
++    const message = rowToMessage({
++      id: r.lastID, session_id: convId, idx, role, content, status, run_id: runId,
++      client_msg_id: clientMsgId, metadata: safeJsonStringify(metadata || {}), created_at: ts, updated_at: ts
++    });
++    if (status === "final") {
++      await enqueueMirror(w, "message", msgKey(convId, idx), { ...message, user_id: userId });
++      await enqueueSessionMirror(w, convId);
++    }
++    return { message, duplicate: false, seq };
++}
++
+ const repo = {
+   // ---------- Utilisateurs ----------
+   async ensureUser(uid, { email = null, displayName = null, emailVerified = false, role = null } = {}) {
+@@ -1111,38 +1160,23 @@
+   },
+ 
+   // ---------- Messages ----------
+-  async appendMessage({ userId, convId, role, content, clientMsgId = null, runId = null, status = "final", metadata = null }) {
++  async appendMessage(args) {
++    const out = await db.transaction((w) => appendInTx(w, args));
++    if (out.seq) bus.publish(`user:${args.userId}`, { type: "sync", seq: out.seq, conversationId: args.convId });
++    return out;
++  },
++
++  /**
++   * Message utilisateur + emplacement de la réponse dans UNE SEULE transaction.
++   * Corrige : avec plusieurs envois rapides dans la même conversation, les idx étaient
++   * entrelacés (u,u,u,…,a,a,a) → l'historique affiché/synchronisé était dans le désordre.
++   */
++  async appendTurn({ userId, convId, message, clientMsgId = null, runId = null }) {
+     const out = await db.transaction(async (w) => {
+-      if (clientMsgId) {
+-        const dup = await w.get("SELECT * FROM messages WHERE session_id = ? AND client_msg_id = ?", [convId, clientMsgId]);
+-        if (dup) return { message: rowToMessage(dup), duplicate: true, seq: null };
+-      }
+-      const s = await w.get("SELECT user_id, last_idx, deleted_at, title FROM sessions WHERE session_id = ?", [convId]);
+-      if (!s || s.deleted_at) throw Errors.notFound("CONVERSATION_NOT_FOUND", "Conversation introuvable.");
+-      if (s.user_id !== userId) throw Errors.forbidden("CONVERSATION_OWNERSHIP", "Cette conversation ne vous appartient pas.");
+-      const idx = (s.last_idx || 0) + 1;
+-      const ts = now();
+-      const r = await w.run(
+-        `INSERT INTO messages (session_id, user_id, role, content, metadata, created_at, updated_at, idx, client_msg_id, run_id, status)
+-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+-        [convId, userId, role, content, safeJsonStringify(metadata || {}), ts, ts, idx, clientMsgId, runId, status]
+-      );
+-      const newTitle = !s.title && role === "user" ? preview(content, 60) : null;
+-      await w.run(
+-        `UPDATE sessions SET last_idx = ?, msg_count = msg_count + 1, last_preview = ?, last_role = ?,
+-           updated_at = ?, version = version + 1, title = COALESCE(title, ?) WHERE session_id = ?`,
+-        [idx, preview(content), role, ts, newTitle, convId]
+-      );
+-      const seq = await logSync(w, userId, convId, idx);
+-      const message = rowToMessage({
+-        id: r.lastID, session_id: convId, idx, role, content, status, run_id: runId,
+-        client_msg_id: clientMsgId, metadata: safeJsonStringify(metadata || {}), created_at: ts, updated_at: ts
+-      });
+-      if (status === "final") {
+-        await enqueueMirror(w, "message", msgKey(convId, idx), { ...message, user_id: userId });
+-        await enqueueSessionMirror(w, convId);
+-      }
+-      return { message, duplicate: false, seq };
++      const u = await appendInTx(w, { userId, convId, role: "user", content: message, clientMsgId, status: "final" });
++      if (u.duplicate) return { duplicate: true, user: u, asst: null, seq: null };
++      const a = await appendInTx(w, { userId, convId, role: "assistant", content: "", runId, status: "streaming" });
++      return { duplicate: false, user: u, asst: a, seq: a.seq };
+     });
+     if (out.seq) bus.publish(`user:${userId}`, { type: "sync", seq: out.seq, conversationId: convId });
+     return out;
+@@ -3126,6 +3160,8 @@
+     this.activeHeavy = 0;
+     this.userActive = new Map();
+     this.userQueued = new Map();
++    this.reserved = 0;                  // places réservées par des requêtes en cours d'écriture (avant submit)
++    this.userReserved = new Map();
+     this.activeConv = new Set();
+     this.draining = false;
+     this.ticker = null;
+@@ -3138,7 +3174,7 @@
+   }
+ 
+   stats() {
+-    return { active: this.active, activeHeavy: this.activeHeavy, queued: this.queue.length, draining: this.draining, tracked: this.runs.size, limits: { global: CONFIG.QUEUE.GLOBAL_CONCURRENCY, heavy: CONFIG.QUEUE.HEAVY_CONCURRENCY, perUser: CONFIG.QUEUE.PER_USER_CONCURRENCY } };
++    return { active: this.active, activeHeavy: this.activeHeavy, queued: this.queue.length, reserved: this.reserved, draining: this.draining, tracked: this.runs.size, limits: { global: CONFIG.QUEUE.GLOBAL_CONCURRENCY, heavy: CONFIG.QUEUE.HEAVY_CONCURRENCY, perUser: CONFIG.QUEUE.PER_USER_CONCURRENCY } };
+   }
+   get(id) { return this.runs.get(id) || null; }
+   findByMessage(convId, userIdx) { const id = this.byMsg.get(`${convId}:${userIdx}`); return id ? this.runs.get(id) || null : null; }
+@@ -3146,11 +3182,25 @@
+   /** Contrôle d'admission AVANT toute écriture : on refuse tôt et proprement. */
+   assertCanAccept(userId) {
+     if (this.draining) throw Errors.busy("Le serveur redémarre, réessayez dans quelques secondes.", 5000);
+-    if (this.queue.length >= CONFIG.QUEUE.MAX_QUEUE) { M.shed.inc({ reason: "queue_full" }); throw Errors.busy("Luba est très sollicitée, réessayez dans quelques secondes.", 8000); }
+-    if ((this.userQueued.get(userId) || 0) >= CONFIG.QUEUE.PER_USER_QUEUED) throw Errors.tooMany("TOO_MANY_PENDING", "Vous avez déjà plusieurs réponses en attente. Patientez un instant.", 3000);
++    if (this.queue.length + this.reserved >= CONFIG.QUEUE.MAX_QUEUE) { M.shed.inc({ reason: "queue_full" }); throw Errors.busy("Luba est très sollicitée, réessayez dans quelques secondes.", 8000); }
++    if ((this.userQueued.get(userId) || 0) + (this.userReserved.get(userId) || 0) >= CONFIG.QUEUE.PER_USER_QUEUED) throw Errors.tooMany("TOO_MANY_PENDING", "Vous avez déjà plusieurs réponses en attente. Patientez un instant.", 3000);
++  }
++
++  /**
++   * Réserve une place AVANT d'écrire quoi que ce soit en base (le contrôle d'admission et l'insertion
++   * étaient séparés par des `await` : N requêtes simultanées passaient toutes le contrôle, puis celles
++   * en trop laissaient un message utilisateur « fantôme » sans réponse). Retourne une fonction de libération.
++   */
++  reserve(userId) {
++    this.assertCanAccept(userId);
++    this.reserved++;
++    this.userReserved.set(userId, (this.userReserved.get(userId) || 0) + 1);
++    let done = false;
++    return () => { if (done) return; done = true; this.reserved--; this._dec(this.userReserved, userId); };
+   }
+ 
+-  submit(spec) {
++  submit(spec, reservation = null) {
++    if (reservation) reservation();      // la place réservée devient une place en file (même tick : pas de fenêtre de course)
+     this.assertCanAccept(spec.userId);
+     const run = new Run(spec);
+     this.runs.set(run.id, run);
+@@ -3314,6 +3364,23 @@
+   return out;
+ }
+ 
++/**
++ * Les images sont livrées par `media.images` (galerie affichée en haut par l'interface). Si le modèle (ou un résultat d'outil)
++ * recopie une image en Markdown `![alt](url)` dans son texte, elle s'afficherait une SECONDE fois dans la réponse : on la retire.
++ * (La publicité, ajoutée APRÈS ce nettoyage dans le pied de réponse, n'est pas concernée.)
++ */
++function stripInlineImages(text) {
++  if (!text || text.indexOf("![") === -1) return text;
++  return String(text)
++    .replace(/\[!\[[^\]]*\]\([^)\s]+\)\]\([^)\s]+\)/g, "")      // image cliquable [![alt](img)](lien)
++    .replace(/!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\)/g, "")        // image simple ![alt](url "titre")
++    .replace(/^[ \t]*---[ \t]*\n+(?=[ \t]*---[ \t]*(?:\n|$))/gm, "")   // séparateurs orphelins laissés par le retrait
++    .replace(/^\s*---\s*\n+/, "")                                     // séparateur en tête de réponse
++    .replace(/[ \t]+\n/g, "\n")
++    .replace(/\n{3,}/g, "\n\n")
++    .trim();
++}
++
+ const chat = {
+   /** Admission + persistance idempotente + mise en file. Retourne immédiatement (aucun appel LLM ici). */
+   async start({ userId, role, firebaseUid, convId, message, clientMsgId = null, tier = "v100", images = null, googleAccessToken = null, channel = "web", skipQuota = false, knownNew = false }) {
+@@ -3338,35 +3405,43 @@
+       }
+     }
+ 
+-    runManager.assertCanAccept(userId);
+-
++    const reservation = runManager.reserve(userId);      // place garantie AVANT toute écriture
+     const hasImages = Boolean(images && images.length);
+-    if (!skipQuota) {
+-      const q = await repo.reserveQuota(userId, "message", role);
+-      if (!q.allowed) throw new AppError("QUOTA_EXCEEDED", q.message, { status: 429 });
+-    }
+-    if (hasImages && !skipQuota) {
+-      const qi = await repo.reserveQuota(userId, "image", role);
+-      if (!qi.allowed) { await repo.refundQuota(userId, "message"); throw new AppError("QUOTA_EXCEEDED", qi.message, { status: 429 }); }
+-    }
+-
+-    let userMsg = null, asst = null;
++    let quotaTaken = false, imageQuotaTaken = false, asst = null;
+     try {
++      if (!skipQuota) {
++        const q = await repo.reserveQuota(userId, "message", role);
++        if (!q.allowed) throw new AppError("QUOTA_EXCEEDED", q.message, { status: 429 });
++        quotaTaken = true;
++      }
++      if (hasImages && !skipQuota) {
++        const qi = await repo.reserveQuota(userId, "image", role);
++        if (!qi.allowed) throw new AppError("QUOTA_EXCEEDED", qi.message, { status: 429 });
++        imageQuotaTaken = true;
++      }
++
+       const runId = newId("run");
+-      userMsg = (await repo.appendMessage({ userId, convId, role: "user", content: message, clientMsgId, status: "final" })).message;
+-      asst = (await repo.appendMessage({ userId, convId, role: "assistant", content: "", runId, status: "streaming" })).message;
++      const turn = await repo.appendTurn({ userId, convId, message, clientMsgId, runId });   // user + réponse : idx adjacents, atomique
++      if (turn.duplicate) {            // deux retries simultanés : le second ne crée rien et n'est pas facturé
++        reservation();
++        if (quotaTaken) await repo.refundQuota(userId, "message").catch(() => {});
++        if (imageQuotaTaken) await repo.refundQuota(userId, "image").catch(() => {});
++        const existing = runManager.findByMessage(convId, turn.user.message.idx);
++        return { duplicate: true, run: existing, userIdx: turn.user.message.idx, created: false };
++      }
++      const userMsg = turn.user.message;
++      asst = turn.asst.message;
+       const lane = laneOf(tier, hasImages);
+       await repo.insertRun({ runId, userId, convId, userIdx: userMsg.idx, assistantIdx: asst.idx, tier, lane });
+       const run = runManager.submit({
+         id: runId, userId, firebaseUid, role, convId, userIdx: userMsg.idx, assistantIdx: asst.idx,
+         tier, lane, message, images, googleAccessToken, channel, skipQuota, language: detectLanguage(message), isNew: created
+-      });
++      }, reservation);
+       return { duplicate: false, run, userMessage: userMsg, assistantMessage: asst, created };
+     } catch (e) {
+-      if (!skipQuota) {
+-        await repo.refundQuota(userId, "message").catch(() => {});
+-        if (hasImages) await repo.refundQuota(userId, "image").catch(() => {});
+-      }
++      reservation();
++      if (quotaTaken) await repo.refundQuota(userId, "message").catch(() => {});
++      if (imageQuotaTaken) await repo.refundQuota(userId, "image").catch(() => {});
+       if (asst) await repo.finalizeMessage({ userId, convId, idx: asst.idx, content: "", status: "failed" }).catch(() => {});
+       throw e;
+     }
+@@ -3461,7 +3536,7 @@
+       });
+       out.sources.forEach((k) => sources.add(k));
+ 
+-      let finalText = formatFinalReply(out.text);
++      let finalText = stripInlineImages(formatFinalReply(out.text));
+       const sug = extractSuggestions(finalText);
+       finalText = sug.text;
+       if (!finalText) throw new ProviderError("empty", "réponse vide");
+@@ -3501,7 +3576,7 @@
+         modelTier: run.tier, visionEnabled: hasImages, intent, language: run.language, contextLength: history.length,
+         elapsedMs, ttftMs: out.ttftMs, queueMs: run.queueMs, adIncluded: Boolean(ad), imagesGuaranteed: Boolean(guaranteed?.images?.length),
+         suggestions: sug.suggestions, sources: srcList, toolCallTrace: out.trace, usage: out.usage,
+-        media: { images: imageUrls, videos: out.videos }
++        images: imageUrls, media: { images: imageUrls, videos: out.videos }
+       };
+       run.push("done", result);
+       run.finish(out.partial ? "interrupted" : "done", result);
+@@ -3733,7 +3808,6 @@
+     },
+     close: () => { try { ws.close(1001, "closing"); } catch {} }
+   };
+-  syncHub.add(conn);
+   ws.on("close", () => syncHub.remove(conn));
+   ws.on("error", () => syncHub.remove(conn));
+   ws.on("message", (raw) => {
+@@ -3743,7 +3817,9 @@
+     if (m.type === "subscribe" && Number.isFinite(+m.cursor)) { conn.cursor = +m.cursor; syncHub.schedule(conn); }
+   });
+   repo.currentSeq(userId).then((cur) => {
++    if (ws.readyState !== 1) return;                       // fermé pendant l'attente
+     if (since === 0) conn.cursor = cur;
++    syncHub.add(conn);                                     // enregistré APRÈS le curseur : aucun flush ne repart de 0
+     conn.send("hello", { cursor: conn.cursor, snapshot: since === 0 }, conn.cursor);
+     if (since > 0) syncHub.schedule(conn);
+   }).catch(() => {});
+@@ -4169,11 +4245,22 @@
+     images = req.files.map(toImageObj);
+   }
+ 
+-  const started = await chat.start({
+-    userId: req.userId, role: req.userRole, firebaseUid: req.firebaseUid, convId, message, clientMsgId, knownNew: isNewRequest,
+-    tier: req.body?.modelTier === "v250" ? "v250" : "v100", images,
+-    googleAccessToken: req.headers["x-google-access-token"] || null, channel: stream ? "web-sse" : "web"
+-  });
++  let started;
++  try {
++    started = await chat.start({
++      userId: req.userId, role: req.userRole, firebaseUid: req.firebaseUid, convId, message, clientMsgId, knownNew: isNewRequest,
++      tier: req.body?.modelTier === "v250" ? "v250" : "v100", images,
++      googleAccessToken: req.headers["x-google-access-token"] || null, channel: stream ? "web-sse" : "web"
++    });
++  } catch (e) {
++    // Client JSON : une surcharge passagère (503 / trop de demandes en attente) est renvoyée en 200 avec un texte lisible ;
++    // un statut 5xx fait afficher « serveur hors ligne » à l'interface alors que le serveur est simplement occupé.
++    if (!stream && e instanceof AppError && (e.code === "SERVER_BUSY" || e.code === "TOO_MANY_PENDING")) {
++      if (e.retryAfterMs) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(e.retryAfterMs / 1000))));
++      return res.status(200).json({ success: false, error: true, retryable: true, code: e.code, reply: e.message, conversationId: convId, requestId: req.requestId });
++    }
++    throw e;
++  }
+   const { run, duplicate } = started;
+   const accepted = {
+     conversationId: convId, isNewConversation: isNewRequest || Boolean(started.created), runId: run?.id || null, duplicate: Boolean(duplicate),
+@@ -4195,10 +4282,41 @@
+   }
+ 
+   if (!run) return res.json({ success: true, error: false, ...accepted });
+-  const waitMs = envInt("NONSTREAM_WAIT_MS", 90000);
++
++  // Réponse JSON NON streamée (c'est ce qu'utilise Luba.html). Une question lourde peut durer > 60 s : sans octet envoyé,
++  // le reverse-proxy coupe la connexion et le client affiche « Luba n'est pas disponible ». On envoie donc l'en-tête 200
++  // puis un espace toutes les 10 s (les espaces avant un JSON sont valides) jusqu'à la vraie réponse.
++  const waitMs = envInt("NONSTREAM_WAIT_MS", 270000);
++  const kaDelayMs = envInt("NONSTREAM_KEEPALIVE_AFTER_MS", 8000);
++  let ka = null, kaStart = null, closed = false;
++  const stopKa = () => { clearTimeout(kaStart); clearInterval(ka); };
++  const write = (chunk) => { try { res.write(chunk); res.flush?.(); } catch { closed = true; stopKa(); } };
++  res.on("close", () => { closed = true; stopKa(); });
++  kaStart = setTimeout(() => {
++    if (res.headersSent || closed) return;
++    res.status(200);
++    res.setHeader("Content-Type", "application/json; charset=utf-8");
++    res.setHeader("Cache-Control", "no-store");
++    res.setHeader("X-Accel-Buffering", "no");
++    res.flushHeaders?.();
++    write(" ");
++    ka = setInterval(() => write(" "), CONFIG.TIMEOUTS.HEARTBEAT_MS);
++    ka.unref?.();
++  }, kaDelayMs);
++  kaStart.unref?.();
++
+   const result = await Promise.race([run.finished, sleepRaw(waitMs).then(() => null)]);
+-  if (!result) return res.status(202).json({ success: true, accepted: true, status: run.status, ...accepted, pollUrl: `/api/runs/${run.id}` });
+-  return res.status(200).json({ success: !result.error, ...result, conversationId: convId, isNewConversation: accepted.isNewConversation, duplicate: Boolean(duplicate) });
++  stopKa();
++  if (closed) return;                 // le client est parti : la réponse est de toute façon sauvegardée dans la conversation
++  const send = (status, body) => (res.headersSent ? res.end(JSON.stringify(body)) : res.status(status).json(body));
++  if (!result) {
++    // Au-delà du délai : le run continue côté serveur ; on renvoie un message lisible (pas un JSON brut affiché au client).
++    return send(202, {
++      success: true, error: false, accepted: true, pending: true, degraded: true, status: run.status, ...accepted, pollUrl: `/api/runs/${run.id}`,
++      reply: "⏳ Cette demande est très lourde et prend plus de temps que prévu. Ta réponse sera enregistrée dans la conversation : rouvre-la dans un instant."
++    });
++  }
++  return send(200, { success: !result.error, ...result, conversationId: convId, isNewConversation: accepted.isNewConversation, duplicate: Boolean(duplicate) });
+ }
+ 
+ // ---------- Runs ----------
+@@ -4253,7 +4371,10 @@
+   const limit = full ? 500 : clamp(parseInt(req.query.limit, 10) || 50, 1, CONFIG.LIMITS.MAX_PAGE_SIZE * 2);
+   await settle(cloud.hydrateConversation(req.userId, convId), 8000, null);
+   const r = await repo.getMessages(req.userId, convId, { afterIdx: parseInt(req.query.after, 10) || 0, beforeIdx: parseInt(req.query.before, 10) || null, limit });
+-  res.json({ success: true, error: false, conversationId: convId, messages: r.messages, count: r.messages.length, hasMore: r.hasMore, lastIdx: r.lastIdx });
++  // Les routes « interface » (/api/conversations/:id, /api/conversation/:id/messages) rendent chaque message tel quel : on retire les
++  // réponses échouées/annulées VIDES (sinon une bulle blanche s'affiche). Les clients de synchro (/api/sync) gardent tout.
++  const messages = req.query.raw === "1" ? r.messages : r.messages.filter((m) => !(m.role === "assistant" && !m.content && (m.status === "failed" || m.status === "cancelled")));
++  res.json({ success: true, error: false, conversationId: convId, messages, count: messages.length, hasMore: r.hasMore, lastIdx: r.lastIdx });
+ }
+ 
+ async function syncHandler(req, res) {
+@@ -4274,9 +4395,11 @@
+   const since = parseInt(req.headers["last-event-id"] || req.query.cursor || "0", 10) || 0;
+   const sse = new SSEStream(req, res);
+   const conn = { userId: req.userId, cursor: since, transport: "sse", send: (e, d, id) => sse.send(e, d, id), close: () => sse.end() };
++  if (since === 0) conn.cursor = await repo.currentSeq(req.userId).catch(() => 0);
++  if (sse.closed) return;                                  // le client est parti pendant l'attente : ne rien enregistrer (fuite)
+   syncHub.add(conn);
+   sse.onClose = () => syncHub.remove(conn);
+-  if (since === 0) { conn.cursor = await repo.currentSeq(req.userId); sse.send("hello", { cursor: conn.cursor, snapshot: true }, conn.cursor); }
++  if (since === 0) sse.send("hello", { cursor: conn.cursor, snapshot: true }, conn.cursor);
+   else { sse.send("hello", { cursor: since, snapshot: false }, since); syncHub.schedule(conn); }
+ }
+ 
+@@ -4315,6 +4438,24 @@
+   return Boolean(CONFIG.DEBUG_TOKEN && t && timingSafeStr(t, CONFIG.DEBUG_TOKEN));
+ };
+ 
++/** Texte lisible (Markdown) pour le résultat d'un outil — utilisé par POST /api/tools. */
++function toolReplyText(result) {
++  if (!result || typeof result !== "object") return "";
++  if (result.success === false && result.error) return `Je n'ai pas pu terminer cette recherche : ${String(result.error).slice(0, 200)}`;
++  const list = Array.isArray(result.results) ? result.results : Array.isArray(result.articles) ? result.articles : [];
++  if (list.length) {
++    return list.slice(0, 6).map((r, i) => {
++      const title = String(r.title || r.name || r.url || `Résultat ${i + 1}`).replace(/[[\]]/g, "");
++      const snippet = String(r.snippet || r.description || r.summary || "").replace(/\s+/g, " ").slice(0, 220);
++      return `${i + 1}. ${r.url ? `[${title}](${r.url})` : `**${title}**`}${snippet ? `\n   ${snippet}` : ""}`;
++    }).join("\n\n");
++  }
++  if (typeof result.reply === "string") return result.reply;
++  if (typeof result.summary === "string") return result.summary;
++  if (typeof result.text === "string") return result.text.slice(0, 2000);
++  return "";
++}
++
+ function buildApp() {
+   if (!express) throw new Error("Le paquet `express` est requis (npm i express)");
+   const app = express();
+@@ -4457,11 +4598,21 @@
+   app.delete("/api/tasks/:taskId", auth, rateLimit("API"), wrap(async (req, res) => res.json({ success: await repo.deleteTask(req.userId, req.params.taskId) })));
+ 
+   app.post("/api/web/run", auth, rateLimit("WEB"), wrap(webRunHandler));      // web.run : action = fast | slow | open | click
++  // Luba.html envoie { action: "web_search", params: { query } } et attend un champ `reply` : on accepte les deux formats
++  // (tool/name/toolName/action + args/params/arguments) et on fabrique un texte lisible à partir du résultat.
++  const TOOL_ALIASES = { web_search: "web_fast", search_web: "web_fast", search: "web_fast", recherche: "web_fast" };
+   app.post("/api/tools", auth, rateLimit("API"), wrap(async (req, res) => {
+-    const name = String(req.body?.tool || req.body?.name || "");
++    const asked = String(req.body?.tool || req.body?.name || req.body?.toolName || req.body?.action || "");
++    const name = TOOL_ALIASES[asked] || asked;
++    const args = req.body?.args || req.body?.params || req.body?.arguments || {};
+     if (!getToolSchemas().some((s) => s.function.name === name)) throw Errors.badRequest("UNKNOWN_TOOL", "Outil inconnu.");
+-    const out = await withTimeout(executeTool({ toolName: name, args: req.body?.args || {} }, { userId: req.userId, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null }), CONFIG.TIMEOUTS.TOOL_MS, null, `outil ${name}`);
+-    res.json({ success: true, ...out });
++    const out = await withTimeout(executeTool({ toolName: name, args }, { userId: req.userId, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null, webRun: new WebRun() }), CONFIG.TIMEOUTS.TOOL_MS * 2, null, `outil ${name}`);
++    res.json({ success: true, toolName: asked || name, ...out, reply: toolReplyText(out?.result) });
++  }));
++  app.post("/api/clear-cache", auth, rateLimit("API"), wrap(async (req, res) => {
++    userProfiles.delete(req.userId);                 // profil relu depuis la base à la prochaine requête
++    cloud.forget(req.userId);                        // la discussion sera ré-hydratée depuis le cloud si besoin
++    res.json({ success: true, cleared: ["profile", "cloud-hydration"] });
+   }));
+ 
+   app.delete("/api/account", auth, rateLimit("STRICT"), wrap(async (req, res) => {
+@@ -14948,7 +15099,7 @@
+   TTLCache, TokenBucketLimiter, ThinkFilter, readSSE, makeWatchdog, fitContext, clipMiddle,
+   ProviderHealth, ProviderError, health, KeyPool, PROVIDERS, TIERS, tierChain, classifyHttp,
+   callLLM, orchestrate, streamOpenAI, streamGemini, streamFake,
+-  Run, RunManager, runManager, chat, SSEStream, SyncHub, syncHub, MirrorWorker, mirrorState,
++  Run, RunManager, runManager, chat, stripInlineImages, SSEStream, SyncHub, syncHub, MirrorWorker, mirrorState,
+   verifyToken, tokenCache, authenticate, buildApp, bootstrap, shutdown, diagnostics,
+   formatFinalReply, cleanOutput, extractSuggestions, detectLanguage, quickIntent,
+   handlers: { chatHandler, runStatusHandler, runStreamHandler, runCancelHandler, listConversationsHandler, messagesHandler, syncHandler, syncStreamHandler, bootstrapHandler },
