@@ -476,6 +476,7 @@ const CONFIG = deepFreeze({
   MEMORY_EXTRACT: envBool("MEMORY_EXTRACT", true),
   LIVE: { MAX_TOKENS: envInt("LIVE_MAX_TOKENS", 380) },
   DUAL: { ENABLED: envBool("DUAL_MODEL", true), PLAN_TIMEOUT_MS: envInt("DUAL_PLAN_TIMEOUT_MS", 90000), PLAN_MAX_TOKENS: envInt("DUAL_PLAN_MAX_TOKENS", 1500) },
+  IMAGES_ONLY: { COUNT: envInt("IMAGES_ONLY_COUNT", 16) },
   RESCUE: { TIMEOUT_MS: envInt("RESCUE_TIMEOUT_MS", 90000) },
   DEBUG_TOKEN: envStr("DEBUG_TOKEN", null),
   METRICS_TOKEN: envStr("METRICS_TOKEN", null),
@@ -3733,7 +3734,7 @@ const sourceList = (keys) => keys.map((k) => SOURCE_LABELS[k]).filter(Boolean).m
 const factSlots = { n: 0, max: 2 };
 
 /** Médias d'une réponse sous forme de LIENS (url + titre + crédit) : rien n'est téléchargé ni copié, l'image reste chez Wikimedia & co. */
-function linkMedia(list, max = 6) {
+function linkMedia(list, max = 24) {
   const seen = new Set(), out = [];
   for (const it of list || []) {
     const o = typeof it === "string" ? { url: it } : it;
@@ -4068,7 +4069,11 @@ class SpeechSanitizer {
 
 // ---------- Historique compact : récent in extenso, ancien résumé (conversations longues sans erreur) ----------
 function buildHistory(rows, userIdx, { live = false } = {}) {
-  const prior = rows.filter((r) => r.idx < userIdx && String(r.content || "").trim());
+  const GALLERY = "[Galerie d'images affichée à l'utilisateur]";
+  const prior = rows.filter((r) => r.idx < userIdx).map((r) => {
+    const clean = String(r.content || "").replace(/\u200B/g, "").trim();
+    return { ...r, content: clean || (r.role === "assistant" && String(r.content || "").includes("\u200B") ? GALLERY : "") };
+  }).filter((r) => r.content);
   const keep = live ? 8 : 10;
   const recent = prior.slice(-keep);
   const older = prior.slice(0, Math.max(0, prior.length - keep));
@@ -4119,6 +4124,36 @@ async function rescueAnswer({ messages, hasImages, signal, emit, cause }) {
 }
 /** Ferme un bloc de code resté ouvert (réponse coupée) pour que l'affichage ne casse pas. */
 const repairCodeFences = (t) => ((String(t).match(/```/g) || []).length % 2 === 1 ? `${t}\n\`\`\`` : t);
+
+// ---------- Recherche d'images « façon Google Images » : uniquement une galerie, aucun texte ----------
+const IMAGE_ONLY_TEXT = "\u200B";       // le frontend refuse une réponse vide : on envoie un caractère invisible, la galerie s'affiche seule
+const IMG_NOUN = /\b(images?|photos?|pictures?|pics?|illustrations?|wallpapers?|fonds?\s+d['’]?\s?[ée]cran|logos?)\b/i;
+const IMG_SEARCH_VERB = /\b(montre|affiche|cherche|recherche|trouve|donne|envoie|passe|propose|vois|voir|show|search|find|get|send|je\s+veux|je\s+voudrais|j['’]aimerais|besoin)\b/i;
+const IMG_NOT_SEARCH = /\b(g[ée]n[èe]re|g[ée]n[ée]rer|cr[ée]e|cr[ée]er|dessine|dessiner|fabrique|invente|imagine|draw|generate|create|retouche|modifie|[ée]dite|analyse|d[ée]cris|d[ée]crire|explique|que\s+vois|identifie|traduis|lis)\b/i;
+function isImageSearchRequest(msg) {
+  const m = String(msg || "").trim();
+  if (m.length < 4 || m.length > 200 || !IMG_NOUN.test(m) || IMG_NOT_SEARCH.test(m)) return false;
+  return IMG_SEARCH_VERB.test(m) || /^(des\s+|les\s+|quelques\s+)?(images?|photos?)\s+(de|d['’]|du|des|sur)\b/i.test(m);
+}
+function imageQueryFrom(msg) {
+  let q = String(msg || "").replace(/[?!.,;]+/g, " ")
+    .replace(/-(moi|nous|lui|leur|m['’]en)\b/gi, " ")
+    .replace(IMG_NOUN, " ")
+    .replace(/\b(montre|affiche|cherche|recherche|trouve|donne|envoie|passe|propose|vois|voir|show|search|find|get|send|moi|me|nous|stp|svp|please|luba|je\s+veux|je\s+voudrais|j['’]aimerais|besoin|s['’]il\s+(te|vous)\s+pla[iî]t|quelques|plusieurs|belles?|beaux|meilleures?|hd)\b/gi, " ")
+    .replace(/\s+/g, " ").trim();
+  for (let i = 0; i < 4; i++) q = q.replace(/^(de|du|des|d['’]|sur|la|le|les|l['’]|un|une|en|pour|avec|of|some|the|a|an|about)\s+/i, "").trim();
+  return q.slice(0, 120);
+}
+/** Lance la recherche d'images et renvoie un résultat « images seulement » (ou null → on retombe sur la réponse normale). */
+async function imageOnlyAnswer({ q, ctx, emit, signal }) {
+  emit.status("tool", { name: "search_images" });
+  const o = await withTimeout(executeTool({ toolName: "search_images", args: { query: q, limit: CONFIG.IMAGES_ONLY.COUNT } }, ctx), 25000, signal, "recherche d'images");
+  const imgs = (o?.result?.images || []).filter((i) => i && typeof i.url === "string" && /^https?:\/\//i.test(i.url));
+  if (!imgs.length) return null;
+  emit.images(imgs);
+  emit.token(IMAGE_ONLY_TEXT);
+  return { text: IMAGE_ONLY_TEXT, reasoning: "", sources: [], images: [...new Set(imgs.map((i) => i.url))], videos: [], trace: [{ name: "search_images", args: { query: q } }], provider: "images", model: "search", ttftMs: 0, usage: { prompt: 0, completion: 0 }, partial: false, error: null, imageOnly: true };
+}
 
 const chat = {
   /** Admission + persistance idempotente + mise en file. Retourne immédiatement (aucun appel LLM ici). */
@@ -4233,7 +4268,8 @@ const chat = {
       const bigJob = !live && (["CODE", "WEBSITE", "DOCUMENT"].includes(intent) || run.message.length > 1500 || Boolean(run.docs?.length));
       const tlane = bigJob ? "heavy" : "light";
       if (!live) deadlineAt = now() + (bigJob ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT).TOTAL_MS;
-      const wantsEnrich = !live && !["SMALLTALK", "CODE", "GENERAL", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) && legacy?.enrichContextWithIntent;
+      const imgReq = !live && !(run.images && run.images.length) && !run.docs?.length && isImageSearchRequest(run.message);   // « montre-moi des images de … » : galerie seule
+      const wantsEnrich = !live && !imgReq && !["SMALLTALK", "CODE", "GENERAL", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) && legacy?.enrichContextWithIntent;
 
       // Tout ce qui est facultatif est BORNÉ dans le temps et ne peut jamais bloquer la réponse.
       const [ctxRows, memoryBlock, mod, enrichment] = await Promise.all([
@@ -4254,7 +4290,7 @@ const chat = {
 
       // Image « garantie » : lancée en parallèle du LLM (avant : bloquait la réponse).
       let imagePromise = null;
-      const skipImage = live || hasImages || run.docs?.length || intent === "SMALLTALK" || enrichment?.media?.images?.length || (legacy?.isIdentityOrSelfQuestion && legacy.isIdentityOrSelfQuestion(run.message));
+      const skipImage = live || imgReq || hasImages || run.docs?.length || intent === "SMALLTALK" || enrichment?.media?.images?.length || (legacy?.isIdentityOrSelfQuestion && legacy.isIdentityOrSelfQuestion(run.message));
       if (!skipImage && legacy?.ensureImageForResponse) imagePromise = settle(legacy.ensureImageForResponse(run.message, entity), 6000, null);
 
       const tools = live
@@ -4307,8 +4343,12 @@ const chat = {
 
       // « On attend jusqu'au bout » : si TOUS les modèles échouent pour une raison passagère (quota, 5xx, réseau, réponse vide),
       // on patiente (2,5 s, 5 s, 10 s… jusqu'à 30 s) puis on relance la chaîne, tant que le délai de la demande n'est pas écoulé.
-      let out;
-      for (let round = 0; ; round++) {
+      let out = null;
+      if (imgReq) {
+        const q = imageQueryFrom(run.message);
+        if (q) out = await settle(imageOnlyAnswer({ q, ctx, emit, signal }), 30000, null);   // aucun résultat → réponse normale ci-dessous
+      }
+      for (let round = 0; !out; round++) {
         try {
           out = await orchestrate({
             chain, lane: live ? run.lane : tlane, messages, images: run.images && run.images.length ? run.images : null, tools,
@@ -4336,6 +4376,7 @@ const chat = {
       if (live) { const rest = speech.flush(); if (rest) run.token(rest); }
 
       const finalize = (o) => {
+        if (o.imageOnly) return { text: IMAGE_ONLY_TEXT, sug: { text: IMAGE_ONLY_TEXT, suggestions: [] } };
         let t = live ? speakable(formatFinalReply(o.text)) : repairCodeFences(stripInlineImages(formatFinalReply(o.text)));
         const sg = live ? { text: t, suggestions: [] } : extractSuggestions(t);
         return { text: sg.text, sug: sg };
@@ -4354,11 +4395,11 @@ const chat = {
         guaranteed = await settle(imagePromise, Math.max(500, Math.min(3000, deadlineAt - now())), null);
         if (guaranteed?.images?.length) emit.images(guaranteed.images);
       }
-      const imageUrls = [...new Set(run.outImages.map((i) => i?.url || i).filter((u) => typeof u === "string"))].slice(0, 3);
+      const imageUrls = [...new Set(run.outImages.map((i) => i?.url || i).filter((u) => typeof u === "string"))].slice(0, out.imageOnly ? CONFIG.IMAGES_ONLY.COUNT : 3);
 
       // Publicité (facultative, 1,5 s max) — même comportement qu'en v16.5
       let ad = null;
-      if (legacy?.getAd && run.channel !== "whatsapp" && !live) ad = await settle(legacy.getAd({ slot: "chat_below", userId: run.userId }), 1500, null);
+      if (legacy?.getAd && run.channel !== "whatsapp" && !live && !out.imageOnly) ad = await settle(legacy.getAd({ slot: "chat_below", userId: run.userId }), 1500, null);
       const srcList = mergeSources(ctx.webRun.sources(), sourceList([...sources]));   // pages consultées d'abord (nom + domaine + icône)
       let footer = "";
       if (ad?.imageUrl) {
@@ -4366,7 +4407,7 @@ const chat = {
         footer += `\n\n${ad.clickUrl ? `[![${title}](${ad.imageUrl})](${ad.clickUrl})` : `![${title}](${ad.imageUrl})`}`;
         run.push("ad", { ad });
       }
-      if (srcList.length && !live) footer += `\n\n---\n\n**Sources :** ${srcList.map(mdSourceLink).join(" · ")}`;
+      if (srcList.length && !live && !out.imageOnly) footer += `\n\n---\n\n**Sources :** ${srcList.map(mdSourceLink).join(" · ")}`;
       if (srcList.length) run.push("sources", { sources: srcList });
       if (sug.suggestions.length) run.push("suggestions", { suggestions: sug.suggestions });
       if (footer) run.token(footer);
@@ -5337,7 +5378,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
@@ -8635,7 +8676,7 @@ async function executeToolNative(toolName, rawArgs, context = {}) {
     switch (toolName) {
       case "search_images": {
         const q = extractEntity(args.query) || args.query;
-        result = await searchImagesWithFallback(q, CONFIG.LIMITS.IMAGE_SEARCH_LIMIT);
+        result = await searchImagesWithFallback(q, Math.min(24, Math.max(1, parseInt(args.limit, 10) || CONFIG.LIMITS.IMAGE_SEARCH_LIMIT)));
         if (result.images?.length) sourceKeys.push("wikimediacommons");
         break;
       }
