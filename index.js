@@ -386,7 +386,7 @@ const CONFIG = deepFreeze({
     PER_USER_CONCURRENCY: envInt("RUN_PER_USER_CONCURRENCY", 2),
     PER_USER_QUEUED: envInt("RUN_PER_USER_QUEUED", 4),
     MAX_QUEUE: envInt("RUN_MAX_QUEUE", 400),
-    MAX_WAIT_MS: envInt("RUN_MAX_QUEUE_WAIT_MS", 120000),
+    MAX_WAIT_MS: envInt("RUN_MAX_QUEUE_WAIT_MS", 600000),
     EVENT_BUFFER: envInt("RUN_EVENT_BUFFER", 4000),
     KEEP_FINISHED_MS: envInt("RUN_KEEP_FINISHED_MS", 120000),
     CHECKPOINT_MS: envInt("RUN_CHECKPOINT_MS", 2000)
@@ -396,14 +396,14 @@ const CONFIG = deepFreeze({
   // sans qu'on le considère en panne tant que le flux reste vivant.
   TIMEOUTS: {
     LIGHT: {
-      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 25000),
-      IDLE_MS: envInt("LIGHT_IDLE_MS", 20000),
-      TOTAL_MS: envInt("LIGHT_TOTAL_MS", 120000)
+      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 90000),
+      IDLE_MS: envInt("LIGHT_IDLE_MS", 90000),
+      TOTAL_MS: envInt("LIGHT_TOTAL_MS", 240000)
     },
     HEAVY: {
-      FIRST_TOKEN_MS: envInt("HEAVY_FIRST_TOKEN_MS", 90000),
-      IDLE_MS: envInt("HEAVY_IDLE_MS", 60000),
-      TOTAL_MS: envInt("HEAVY_TOTAL_MS", 300000)
+      FIRST_TOKEN_MS: envInt("HEAVY_FIRST_TOKEN_MS", 300000),
+      IDLE_MS: envInt("HEAVY_IDLE_MS", 240000),
+      TOTAL_MS: envInt("HEAVY_TOTAL_MS", 600000)
     },
     LIVE: {
       FIRST_TOKEN_MS: envInt("LIVE_FIRST_TOKEN_MS", 8000),
@@ -475,8 +475,8 @@ const CONFIG = deepFreeze({
 
   MEMORY_EXTRACT: envBool("MEMORY_EXTRACT", true),
   LIVE: { MAX_TOKENS: envInt("LIVE_MAX_TOKENS", 380) },
-  DUAL: { ENABLED: envBool("DUAL_MODEL", true), PLAN_TIMEOUT_MS: envInt("DUAL_PLAN_TIMEOUT_MS", 30000), PLAN_MAX_TOKENS: envInt("DUAL_PLAN_MAX_TOKENS", 1500) },
-  RESCUE: { TIMEOUT_MS: envInt("RESCUE_TIMEOUT_MS", 45000) },
+  DUAL: { ENABLED: envBool("DUAL_MODEL", true), PLAN_TIMEOUT_MS: envInt("DUAL_PLAN_TIMEOUT_MS", 90000), PLAN_MAX_TOKENS: envInt("DUAL_PLAN_MAX_TOKENS", 1500) },
+  RESCUE: { TIMEOUT_MS: envInt("RESCUE_TIMEOUT_MS", 90000) },
   DEBUG_TOKEN: envStr("DEBUG_TOKEN", null),
   METRICS_TOKEN: envStr("METRICS_TOKEN", null),
   FAKE_LLM: envBool("FAKE_LLM", false)
@@ -2162,6 +2162,7 @@ async function streamFake({ pc, messages, tools, wd, h }) {
   if (/\[fail\]/.test(lastText)) throw new ProviderError("server", "HTTP 500 fake failure", { status: 500 });
   if (/\[413\]/.test(lastText) && ((JSON.stringify(messages).length / 4) + (pc?.maxTokens || 0)) > 6500) throw new ProviderError("context", "Request too large for model on tokens per minute (TPM): Limit 8000, Requested 12000", { status: 413 });
   if (/\[toolfail\]/.test(lastText) && tools?.length) throw new ProviderError("client", "tool_use_failed: Failed to call a function", { status: 400 });
+  if (/\[flaky\]/.test(lastText) && (global.__flaky = (global.__flaky || 0) + 1) <= 3) throw new ProviderError("server", "HTTP 503 fake flaky", { status: 503 });
   if (/\[allfail\]/.test(lastText) && (pc?.maxTokens || 0) > 2000) throw new ProviderError("server", "HTTP 500 all fail", { status: 500 });   // le passage de secours (max 2000 jetons) réussit
   if (messages.some((m) => m.role === "user" && typeof m.content === "string" && /\[len\]/.test(m.content))) {
     const cont = messages.some((m) => m.role === "user" && typeof m.content === "string" && m.content === CONTINUE_PROMPT);
@@ -2235,6 +2236,7 @@ function fitContext(messages, budgetTokens) {
   return { messages: [...sys, ...kept, lastClipped], dropped: rest.length - 1 - kept.length };
 }
 
+const SHOW_ERROR_REASON = envBool("SHOW_ERROR_REASON", true);   // ajoute « (réf : fournisseur code) » au message d'erreur pour diagnostiquer ; mettre false en production stable
 const FRIENDLY = {
   rate_limit: "Luba est très sollicitée en ce moment. Réessaie dans quelques secondes.",
   timeout_first: "La réflexion a pris trop de temps. Réessaie, ou pose la question en plus court.",
@@ -2246,7 +2248,10 @@ const FRIENDLY = {
   network: "Luba n'arrive pas à joindre ses modèles pour le moment. Réessaie dans un instant.",
   default: "Je n'arrive pas à répondre pour le moment. Réessaie dans un instant."
 };
-const friendlyMessage = (err) => FRIENDLY[err?.kind] || FRIENDLY.default;
+const friendlyMessage = (err) => {
+  const base = FRIENDLY[err?.kind] || FRIENDLY.default;
+  return SHOW_ERROR_REASON && err?.kind ? `${base} (réf : ${[err.provider, err.status || err.kind].filter(Boolean).join(" ")})` : base;
+};
 
 // ----- v18 : limites apprises par modèle (413 / TPM / contexte) — mémorisées 30 min -----
 const providerLimits = new Map();
@@ -2359,6 +2364,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
           err = wd.signal.aborted ? new ProviderError(wd.reason || "timeout_total", `timeout (${wd.reason})`) : new ProviderError("network", String(e.message || e));
         }
         M.llm.inc({ provider: pc.provider, model: pc.model, outcome: err.kind });
+        err.provider = err.provider || pc.provider;
         lastErr = err;
         noteLlmError(pc, err);
         logger.warn({ provider: pc.provider, model: pc.model, kind: err.kind, status: err.status, attempt, msg: redactSecrets(err.message).slice(0, 200) }, "appel LLM échoué");
@@ -4198,8 +4204,8 @@ const chat = {
 
   async execute(run) {
     const live = Boolean(run.live);
-    const T = live ? CONFIG.TIMEOUTS.LIVE : run.lane === "heavy" ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT;
-    const deadlineAt = now() + T.TOTAL_MS;
+    const T = live ? CONFIG.TIMEOUTS.LIVE : CONFIG.TIMEOUTS.LIGHT;
+    let deadlineAt = now() + T.TOTAL_MS;      // ajusté plus bas selon la nature de la demande (4 min / 10 min)
     const signal = run.controller.signal;
     const startedAt = now();
     const speech = live ? new SpeechSanitizer() : null;     // Luba Live : on ne laisse passer que du texte « parlable »
@@ -4223,6 +4229,10 @@ const chat = {
       const pre = legacy?.preRouteIntent ? (() => { try { return legacy.preRouteIntent(run.message); } catch { return null; } })() : null;
       const intent = refineIntent(pre?.intent && pre.intent !== "GENERAL" ? pre.intent : quickIntent(run.message), run.message, { hasDocs: Boolean(run.docs?.length) });
       const entity = pre?.entity ?? null;
+      // Durée accordée : message ordinaire 4 min ; code / site web / document / très long message 10 min
+      const bigJob = !live && (["CODE", "WEBSITE", "DOCUMENT"].includes(intent) || run.message.length > 1500 || Boolean(run.docs?.length));
+      const tlane = bigJob ? "heavy" : "light";
+      if (!live) deadlineAt = now() + (bigJob ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT).TOTAL_MS;
       const wantsEnrich = !live && !["SMALLTALK", "CODE", "GENERAL", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) && legacy?.enrichContextWithIntent;
 
       // Tout ce qui est facultatif est BORNÉ dans le temps et ne peut jamais bloquer la réponse.
@@ -4295,17 +4305,32 @@ const chat = {
         }
       }
 
+      // « On attend jusqu'au bout » : si TOUS les modèles échouent pour une raison passagère (quota, 5xx, réseau, réponse vide),
+      // on patiente (2,5 s, 5 s, 10 s… jusqu'à 30 s) puis on relance la chaîne, tant que le délai de la demande n'est pas écoulé.
       let out;
-      try {
-        out = await orchestrate({
-          chain, lane: run.lane, messages, images: run.images && run.images.length ? run.images : null, tools,
-          executeTool: (call) => executeTool(call, ctx), signal, deadlineAt, emit,
-          profile: live ? "live" : null, maxIterations: live ? CONFIG.AGENT.LIVE_MAX_ITERATIONS : null, toolTimeoutMs: live ? CONFIG.TIMEOUTS.LIVE_TOOL_MS : null
-        });
-      } catch (e) {
-        if (signal.aborted || !(e instanceof ProviderError)) throw e;
-        logger.warn({ runId: run.id, kind: e.kind }, "orchestration échouée → réponse de secours");
-        out = await rescueAnswer({ messages, hasImages, signal, emit, cause: e });
+      for (let round = 0; ; round++) {
+        try {
+          out = await orchestrate({
+            chain, lane: live ? run.lane : tlane, messages, images: run.images && run.images.length ? run.images : null, tools,
+            executeTool: (call) => executeTool(call, ctx), signal, deadlineAt, emit,
+            profile: live ? "live" : null, maxIterations: live ? CONFIG.AGENT.LIVE_MAX_ITERATIONS : null, toolTimeoutMs: live ? CONFIG.TIMEOUTS.LIVE_TOOL_MS : null
+          });
+          break;
+        } catch (e) {
+          if (signal.aborted || !(e instanceof ProviderError)) throw e;
+          const left = deadlineAt - now();
+          const transient = !["auth", "model", "context", "client"].includes(e.kind);
+          if (transient && round < 8 && left > 25000) {
+            const waitMs = Math.min(30000, 2500 * 2 ** round, left - 20000);
+            logger.warn({ runId: run.id, kind: e.kind, provider: e.provider, round: round + 1, waitMs }, "tous les modèles ont échoué (passager) → on patiente puis on relance");
+            emit.status("waiting", { round: round + 1, reason: e.kind });
+            await sleep(waitMs, signal);
+            continue;
+          }
+          logger.warn({ runId: run.id, kind: e.kind, provider: e.provider }, "orchestration échouée → réponse de secours");
+          out = await rescueAnswer({ messages, hasImages, signal, emit, cause: e });
+          break;
+        }
       }
       out.sources.forEach((k) => sources.add(k));
       if (live) { const rest = speech.flush(); if (rest) run.token(rest); }
@@ -5072,7 +5097,7 @@ async function chatHandler(req, res) {
   // Réponse JSON NON streamée (c'est ce qu'utilise Luba.html). Une question lourde peut durer > 60 s : sans octet envoyé,
   // le reverse-proxy coupe la connexion et le client affiche « Luba n'est pas disponible ». On envoie donc l'en-tête 200
   // puis un espace toutes les 10 s (les espaces avant un JSON sont valides) jusqu'à la vraie réponse.
-  const waitMs = envInt("NONSTREAM_WAIT_MS", 270000);
+  const waitMs = envInt("NONSTREAM_WAIT_MS", 660000);
   const kaDelayMs = envInt("NONSTREAM_KEEPALIVE_AFTER_MS", 8000);
   let ka = null, kaStart = null, closed = false;
   const stopKa = () => { clearTimeout(kaStart); clearInterval(ka); };
@@ -5312,7 +5337,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
