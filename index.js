@@ -1,4 +1,7 @@
 // ================================================================================
+// v18.0.0 + LUBA ENGINE (ajout ciblé, optionnel) — luba-engine.js + luba_worker.py : analyse / correction de fichiers sur copie de
+//   travail, contrôles de code réels, ZIP contrôlés. Points d'intégration repérés par « [LUBA ENGINE] » ; désactivable : ENGINE_ENABLED=false.
+// ================================================================================
 // v18.0.0 — CHANGEMENTS (par rapport à v17.2.0)
 //  1. STABILITÉ : limites de jetons des modèles lues dans l'erreur 413/TPM et mémorisées (nouvel essai réduit, même modèle) ;
 //     400 « tool_use_failed » → nouvel essai SANS outils ; réponse vide d'un modèle de raisonnement → effort réduit ;
@@ -103,6 +106,8 @@ const firebaseAdmin = tryRequire("firebase-admin");
 const supabaseLib = tryRequire("@supabase/supabase-js");
 // Sources gratuites sans clé (Google News, arXiv, OpenAlex, Deezer…) : actif dès que ./free-sources.js existe.
 const freeSources = /^(1|true|yes|on)$/i.test(process.env.DISABLE_FREE_SOURCES || "") ? null : tryRequire("./free-sources.js");
+// [LUBA ENGINE] Bras et yeux de Luba (analyse/correction de fichiers, vérification de code) : actif dès que ./luba-engine.js existe ; ENGINE_ENABLED=false le désactive.
+const lubaEngine = /^(0|false|no|off)$/i.test(process.env.ENGINE_ENABLED || "") ? null : tryRequire("./luba-engine.js");
 
 const sleepRaw = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -3342,13 +3347,14 @@ Object.assign(NATIVE_TOOLS, MEDIA_TOOLS);
 function getToolSchemas() {
   const native = Object.values(NATIVE_TOOLS).map((t) => t.schema);
   const free = freeSources ? freeSources.schemas() : [];
-  const taken = new Set([...native, ...free].map((t) => t.function.name));
+  const eng = lubaEngine ? lubaEngine.schemas() : [];   // [LUBA ENGINE] vide tant que le moteur n'est pas prêt
+  const taken = new Set([...native, ...free, ...eng].map((t) => t.function.name));
   taken.add("search_youtube");        // remplacé par youtube_search / youtube_video_info (youtubei.js)
   let extra = [];
   if (!CONFIG.FAKE_LLM && legacy?.getToolSchemas) {
     try { extra = legacy.getToolSchemas("chat").filter((t) => !taken.has(t.function?.name)); } catch {}
   }
-  return [...native, ...free, ...extra];
+  return [...native, ...free, ...eng, ...extra];
 }
 
 const TOOL_ROUTES = [
@@ -3367,6 +3373,7 @@ const TOOL_ROUTES = [
   [/google/i, /google_search/],
   [/image|photo|illustration|picture|archive|historique|ancien|dessin|logo/i, /image|loc_gov/],
   [/\bcode\b|script|python|javascript|programme|ex[ée]cute|\bbug\b|fonction|algorithme|\bsql\b/i, /run_code|code|sandbox/],
+  [/v[ée]rifi|syntaxe|compil|\blint\b|valide[rz]? (ce|le|mon) (code|script|fichier)|luba engine|capacit[ée]s? du moteur/i, /^engine_/],   // [LUBA ENGINE]
   [/calcul|combien|racine|int[ée]grale|d[ée]riv[ée]e|[ée]quation|pourcentage|\d+\s*[+\-*\/x×^]\s*\d+|math/i, /math/],
   [/rappel|t[âa]che|todo|[àa] faire|agenda/i, /task/],
   [/souviens|retiens|m[ée]moire|rappelle-toi|oublie/i, /memory|remember|recall|fact/],
@@ -3395,11 +3402,26 @@ async function executeTool({ toolName, args }, ctx) {
   const nat = NATIVE_TOOLS[toolName];
   if (nat) return { result: await nat.exec(args || {}, ctx), sourceKeys: [] };
   if (freeSources?.has(toolName)) return freeSources.execute(toolName, args || {}, ctx);
+  if (lubaEngine?.has(toolName)) return lubaEngine.execute(toolName, args || {}, ctx);   // [LUBA ENGINE]
   if (legacy?.executeToolNative) {
     const out = await legacy.executeToolNative(toolName, args, { userId: ctx.userId, googleAccessToken: ctx.googleAccessToken, sessionId: ctx.convId });
     return { result: out.result, sourceKeys: out.sourceKeys || [] };
   }
   return { result: { success: false, error: "Outil indisponible" }, sourceKeys: [] };
+}
+
+// ----- [LUBA ENGINE] Adaptateur LLM : réutilise callLLM / tierChain de Milo (aucun second fournisseur, aucune clé dupliquée) -----
+// Le moteur y envoie un contexte structuré et reçoit du TEXTE ; il le valide lui-même (JSON, chemins, opérations autorisées).
+async function lubaEngineLlm({ messages, tier = "v100", signal = null, timeoutMs = 90000 }) {
+  const chain = tierChain(tier === "v250" ? "v250" : "v100", { code: tier === "v250" });
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener("abort", onAbort, { once: true }); }
+  const noop = () => {};
+  try {
+    const r = await callLLM({ chain, messages, tools: null, images: null, lane: "heavy", signal: ac.signal, deadlineAt: now() + timeoutMs, emit: { status: noop, token: noop, reasoning: noop } });
+    return { text: r.text || "", provider: r.provider, model: r.model, partial: Boolean(r.partial) };
+  } finally { if (signal) signal.removeEventListener("abort", onAbort); }
 }
 
 // ----- Prompt système (identique v16.5, enrichi dynamiquement) -----
@@ -5378,7 +5400,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
@@ -5499,6 +5521,8 @@ function buildApp() {
   app.post("/api/admin/self-heal/reset", auth, requireRole("ADMIN"), wrap(async (_req, res) => { health.reset(); res.json({ success: true }); }));
 
   // ----- Routes non portées (voix, WhatsApp, intentions…) : ancien code, optionnel -----
+  // [LUBA ENGINE] routes /api/engine/* (capacités, tâches d'analyse/correction, vérification, téléchargement). Échec = Milo continue.
+  if (lubaEngine) { try { lubaEngine.mount(app, { auth, rateLimit, logger, llm: lubaEngineLlm }); } catch (e) { logger.error({ err: e.message }, "Luba Engine : montage des routes échoué (non bloquant)"); } }
   if (legacy?.app && envBool("LEGACY_MOUNT", true)) app.use(legacy.app);
 
   app.use((req, res) => sendError(req, res, Errors.notFound("NOT_FOUND", "Route introuvable.")));
@@ -5522,6 +5546,8 @@ function validateEnvironment() {
   logger.info({ providers: withKeys, fakeLlm: CONFIG.FAKE_LLM, node: process.version }, "environnement");
   if (freeSources) logger.info({ tools: freeSources.schemas().length, version: freeSources.VERSION }, "sources gratuites chargées (free-sources.js)");
   else if (fs.existsSync(path.join(__dirname, "free-sources.js")) && !envBool("DISABLE_FREE_SOURCES", false)) logger.warn("free-sources.js présent mais non chargeable (erreur de syntaxe ?)");
+  if (lubaEngine) logger.info({ version: lubaEngine.VERSION }, "Luba Engine chargé (luba-engine.js)");   // [LUBA ENGINE]
+  else if (fs.existsSync(path.join(__dirname, "luba-engine.js")) && !/^(0|false|no|off)$/i.test(process.env.ENGINE_ENABLED || "")) logger.warn("luba-engine.js présent mais non chargeable (erreur de syntaxe ?)");
 }
 
 async function bootstrap({ listen = true } = {}) {
@@ -5540,6 +5566,10 @@ async function bootstrap({ listen = true } = {}) {
     catch (e) { logger.error({ err: e.message }, "initialisation de l'héritage échouée (voix/WhatsApp peuvent être dégradés)"); }
   }
 
+  if (lubaEngine) {   // [LUBA ENGINE] module facultatif : une erreur d'initialisation désactive le moteur mais ne bloque jamais Milo
+    try { const st = await lubaEngine.init({ logger, llm: lubaEngineLlm }); if (!st.ready) logger.warn({ reason: st.reason }, "Luba Engine non actif (Milo continue sans lui)"); }
+    catch (e) { logger.error({ err: e.message }, "Luba Engine : initialisation échouée (non bloquant)"); }
+  }
   const app = buildApp();
   if (!listen) return { app };
   server = http.createServer(app);
@@ -5592,6 +5622,7 @@ async function shutdown(signal, code = 0) {
     mirrorWorker.stop();
     try { await legacy?.baileysManager?.destroyAll(); } catch {}
     for (const t of timers) clearInterval(t);
+    try { await lubaEngine?.shutdown(); } catch {}      // [LUBA ENGINE] annule les tâches, nettoie les espaces temporaires
     await bus.close();
     await db.close();
     logger.info("arrêt propre terminé");
@@ -15965,6 +15996,7 @@ module.exports = {
   CONFIG, logger, AppError, Errors, bus, db, Database, repo, MIGRATIONS,
   TTLCache, TokenBucketLimiter, ThinkFilter, readSSE, makeWatchdog, fitContext, clipMiddle,
   ProviderHealth, ProviderError, health, KeyPool, PROVIDERS, TIERS, tierChain, classifyHttp,
+  lubaEngine, lubaEngineLlm,
   callLLM, orchestrate, streamOpenAI, streamGemini, streamFake,
   Run, RunManager, runManager, chat, stripInlineImages, SSEStream, SyncHub, syncHub, MirrorWorker, mirrorState,
   verifyToken, tokenCache, authenticate, buildApp, bootstrap, shutdown, diagnostics,
